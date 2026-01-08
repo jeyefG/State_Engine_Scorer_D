@@ -19,7 +19,7 @@ class StateLabeler:
     """Rule-based state labeling for offline training."""
 
     bootstrap_option: str = "A"
-    confirmation_feature: str = "ReentryCount"
+    confirmation_feature: str = "InsideBarsRatio"
 
     # Trend: loosen a bit so TREND actually exists in H1 (was too strict)
     trend_er: float = 0.34
@@ -27,17 +27,17 @@ class StateLabeler:
     trend_breakmag: float = 0.20
 
     # Balance: broaden so BALANCE is not near-zero
-    balance_er: float = 0.28
-    balance_netmove: float = 1.10
+    balance_er: float = 0.30
+    balance_netmove: float = 1.20
     balance_reentry: float = 1.0
-    balance_inside_ratio: float = 0.18
+    balance_inside_ratio: float = 0.16
 
     transition_breakmag: float = 0.25
     transition_reentry: float = 1.0
     # Transition: narrow the ER band slightly (was too wide)
-    transition_netmove: float = 1.10
-    transition_er_low: float = 0.26
-    transition_er_high: float = 0.36
+    transition_netmove: float = 1.15
+    transition_er_low: float = 0.27
+    transition_er_high: float = 0.35
     transition_range_slope: float = 0.0
     transition_inside_drop: float = 0.15
 
