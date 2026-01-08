@@ -21,20 +21,23 @@ class StateLabeler:
     bootstrap_option: str = "A"
     confirmation_feature: str = "ReentryCount"
 
-    trend_er: float = 0.38
-    trend_netmove: float = 1.3
-    trend_breakmag: float = 0.25
+    # Trend: loosen a bit so TREND actually exists in H1 (was too strict)
+    trend_er: float = 0.34
+    trend_netmove: float = 1.15
+    trend_breakmag: float = 0.20
 
-    balance_er: float = 0.22
-    balance_netmove: float = 0.9
-    balance_reentry: float = 2.0
-    balance_inside_ratio: float = 0.20
+    # Balance: broaden so BALANCE is not near-zero
+    balance_er: float = 0.28
+    balance_netmove: float = 1.10
+    balance_reentry: float = 1.0
+    balance_inside_ratio: float = 0.18
 
     transition_breakmag: float = 0.25
     transition_reentry: float = 1.0
-    transition_netmove: float = 1.0
-    transition_er_low: float = 0.22
-    transition_er_high: float = 0.38
+    # Transition: narrow the ER band slightly (was too wide)
+    transition_netmove: float = 1.10
+    transition_er_low: float = 0.26
+    transition_er_high: float = 0.36
     transition_range_slope: float = 0.0
     transition_inside_drop: float = 0.15
 
@@ -55,23 +58,29 @@ class StateLabeler:
             balance_confirm, trend_confirm = self._confirmation(features)
             trend = (er >= self.trend_er) & (net_move >= self.trend_netmove) & trend_confirm
             balance = (er <= self.balance_er) & (net_move <= self.balance_netmove) & balance_confirm
-            transition = self._transition_rules(features, er, net_move)
         else:
             trend = (er >= self.trend_er) & (net_move >= self.trend_netmove)
             balance = (er <= self.balance_er) & (net_move <= self.balance_netmove)
-            transition = self._transition_rules(features, er, net_move)
 
+        # TRANSITION is the complement, but we also keep explicit transition rules
+        # to avoid calling everything TRANSITION when balance/trend are rare.
+        transition = self._transition_rules(features, er, net_move)
+        transition = transition & (~trend) & (~balance)
+        
         labels = pd.Series(StateLabels.TRANSITION, index=features.index)
         labels[balance] = StateLabels.BALANCE
         labels[trend] = StateLabels.TREND
+        # Do not overwrite trend/balance with transition (already masked above)
         labels[transition] = StateLabels.TRANSITION
+        
         return labels
 
     def _confirmation(self, features: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         feature = self.confirmation_feature
         if feature == "ReentryCount":
             balance_confirm = features["ReentryCount"] >= self.balance_reentry
-            trend_confirm = features["ReentryCount"] <= 0
+            # Rolling sums can be float; allow tiny numeric noise.
+            trend_confirm = features["ReentryCount"] <= 0.5
             return balance_confirm, trend_confirm
         if feature == "InsideBarsRatio":
             balance_confirm = features["InsideBarsRatio"] >= self.balance_inside_ratio
@@ -95,8 +104,25 @@ class StateLabeler:
         inside_ratio = features.get("InsideBarsRatio")
 
         rule_a = pd.Series(False, index=features.index)
-        rule_b = (net_move >= self.transition_netmove) & (er.between(self.transition_er_low, self.transition_er_high))
+        # rule_b was the main reason TRANSITION dominated.
+        # Now: require being in the "in-between" zone AND show instability (break/reentry/inside-drop).
+        mid_zone = (
+            er.between(self.transition_er_low, self.transition_er_high)
+            & net_move.between(self.balance_netmove, self.trend_netmove)
+        )
         rule_c = pd.Series(False, index=features.index)
+        
+        instability = pd.Series(False, index=features.index)
+        if break_mag is not None:
+            instability = instability | (break_mag >= self.transition_breakmag)
+        if reentry is not None:
+            instability = instability | (reentry >= self.transition_reentry)
+        if inside_ratio is not None:
+            prev_inside = inside_ratio.shift(1)
+            drop = prev_inside - inside_ratio
+            instability = instability | (drop >= self.transition_inside_drop)
+
+        rule_b = mid_zone & instability        
 
         if break_mag is not None and reentry is not None:
             rule_a = (break_mag >= self.transition_breakmag) & (reentry >= self.transition_reentry)
