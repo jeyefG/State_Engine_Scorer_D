@@ -34,6 +34,20 @@ class MT5Connector:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         df.set_index("time", inplace=True)
         return df
-
+    
+    def server_now(self, symbol: str) -> pd.Timestamp:
+        """
+        Return current MT5 server time inferred from last tick (naive timestamp).
+        This is the closest we can get to server clock using the Python MT5 API.
+        """
+        # Ensure symbol is selected so ticks update
+        mt5.symbol_select(symbol, True)
+    
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise RuntimeError("No se pudo obtener tick para inferir hora del servidor MT5.")
+    
+        # tick.time is seconds since epoch (server-side timestamp)
+        return pd.to_datetime(int(tick.time), unit="s")
 
 __all__ = ["MT5Connector"]
