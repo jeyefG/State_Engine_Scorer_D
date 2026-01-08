@@ -17,8 +17,9 @@ class FeatureConfig:
     """Configuration for PA-based features."""
 
     window: int = 24
-    acceptance_lookback: int = 8
+    recent_window: int = 8
     enable_slopes: bool = False
+    include_er_netmove: bool = False
 
 
 class FeatureEngineer:
@@ -43,45 +44,52 @@ class FeatureEngineer:
         close = ohlcv["close"]
 
         atr_w = self._atr(high, low, close, cfg.window)
-        displacement = (close - close.shift(cfg.window)).abs() / atr_w
-        path_length = close.diff().abs().rolling(cfg.window).sum() / atr_w
-        efficiency = displacement / path_length.replace(0, np.nan)
+        atr_n = self._atr(high, low, close, cfg.recent_window)
+
+        displacement = (close - close.shift(cfg.window)).abs()
+        path_raw = close.diff().abs().rolling(cfg.window).sum()
+        efficiency = displacement / path_raw.replace(0, np.nan)
+
+        net_move = displacement / atr_w.replace(0, np.nan)
+        path = path_raw / atr_w.replace(0, np.nan)
 
         range_high = high.rolling(cfg.window).max()
         range_low = low.rolling(cfg.window).min()
         range_width = (range_high - range_low)
-        range_w = range_width / atr_w
+        range_w = range_width / atr_w.replace(0, np.nan)
 
-        close_location = (close - range_low) / range_width.replace(0, np.nan)
+        close_location = self._close_location(close, range_low, range_width)
+        break_mag = self._break_magnitude(close, range_low, range_high, atr_n)
 
-        acceptance = self._acceptance_ratio(
+        reentry = self._reentry_count(
             close,
             range_low,
-            range_width,
-            cfg.window,
-            cfg.acceptance_lookback,
+            range_high,
+            cfg.recent_window,
         )
-
-        reentry = self._reentry_count(close, range_low, range_high, cfg.window)
-        inside_ratio = self._inside_bars_ratio(high, low, cfg.window)
+        inside_ratio = self._inside_bars_ratio(high, low, cfg.recent_window)
         swing_counts = self._swing_counts(high, low, cfg.window)
+
+        atr_ratio = atr_n / atr_w.replace(0, np.nan)
 
         features = pd.DataFrame(
             {
-                "D": displacement,
+                "NetMove": net_move,
+                "Path": path,
                 "ER": efficiency,
-                "A": acceptance,
                 "Range_W": range_w,
                 "CloseLocation": close_location,
+                "BreakMag": break_mag,
                 "ReentryCount": reentry,
                 "InsideBarsRatio": inside_ratio,
-                "SwingCounts": swing_counts,
+                "SwingCount": swing_counts,
+                "ATR_Ratio": atr_ratio,
             },
             index=ohlcv.index,
         )
 
         if cfg.enable_slopes:
-            features["EfficiencySlope"] = self._slope(efficiency, cfg.window)
+            features["ERSlope"] = self._slope(efficiency, cfg.window)
             features["RangeSlope"] = self._slope(range_w, cfg.window)
 
         return features
@@ -89,18 +97,28 @@ class FeatureEngineer:
     def feature_names(self) -> List[str]:
         """Return the ordered list of feature names."""
         names = [
-            "D",
-            "ER",
-            "A",
+            "Path",
             "Range_W",
             "CloseLocation",
+            "BreakMag",
             "ReentryCount",
             "InsideBarsRatio",
-            "SwingCounts",
+            "SwingCount",
+            "ATR_Ratio",
         ]
+        if self.config.include_er_netmove:
+            names = ["NetMove", "ER", *names]
         if self.config.enable_slopes:
-            names.extend(["EfficiencySlope", "RangeSlope"])
+            names.extend(["ERSlope", "RangeSlope"])
         return names
+
+    def training_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Return features aligned with the configured training set."""
+        names = self.feature_names()
+        missing = [name for name in names if name not in features.columns]
+        if missing:
+            raise ValueError(f"Missing expected features: {missing}")
+        return features[names]
 
     @staticmethod
     def _validate_input(ohlcv: pd.DataFrame) -> None:
@@ -123,23 +141,23 @@ class FeatureEngineer:
         return tr.rolling(window).mean()
 
     @staticmethod
-    def _acceptance_ratio(
+    def _close_location(
         close: pd.Series,
         range_low: pd.Series,
         range_width: pd.Series,
-        window: int,
-        lookback: int,
     ) -> pd.Series:
-        direction = np.sign(close - close.shift(window))
-        upper_zone = range_low + (2.0 / 3.0) * range_width
-        lower_zone = range_low + (1.0 / 3.0) * range_width
+        location = (close - range_low) / range_width.replace(0, np.nan)
+        return location.fillna(0.5)
 
-        up_accept = close >= upper_zone
-        down_accept = close <= lower_zone
-        zone_accept = np.where(direction >= 0, up_accept, down_accept)
-        zone_accept = pd.Series(zone_accept, index=close.index)
-
-        return zone_accept.rolling(lookback).mean()
+    @staticmethod
+    def _break_magnitude(
+        close: pd.Series,
+        range_low: pd.Series,
+        range_high: pd.Series,
+        atr_n: pd.Series,
+    ) -> pd.Series:
+        clamped = close.clip(lower=range_low, upper=range_high)
+        return (close - clamped).abs() / atr_n.replace(0, np.nan)
 
     @staticmethod
     def _reentry_count(
@@ -149,8 +167,8 @@ class FeatureEngineer:
         window: int,
     ) -> pd.Series:
         inside = (close >= range_low) & (close <= range_high)
-        prev_inside = inside.shift(1)
-        reentry = inside & (prev_inside == False)
+        outside = ~inside
+        reentry = outside.shift(1) & inside
         return reentry.rolling(window).sum()
 
     @staticmethod
@@ -162,9 +180,9 @@ class FeatureEngineer:
 
     @staticmethod
     def _swing_counts(high: pd.Series, low: pd.Series, window: int) -> pd.Series:
-        swing_up = (high > high.shift(1)) & (high.shift(1) > high.shift(2))
-        swing_down = (low < low.shift(1)) & (low.shift(1) < low.shift(2))
-        swings = swing_up | swing_down
+        pivot_high = (high > high.shift(1)) & (high > high.shift(-1))
+        pivot_low = (low < low.shift(1)) & (low < low.shift(-1))
+        swings = (pivot_high | pivot_low).shift(1)
         return swings.rolling(window).sum()
 
     @staticmethod
