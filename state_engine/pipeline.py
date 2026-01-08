@@ -14,6 +14,7 @@ from .labels import StateLabeler
 class DatasetArtifacts:
     features: pd.DataFrame
     labels: pd.Series
+    full_features: pd.DataFrame
 
 
 class DatasetBuilder:
@@ -29,10 +30,10 @@ class DatasetBuilder:
 
     def build(self, ohlcv: pd.DataFrame) -> DatasetArtifacts:
         """Compute features and labels from OHLCV data."""
-        features = self.feature_engineer.compute_features(ohlcv)
-        labels = self.labeler.label(features)
-        return DatasetArtifacts(features=features, labels=labels)
+        full_features = self.feature_engineer.compute_features(ohlcv)
+        labels = self.labeler.label(full_features)
+        features = self.feature_engineer.training_features(full_features)
+        return DatasetArtifacts(features=features, labels=labels, full_features=full_features)
 
 
 __all__ = ["DatasetArtifacts", "DatasetBuilder"]
-
