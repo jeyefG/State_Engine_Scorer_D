@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("models"),
+        default=str(PROJECT_ROOT / "state_engine" / "models"),
         help="Directorio donde se encuentran los modelos entrenados.",
     )
     parser.add_argument(
@@ -182,7 +182,7 @@ def main() -> None:
         while True:
             for symbol in symbols:
                 server_now = connector.server_now(symbol).tz_localize(None)
-                cutoff = server_now.floor("H")
+                cutoff = server_now.floor("h")
                 start = cutoff - timedelta(days=args.lookback_days)
                 end = cutoff + timedelta(days=1)
 
