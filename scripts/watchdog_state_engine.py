@@ -6,7 +6,9 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
+import signal
 import sys
+import threading
 import time
 from typing import Any
 
@@ -26,6 +28,15 @@ from state_engine.pipeline import DatasetBuilder
 
 
 LABEL_ORDER = [StateLabels.BALANCE, StateLabels.TRANSITION, StateLabels.TREND]
+
+
+def try_import_rich() -> dict[str, Any] | None:
+    try:
+        from rich.console import Console
+
+        return {"Console": Console}
+    except Exception:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +123,7 @@ def render_summary(
     gating: pd.DataFrame,
     last_bar_ts: pd.Timestamp,
     server_now: pd.Timestamp,
+    console: Any | None,
 ) -> None:
     allow_any = gating.any(axis=1)
     gating_allow_rate = float(allow_any.mean()) if len(gating) else 0.0
@@ -140,6 +152,36 @@ def render_summary(
     accuracy = metadata.get("accuracy")
     f1_macro = metadata.get("f1_macro")
 
+    state_label = StateLabels(int(last_state_hat)).name if last_state_hat is not None else "NA"
+    margin_value = f"{last_margin:.4f}" if last_margin is not None else "NA"
+
+    if console:
+        console.print()
+        console.print("[bold]=== State Engine Training Summary ===[/bold]")
+        console.print(f"[cyan]Symbol:[/cyan] {symbol}")
+        if trained_start and trained_end:
+            console.print(f"[cyan]Period:[/cyan] {trained_start} -> {trained_end}")
+        if n_samples is not None and n_train is not None and n_test is not None:
+            console.print(f"[cyan]Samples:[/cyan] {n_samples} (train={n_train}, test={n_test})")
+        console.print(f"[cyan]Baseline:[/cyan] {baseline_label} ({baseline_pct:.2f}%)")
+        if accuracy is not None and f1_macro is not None:
+            console.print(f"[cyan]Accuracy:[/cyan] {accuracy:.4f} | [cyan]F1 Macro:[/cyan] {f1_macro:.4f}")
+        console.print(
+            f"[cyan]Gating allow rate:[/cyan] {gating_allow_rate*100:.2f}% "
+            f"(block {gating_block_rate*100:.2f}%)"
+        )
+        console.print(f"[cyan]Last H1 bar used:[/cyan] {last_bar_ts} | age_min={bar_age_minutes:.2f}")
+        console.print(
+            f"[cyan]Server now (tick):[/cyan] {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}"
+        )
+        console.print(
+            f"[cyan]Last bar decision:[/cyan] ALLOW={last_allow} | state_hat={state_label} | margin={margin_value}"
+        )
+        console.print(f"[cyan]Last bar rules fired:[/cyan] {last_rules if last_rules else '[]'}")
+        console.print(f"[cyan]Model saved:[/cyan] {model_path}")
+        return
+
+    print()
     print("=== State Engine Training Summary ===")
     print(f"Symbol: {symbol}")
     if trained_start and trained_end:
@@ -152,8 +194,6 @@ def render_summary(
     print(f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)")
     print(f"Last H1 bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
     print(f"Server now (tick): {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}")
-    state_label = StateLabels(int(last_state_hat)).name if last_state_hat is not None else "NA"
-    margin_value = f"{last_margin:.4f}" if last_margin is not None else "NA"
     print(f"Last bar decision: ALLOW={last_allow} | state_hat={state_label} | margin={margin_value}")
     print(f"Last bar rules fired: {last_rules if last_rules else '[]'}")
     print(f"Model saved: {model_path}")
@@ -165,6 +205,16 @@ def main() -> None:
     if not symbols:
         raise ValueError("Debe especificar al menos un símbolo en --symbols.")
 
+    stop_event = threading.Event()
+
+    def _handle_stop(signum: int, frame: Any) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+
+    rich_modules = try_import_rich()
+    console = rich_modules["Console"]() if rich_modules else None
     connector = MT5Connector()
     models: dict[str, StateEngineModel] = {}
     model_paths: dict[str, Path] = {}
@@ -180,6 +230,8 @@ def main() -> None:
         last_seen: dict[str, pd.Timestamp] = {}
 
         while True:
+            if stop_event.is_set():
+                break
             for symbol in symbols:
                 server_now = connector.server_now(symbol).tz_localize(None)
                 cutoff = server_now.floor("h")
@@ -222,13 +274,15 @@ def main() -> None:
                         gating=gating,
                         last_bar_ts=last_bar_ts,
                         server_now=server_now,
+                        console=console,
                     )
 
                 last_seen[symbol] = last_bar_ts
 
             if args.once:
                 break
-            time.sleep(args.poll_seconds)
+            if stop_event.wait(timeout=args.poll_seconds):
+                break
     finally:
         connector.shutdown()
 
