@@ -6,7 +6,7 @@ import argparse
 import json
 import logging
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import sys
 
@@ -31,6 +31,8 @@ from state_engine.pipeline import DatasetBuilder
 
 
 def parse_args() -> argparse.Namespace:
+    
+    default_end = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(description="Train State Engine model.")
     parser.add_argument("--symbol", required=True, help="Símbolo MT5 (ej. EURUSD)")
     parser.add_argument(
@@ -40,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--end",
-        required=True,
+        default = default_end,
         help="Fecha fin (YYYY-MM-DD) para descarga H1",
     )
     parser.add_argument(
