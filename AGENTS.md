@@ -1,6 +1,6 @@
 # AGENTS.md — State Engine (PA-first)
 
-Propósito
+## Propósito
 Este repositorio implementa un State Engine para trading discrecional/semisistemático basado en Price Action (PA).
 El objetivo es clasificar el estado del mercado y habilitar/prohibir familias de setups mediante reglas explícitas (ALLOW_*),
 reduciendo errores estructurales y sosteniendo estabilidad cognitiva.
