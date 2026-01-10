@@ -34,6 +34,21 @@ class MT5Connector:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         df.set_index("time", inplace=True)
         return df
+
+    def obtener_m5(
+        self,
+        symbol: str,
+        fecha_inicio: datetime,
+        fecha_fin: datetime,
+    ) -> pd.DataFrame:
+        """Obtener velas M5 en el rango dado."""
+        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, fecha_inicio, fecha_fin)
+        if rates is None or len(rates) == 0:
+            raise RuntimeError("No se pudieron obtener datos M5 desde MT5.")
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df.set_index("time", inplace=True)
+        return df
     
     def server_now(self, symbol: str) -> pd.Timestamp:
         """
