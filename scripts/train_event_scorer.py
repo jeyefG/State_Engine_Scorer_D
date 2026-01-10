@@ -37,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD) para descarga M5/H1")
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--model-out", type=Path, default=None, help="Ruta de salida para Event Scorer")
-    parser.add_argument("--model-dir", type=Path, default=Path("models"), help="Directorio base para modelos")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path(PROJECT_ROOT / "state_engine" / "models"),
+        help="Directorio base para modelos",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8, help="Ratio train/calibración")
     parser.add_argument("--k-bars", type=int, default=24, help="Ventana futura K para etiquetas")
     parser.add_argument("--reward-r", type=float, default=1.0, help="R múltiplo para TP proxy")

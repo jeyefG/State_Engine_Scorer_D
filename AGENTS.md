@@ -206,3 +206,13 @@ Un sistema que:
 - Habilita/prohíbe familias explícitamente.
 - Reduce errores estructurales.
 - Prioriza supervivencia y disciplina sobre actividad.
+
+================================================================
+Notas operativas (Event Scorer M5)
+================================================================
+
+- El etiquetado del Event Scorer usa triple-barrier con `r_outcome` continuo.
+  La etiqueta binaria deriva de `r_outcome` con umbral configurable.
+- La evaluación enfatiza ranking (precision@K / lift@K) por familia y por bins de `margin_H1`.
+- El scorer opera por familia (`EventScorerBundle`), manteniendo telemetría; no genera señales.
+- Los scripts de entrenamiento/backtest usan por defecto `state_engine/models` como base de modelos.

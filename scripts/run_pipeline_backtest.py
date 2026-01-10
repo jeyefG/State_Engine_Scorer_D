@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD)")
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--scorer-model", type=Path, default=None, help="Ruta del modelo Event Scorer (pkl)")
-    parser.add_argument("--model-dir", type=Path, default=Path("models"), help="Directorio base para modelos")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path(PROJECT_ROOT / "state_engine" / "models"),
+        help="Directorio base para modelos",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directorio base para resultados")
     parser.add_argument("--edge-threshold", type=float, default=0.6, help="Threshold global edge_score")
     parser.add_argument("--max-holding-bars", type=int, default=24, help="Máximo de velas M5 por trade")

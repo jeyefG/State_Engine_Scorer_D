@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("models"),
+        default=Path(PROJECT_ROOT / "state_engine" / "models"),
         help="Directorio base para guardar el modelo cuando --model-out no se especifica.",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
