@@ -1,4 +1,9 @@
-"""Train the Event Scorer model from MT5 data."""
+"""Train the Event Scorer model from MT5 data.
+
+The scorer uses a triple-barrier continuous outcome (r_outcome) and reports
+ranking metrics like lift@K to gauge whether top-ranked events outperform the
+base rate. lift@K = precision@K / base_rate.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
-from state_engine.scoring import EventScorer, EventScorerConfig, FeatureBuilder
+from state_engine.scoring import EventScorerBundle, EventScorerConfig, FeatureBuilder
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k-bars", type=int, default=24, help="Ventana futura K para etiquetas")
     parser.add_argument("--reward-r", type=float, default=1.0, help="R múltiplo para TP proxy")
     parser.add_argument("--sl-mult", type=float, default=1.0, help="Multiplicador de ATR para SL proxy")
+    parser.add_argument("--r-thr", type=float, default=0.0, help="Umbral para label binario basado en r_outcome")
+    parser.add_argument("--tie-break", default="distance", choices=["distance", "worst"], help="Tie-break TP/SL")
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
     return parser.parse_args()
 
@@ -100,7 +107,7 @@ def main() -> None:
     ohlcv_m5 = connector.obtener_m5(args.symbol, fecha_inicio, fecha_fin)
     server_now = connector.server_now(args.symbol).tz_localize(None)
 
-    h1_cutoff = server_now.floor("H")
+    h1_cutoff = server_now.floor("h")
     m5_cutoff = server_now.floor("5min")
     ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < h1_cutoff]
     ohlcv_m5 = ohlcv_m5[ohlcv_m5.index < m5_cutoff]
@@ -123,8 +130,16 @@ def main() -> None:
         logger.warning("No events detected; exiting.")
         return
 
-    events = label_events(events, ohlcv_m5, args.k_bars, args.reward_r, args.sl_mult)
-    events = events.dropna(subset=["label"])
+    events = label_events(
+        events,
+        ohlcv_m5,
+        args.k_bars,
+        args.reward_r,
+        args.sl_mult,
+        r_thr=args.r_thr,
+        tie_break=args.tie_break,
+    )
+    events = events.dropna(subset=["label", "r_outcome"])
     events = events.sort_index()
 
     if events.empty:
@@ -142,14 +157,108 @@ def main() -> None:
     y_train = labels.iloc[:split_idx]
     X_calib = event_features.iloc[split_idx:]
     y_calib = labels.iloc[split_idx:]
+    fam_train = events["family_id"].iloc[:split_idx]
+    fam_calib = events["family_id"].iloc[split_idx:]
 
-    scorer = EventScorer(EventScorerConfig())
-    scorer.fit(X_train, y_train, calib_features=X_calib, calib_labels=y_calib)
+    family_summary = pd.DataFrame(
+        {
+            "family_id": sorted(set(events["family_id"])),
+        }
+    )
+    family_summary["samples_train"] = family_summary["family_id"].map(fam_train.value_counts()).fillna(0).astype(int)
+    family_summary["samples_calib"] = family_summary["family_id"].map(fam_calib.value_counts()).fillna(0).astype(int)
+    logger.info("Family counts:\n%s", family_summary.to_string(index=False))
+
+    scorer = EventScorerBundle(EventScorerConfig())
+    scorer.fit(
+        X_train,
+        y_train,
+        fam_train,
+        calib_features=X_calib,
+        calib_labels=y_calib,
+        calib_family_ids=fam_calib,
+    )
+
+    def precision_at_k(scores: pd.Series, labels_: pd.Series, k: int) -> float:
+        if scores.empty:
+            return float("nan")
+        k_eff = min(k, len(scores))
+        top_idx = scores.nlargest(k_eff).index
+        return float(labels_.loc[top_idx].mean())
+
+    def lift_at_k(scores: pd.Series, labels_: pd.Series, k: int) -> float:
+        base_rate = float(labels_.mean())
+        if base_rate == 0 or scores.empty:
+            return float("nan")
+        return precision_at_k(scores, labels_, k) / base_rate
+
+    def summarize_metrics(scope: str, scores: pd.Series, labels_: pd.Series) -> dict[str, float]:
+        base_rate = float(labels_.mean()) if not labels_.empty else float("nan")
+        metrics = {
+            "scope": scope,
+            "samples": len(labels_),
+            "base_rate": base_rate,
+            "auc": float("nan"),
+            "lift@10": lift_at_k(scores, labels_, 10),
+            "lift@20": lift_at_k(scores, labels_, 20),
+            "lift@50": lift_at_k(scores, labels_, 50),
+        }
+        if len(labels_.unique()) > 1:
+            metrics["auc"] = roc_auc_score(labels_, scores)
+        return metrics
+
+    metrics_rows: list[dict[str, float]] = []
+    baseline_rows: list[dict[str, float]] = []
 
     if not y_calib.empty:
-        preds = scorer.predict_proba(X_calib)
-        auc = roc_auc_score(y_calib, preds)
-        logger.info("AUC_calib=%.4f samples=%s", auc, len(y_calib))
+        preds = scorer.predict_proba(X_calib, fam_calib)
+        metrics_rows.append(summarize_metrics("global", preds, y_calib))
+        baseline_scores = pd.Series(0.0, index=y_calib.index)
+        baseline_rows.append(summarize_metrics("global_baseline", baseline_scores, y_calib))
+
+        for family_id, fam_labels in y_calib.groupby(fam_calib):
+            fam_scores = preds.loc[fam_labels.index]
+            metrics_rows.append(summarize_metrics(family_id, fam_scores, fam_labels))
+            baseline_rows.append(summarize_metrics(f"{family_id}_baseline", baseline_scores.loc[fam_labels.index], fam_labels))
+
+        margin_series = df_m5_ctx["margin_H1"].reindex(y_calib.index)
+        try:
+            bins = pd.qcut(margin_series, q=3, duplicates="drop")
+        except ValueError:
+            bins = pd.Series(index=margin_series.index, dtype="object")
+        if not bins.empty:
+            for bin_label, bin_labels in y_calib.groupby(bins):
+                bin_scores = preds.loc[bin_labels.index]
+                metrics_rows.append(summarize_metrics(f"margin_bin_{bin_label}", bin_scores, bin_labels))
+
+    metrics_df = pd.DataFrame(metrics_rows)
+    baseline_df = pd.DataFrame(baseline_rows)
+    if not metrics_df.empty:
+        logger.info("Event scorer metrics (calib):\n%s", metrics_df.to_string(index=False))
+    if not baseline_df.empty:
+        logger.info("Baseline metrics (calib):\n%s", baseline_df.to_string(index=False))
+
+    if not metrics_df.empty and not baseline_df.empty:
+        lift_cols = ["lift@10", "lift@20", "lift@50"]
+        merged = metrics_df.set_index("scope")[lift_cols].fillna(0)
+        baseline = baseline_df.set_index("scope")[lift_cols].fillna(0)
+        improved = False
+        for scope in merged.index:
+            if scope.endswith("_baseline"):
+                continue
+            base_scope = f"{scope}_baseline"
+            if base_scope in baseline.index:
+                if (merged.loc[scope] > baseline.loc[base_scope]).any():
+                    improved = True
+                    break
+        if not improved:
+            logger.warning("No family improved lift@K vs baseline; review signal quality.")
+
+    metrics_summary = {}
+    if not metrics_df.empty:
+        global_row = metrics_df[metrics_df["scope"] == "global"]
+        if not global_row.empty:
+            metrics_summary = global_row.iloc[0].to_dict()
 
     metadata = {
         "symbol": args.symbol,
@@ -157,13 +266,32 @@ def main() -> None:
         "k_bars": args.k_bars,
         "reward_r": args.reward_r,
         "sl_mult": args.sl_mult,
+        "r_thr": args.r_thr,
+        "tie_break": args.tie_break,
         "feature_count": event_features.shape[1],
+        "train_date": datetime.utcnow().isoformat(),
+        "metrics_summary": metrics_summary,
     }
     scorer.save(scorer_out, metadata=metadata)
 
-    logger.info("events_total=%s labeled=%s", len(events), len(labels))
+    summary_table = pd.DataFrame(
+        [
+            {
+                "events_total": len(events),
+                "labeled": len(labels),
+                "feature_count": event_features.shape[1],
+            }
+        ]
+    )
+    logger.info("Summary:\n%s", summary_table.to_string(index=False))
     logger.info("label_distribution=%s", labels.value_counts(normalize=True).to_dict())
     logger.info("model_out=%s", scorer_out)
+
+    if not metrics_df.empty:
+        metrics_path = args.model_dir / f"metrics_{_safe_symbol(args.symbol)}_event_scorer.csv"
+        args.model_dir.mkdir(parents=True, exist_ok=True)
+        metrics_df.to_csv(metrics_path, index=False)
+        logger.info("metrics_out=%s", metrics_path)
 
 
 if __name__ == "__main__":

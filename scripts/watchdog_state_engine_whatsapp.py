@@ -27,7 +27,7 @@ from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.pipeline import DatasetBuilder
-from state_engine.scoring import EventScorer, FeatureBuilder
+from state_engine.scoring import EventScorerBundle, FeatureBuilder
 
 
 LABEL_ORDER = [StateLabels.BALANCE, StateLabels.TRANSITION, StateLabels.TREND]
@@ -165,9 +165,9 @@ def load_event_scorer(
     symbol: str,
     scorer_dir: Path,
     template: str,
-) -> tuple[EventScorer | None, Path]:
+) -> tuple[EventScorerBundle | None, Path]:
     path = scorer_dir / template.format(symbol=safe_symbol(symbol))
-    scorer = EventScorer()
+    scorer = EventScorerBundle()
     if not path.exists():
         return None, path
     scorer.load(path)
@@ -312,7 +312,7 @@ def main() -> None:
     models: dict[str, StateEngineModel] = {}
     model_paths: dict[str, Path] = {}
     feature_configs: dict[str, FeatureConfig] = {}
-    scorers: dict[str, EventScorer | None] = {}
+    scorers: dict[str, EventScorerBundle | None] = {}
     scorer_paths: dict[str, Path] = {}
 
     def _signal_handler(sig: int, frame: Any) -> None:
@@ -432,7 +432,7 @@ def main() -> None:
                                 event_features = feature_builder.add_family_features(
                                     event_features, events_df["family_id"]
                                 )
-                                edge_scores = scorer.predict_proba(event_features)
+                            edge_scores = scorer.predict_proba(event_features, events["family_id"])
                                 ranked = events_df.copy()
                                 ranked["edge_score"] = edge_scores
                                 ranked = _entry_proxy(ranked, df_m5)
