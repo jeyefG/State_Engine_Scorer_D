@@ -7,7 +7,7 @@ from .gating import GatingPolicy, GatingThresholds
 from .labels import StateLabeler, StateLabels
 from .model import StateEngineModel, StateEngineModelConfig
 from .mt5_connector import MT5Connector
-from .scoring import EventScorer, EventScorerConfig, FeatureBuilder
+from .scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from .sweep import run_param_sweep
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "StateEngineModelConfig",
     "MT5Connector",
     "EventScorer",
+    "EventScorerBundle",
     "EventScorerConfig",
     "FeatureBuilder",
     "run_param_sweep",

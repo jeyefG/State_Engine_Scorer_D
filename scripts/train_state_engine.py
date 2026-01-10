@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("models"),
+        default=Path(PROJECT_ROOT / "state_engine" / "models"),
         help="Directorio base para guardar el modelo cuando --model-out no se especifica.",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
@@ -192,8 +192,8 @@ def main() -> None:
     server_now = connector.server_now(args.symbol).tz_localize(None)
     
     # 2) Guardrail correcto: usar solo velas H1 cerradas según hora servidor
-    #    La vela en formación empieza en server_now.floor("H")
-    cutoff = server_now.floor("H")
+    #    La vela en formación empieza en server_now.floor("h")
+    cutoff = server_now.floor("h")
     ohlcv = ohlcv[ohlcv.index < cutoff]
     
     # 3) Timestamp última vela usada

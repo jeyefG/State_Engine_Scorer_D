@@ -20,7 +20,7 @@ from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
-from state_engine.scoring import EventScorer, FeatureBuilder
+from state_engine.scoring import EventScorerBundle, FeatureBuilder
 from state_engine.sweep import run_param_sweep
 
 
@@ -33,7 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD)")
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--scorer-model", type=Path, default=None, help="Ruta del modelo Event Scorer (pkl)")
-    parser.add_argument("--model-dir", type=Path, default=Path("models"), help="Directorio base para modelos")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path(PROJECT_ROOT / "state_engine" / "models"),
+        help="Directorio base para modelos",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directorio base para resultados")
     parser.add_argument("--edge-threshold", type=float, default=0.6, help="Threshold global edge_score")
     parser.add_argument("--max-holding-bars", type=int, default=24, help="Máximo de velas M5 por trade")
@@ -87,7 +92,7 @@ def merge_h1_m5(ctx_h1: pd.DataFrame, ohlcv_m5: pd.DataFrame) -> pd.DataFrame:
 def allow_constant_within_hour(df_m5_ctx: pd.DataFrame, allow_cols: list[str]) -> bool:
     if not allow_cols:
         return True
-    grouped = df_m5_ctx[allow_cols].groupby(df_m5_ctx.index.floor("H"))
+    grouped = df_m5_ctx[allow_cols].groupby(df_m5_ctx.index.floor("h"))
     diffs = grouped.nunique().max()
     return bool((diffs <= 1).all())
 
@@ -183,7 +188,7 @@ def main() -> None:
     ohlcv_m5 = connector.obtener_m5(args.symbol, fecha_inicio, fecha_fin)
 
     server_now = connector.server_now(args.symbol).tz_localize(None)
-    ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < server_now.floor("H")]
+    ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < server_now.floor("h")]
     ohlcv_m5 = ohlcv_m5[ohlcv_m5.index < server_now.floor("5min")]
 
     if not state_model_path.exists():
@@ -215,9 +220,9 @@ def main() -> None:
 
     use_fallback = False
     if scorer_model_path.exists():
-        scorer = EventScorer()
+        scorer = EventScorerBundle()
         scorer.load(scorer_model_path)
-        edge_scores = scorer.predict_proba(event_features)
+        edge_scores = scorer.predict_proba(event_features, events["family_id"])
     else:
         use_fallback = True
         edge_scores = pd.Series(0.5, index=event_features.index, name="edge_score")

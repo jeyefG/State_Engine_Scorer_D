@@ -7,7 +7,7 @@ python scripts/train_state_engine.py \
   --symbol XAUUSD \
   --start 2024-01-01 \
   --end 2025-12-31 \
-  --model-out models/xauusd_state_engine.pkl \
+  --model-out state_engine/models/xauusd_state_engine.pkl \
   --report-out reports/xauusd_state_engine.json \
   --class-weight-balanced
 ```
@@ -23,17 +23,24 @@ Opciones útiles:
 
 ## Event Scorer (M5) + Backtesting
 
-Entrena el Event Scorer (M5) usando el contexto H1 ya desplazado y el etiquetado proxy:
+Entrena el Event Scorer (M5) usando el contexto H1 ya desplazado y un triple-barrier con
+`r_outcome` continuo (el score es telemetría; no genera señales):
 
 ```bash
 python scripts/train_event_scorer.py \
   --symbol XAUUSD \
   --start 2024-01-01 \
   --end 2025-12-31 \
-  --model-dir models \
+  --model-dir state_engine/models \
   --k-bars 24 \
   --reward-r 1.0 \
-  --sl-mult 1.0
+  --sl-mult 1.0 \
+  --r-thr 0.0 \
+  --tie-break distance
+
+Notas:
+- Se reportan métricas de ranking en calibración: precision@K y lift@K por familia y por bins de `margin_H1`.
+- También se guarda un CSV opcional en `state_engine/models/metrics_{symbol}_event_scorer.csv`.
 ```
 
 Ejecuta el pipeline de backtest (State Engine H1 → Events M5 → Scorer → Signals → Backtest):
@@ -43,7 +50,7 @@ python scripts/run_pipeline_backtest.py \
   --symbol XAUUSD \
   --start 2024-01-01 \
   --end 2025-12-31 \
-  --model-dir models \
+  --model-dir state_engine/models \
   --edge-threshold 0.6 \
   --max-holding-bars 24 \
   --reward-r 1.0 \

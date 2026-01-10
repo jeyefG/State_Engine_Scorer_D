@@ -22,9 +22,11 @@ class EventFamily(str, Enum):
 class EventDetectionConfig:
     balance_window: int = 12
     balance_edge: float = 0.20
+    balance_min_range_atr: float = 0.8
     transition_window: int = 12
     trend_window: int = 6
     trend_pullback_edge: float = 0.30
+    trend_momentum_atr_thr: float = 0.3
     trend_continuation_comp_window: int = 6
     trend_continuation_break_window: int = 6
     trend_continuation_comp_thr: float = 1.2
@@ -61,9 +63,14 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
     range_low = low.rolling(cfg.balance_window).min()
     range_width = (range_high - range_low).replace(0, np.nan)
     location = (close - range_low) / range_width
+    if "atr_short" in df.columns:
+        atr_short = df["atr_short"]
+    else:
+        atr_short = _atr(high, low, close, 14)
+    range_filter = (range_width / atr_short.replace(0, np.nan)) > cfg.balance_min_range_atr
     balance_mask = df["ALLOW_balance_fade"] == 1
-    balance_short = balance_mask & (location >= (1.0 - cfg.balance_edge))
-    balance_long = balance_mask & (location <= cfg.balance_edge)
+    balance_short = balance_mask & range_filter & (location >= (1.0 - cfg.balance_edge))
+    balance_long = balance_mask & range_filter & (location <= cfg.balance_edge)
     if balance_short.any():
         subset = df.loc[balance_short].copy()
         subset["family_id"] = EventFamily.BALANCE_FADE.value
@@ -96,9 +103,10 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
     trend_range_low = low.rolling(cfg.trend_window).min()
     trend_range_width = (trend_range_high - trend_range_low).replace(0, np.nan)
     pullback_edge = cfg.trend_pullback_edge
+    momentum_norm = momentum / atr_short.replace(0, np.nan)
 
-    uptrend = trend_mask & (momentum > 0)
-    downtrend = trend_mask & (momentum < 0)
+    uptrend = trend_mask & (momentum_norm > cfg.trend_momentum_atr_thr)
+    downtrend = trend_mask & (momentum_norm < -cfg.trend_momentum_atr_thr)
 
     up_pullback = uptrend & (close <= (trend_range_low + pullback_edge * trend_range_width)) & (close < close.shift(1))
     down_pullback = downtrend & (close >= (trend_range_high - pullback_edge * trend_range_width)) & (close > close.shift(1))
@@ -169,8 +177,11 @@ def label_events(
     reward_r: float,
     sl_mult: float,
     atr_window: int = 14,
+    r_thr: float = 0.0,
+    tie_break: str = "distance",
+    clip_mtm: bool = True,
 ) -> pd.DataFrame:
-    """Label events using a mechanical TP/SL proxy."""
+    """Label events using a triple-barrier proxy with continuous outcome."""
     if events_df.empty:
         return events_df.copy()
 
@@ -182,10 +193,14 @@ def label_events(
     df = events_df.copy()
     atr_short = _atr(df_m5["high"], df_m5["low"], df_m5["close"], atr_window)
 
+    if tie_break not in {"worst", "distance"}:
+        raise ValueError("tie_break must be 'worst' or 'distance'")
+
     entry_prices: list[float | None] = []
     sl_prices: list[float | None] = []
     tp_prices: list[float | None] = []
     labels: list[int | None] = []
+    r_outcomes: list[float | None] = []
 
     for ts, row in df.iterrows():
         if ts not in df_m5.index:
@@ -193,6 +208,7 @@ def label_events(
             sl_prices.append(None)
             tp_prices.append(None)
             labels.append(None)
+            r_outcomes.append(None)
             continue
 
         idx = df_m5.index.get_loc(ts)
@@ -202,6 +218,7 @@ def label_events(
             sl_prices.append(None)
             tp_prices.append(None)
             labels.append(None)
+            r_outcomes.append(None)
             continue
 
         entry_price = float(df_m5["open"].iloc[entry_idx])
@@ -211,17 +228,20 @@ def label_events(
             sl_prices.append(None)
             tp_prices.append(None)
             labels.append(None)
+            r_outcomes.append(None)
             continue
 
         sl_proxy = float(atr_value * sl_mult)
         if row["side"] == "long":
             sl = entry_price - sl_proxy
             tp = entry_price + reward_r * sl_proxy
+            direction = 1.0
         else:
             sl = entry_price + sl_proxy
             tp = entry_price - reward_r * sl_proxy
+            direction = -1.0
 
-        outcome = 0
+        outcome: float | None = None
         for future_idx in range(entry_idx, min(entry_idx + k_bars, len(df_m5.index))):
             high = df_m5["high"].iloc[future_idx]
             low = df_m5["low"].iloc[future_idx]
@@ -233,24 +253,44 @@ def label_events(
                 hit_tp = low <= tp
 
             if hit_sl and hit_tp:
-                outcome = 0
+                if tie_break == "worst":
+                    outcome = -1.0
+                else:
+                    open_price = float(df_m5["open"].iloc[future_idx])
+                    sl_dist = abs(open_price - sl)
+                    tp_dist = abs(tp - open_price)
+                    outcome = -1.0 if sl_dist <= tp_dist else reward_r
                 break
             if hit_sl:
-                outcome = 0
+                outcome = -1.0
                 break
             if hit_tp:
-                outcome = 1
+                outcome = reward_r
                 break
+
+        if outcome is None:
+            end_idx = min(entry_idx + k_bars - 1, len(df_m5.index) - 1)
+            close_end = float(df_m5["close"].iloc[end_idx])
+            sl_dist = sl_proxy if sl_proxy != 0 else np.nan
+            outcome = direction * (close_end - entry_price) / sl_dist
+            if clip_mtm and not pd.isna(outcome):
+                outcome = float(np.clip(outcome, -1.0, reward_r))
 
         entry_prices.append(entry_price)
         sl_prices.append(sl)
         tp_prices.append(tp)
-        labels.append(outcome)
+        if outcome is None or pd.isna(outcome):
+            r_outcomes.append(None)
+            labels.append(None)
+        else:
+            r_outcomes.append(float(outcome))
+            labels.append(int(outcome > r_thr))
 
     df["entry_price"] = entry_prices
     df["sl_price"] = sl_prices
     df["tp_price"] = tp_prices
     df["label"] = labels
+    df["r_outcome"] = r_outcomes
     return df
 
 
