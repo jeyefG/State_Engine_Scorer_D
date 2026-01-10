@@ -21,11 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from state_engine.features import FeatureConfig
+from state_engine.events import detect_events
 from state_engine.gating import GatingPolicy
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.pipeline import DatasetBuilder
+from state_engine.scoring import EventScorer, FeatureBuilder
 
 
 LABEL_ORDER = [StateLabels.BALANCE, StateLabels.TRANSITION, StateLabels.TREND]
@@ -85,6 +87,38 @@ def parse_args() -> argparse.Namespace:
         help="Ejecuta un solo ciclo y termina.",
     )
     parser.add_argument(
+        "--scorer-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directorio donde se encuentran los modelos del Event Scorer "
+            "(default: --model-dir o PROJECT_ROOT/models)."
+        ),
+    )
+    parser.add_argument(
+        "--scorer-template",
+        default="{symbol}_event_scorer.pkl",
+        help="Plantilla del nombre del scorer. Usa {symbol} ya sanitizado.",
+    )
+    parser.add_argument(
+        "--m5-lookback-min",
+        type=int,
+        default=180,
+        help="Ventana M5 a evaluar hacia atrás desde el cutoff (minutos).",
+    )
+    parser.add_argument(
+        "--top-events",
+        type=int,
+        default=5,
+        help="Número máximo de eventos M5 a mostrar en el ranking.",
+    )
+    parser.add_argument(
+        "--min-edge-score",
+        type=float,
+        default=None,
+        help="Umbral mínimo para mostrar eventos en el ranking.",
+    )
+    parser.add_argument(
         "--whatsapp-phone",
         default=os.getenv("WHATSAPP_PHONE"),
         help="Teléfono (con código país) para CallMeBot. También WHATSAPP_PHONE.",
@@ -125,6 +159,64 @@ def load_model(symbol: str, model_dir: Path, template: str) -> tuple[StateEngine
     model = StateEngineModel()
     model.load(path)
     return model, path
+
+
+def load_event_scorer(
+    symbol: str,
+    scorer_dir: Path,
+    template: str,
+) -> tuple[EventScorer | None, Path]:
+    path = scorer_dir / template.format(symbol=safe_symbol(symbol))
+    scorer = EventScorer()
+    if not path.exists():
+        return None, path
+    scorer.load(path)
+    return scorer, path
+
+
+def fetch_m5(
+    connector: MT5Connector,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> pd.DataFrame:
+    return connector.obtener_m5(symbol, start, end)
+
+
+def build_m5_context(
+    df_m5: pd.DataFrame,
+    outputs: pd.DataFrame,
+    gating: pd.DataFrame,
+) -> pd.DataFrame:
+    h1_ctx = outputs[["state_hat", "margin"]].rename(
+        columns={"state_hat": "state_hat_H1", "margin": "margin_H1"}
+    )
+    h1_ctx = h1_ctx.join(gating).shift(1).sort_index()
+    m5 = df_m5.sort_index().reset_index()
+    h1 = h1_ctx.reset_index()
+    merged = pd.merge_asof(m5, h1, on="time", direction="backward")
+    merged = merged.set_index("time")
+    allow_cols = [col for col in gating.columns if col in merged.columns]
+    if allow_cols:
+        merged[allow_cols] = merged[allow_cols].fillna(0).astype(int)
+    return merged
+
+
+def _entry_proxy(events_df: pd.DataFrame, df_m5: pd.DataFrame) -> pd.DataFrame:
+    event_idx = df_m5.index.get_indexer(events_df.index)
+    next_times = []
+    next_prices = []
+    for pos in event_idx:
+        if pos == -1 or pos + 1 >= len(df_m5.index):
+            next_times.append(None)
+            next_prices.append(None)
+            continue
+        next_times.append(df_m5.index[pos + 1])
+        next_prices.append(float(df_m5["open"].iloc[pos + 1]))
+    enriched = events_df.copy()
+    enriched["entry_proxy_time"] = next_times
+    enriched["entry_proxy_price"] = next_prices
+    return enriched
 
 
 def align_features(features: pd.DataFrame, labels: pd.Series) -> pd.DataFrame:
@@ -172,20 +264,15 @@ def build_summary(
     n_samples = metadata.get("n_samples")
     n_train = metadata.get("n_train")
     n_test = metadata.get("n_test")
-    accuracy = metadata.get("accuracy")
-    f1_macro = metadata.get("f1_macro")
-
     state_label = StateLabels(int(last_state_hat)).name if last_state_hat is not None else "NA"
     margin_value = f"{last_margin:.4f}" if last_margin is not None else "NA"
 
-    lines = ["=== State Engine Training Summary ===", f"Symbol: {symbol}"]
+    lines = ["=== State Engine Summary ===", f"Symbol: {symbol}"]
     if trained_start and trained_end:
         lines.append(f"Period: {trained_start} -> {trained_end}")
     if n_samples is not None and n_train is not None and n_test is not None:
         lines.append(f"Samples: {n_samples} (train={n_train}, test={n_test})")
     lines.append(f"Baseline: {baseline_label} ({baseline_pct:.2f}%)")
-    if accuracy is not None and f1_macro is not None:
-        lines.append(f"Accuracy: {accuracy:.4f} | F1 Macro: {f1_macro:.4f}")
     lines.append(
         f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)"
     )
@@ -213,6 +300,8 @@ def main() -> None:
     if not symbols:
         raise ValueError("Debe especificar al menos un símbolo en --symbols.")
 
+    scorer_dir = args.scorer_dir or args.model_dir or (PROJECT_ROOT / "models")
+
     notifier = build_notifier(args)
     if notifier is None:
         raise ValueError(
@@ -223,6 +312,8 @@ def main() -> None:
     models: dict[str, StateEngineModel] = {}
     model_paths: dict[str, Path] = {}
     feature_configs: dict[str, FeatureConfig] = {}
+    scorers: dict[str, EventScorer | None] = {}
+    scorer_paths: dict[str, Path] = {}
 
     def _signal_handler(sig: int, frame: Any) -> None:
         stop_event.set()
@@ -237,8 +328,12 @@ def main() -> None:
             models[symbol] = model
             model_paths[symbol] = path
             feature_configs[symbol] = feature_config_from_metadata(model.metadata)
+            scorer, scorer_path = load_event_scorer(symbol, scorer_dir, args.scorer_template)
+            scorers[symbol] = scorer
+            scorer_paths[symbol] = scorer_path
 
         last_seen: dict[str, pd.Timestamp] = {}
+        feature_builder = FeatureBuilder()
 
         while True:
             if stop_event.is_set():
@@ -277,19 +372,96 @@ def main() -> None:
 
                 last_idx = outputs.index.max()
                 allow_any = gating.any(axis=1)
-                if last_idx in allow_any.index and bool(allow_any.loc[last_idx]):
-                    summaries.append(
-                        build_summary(
-                            symbol=symbol,
-                            model_path=model_paths[symbol],
-                            metadata=models[symbol].metadata,
-                            labels=labels,
-                            outputs=outputs,
-                            gating=gating,
-                            last_bar_ts=last_bar_ts,
-                            server_now=server_now,
-                        )
+                last_allow = bool(allow_any.loc[last_idx]) if last_idx in allow_any.index else False
+                summary = build_summary(
+                    symbol=symbol,
+                    model_path=model_paths[symbol],
+                    metadata=models[symbol].metadata,
+                    labels=labels,
+                    outputs=outputs,
+                    gating=gating,
+                    last_bar_ts=last_bar_ts,
+                    server_now=server_now,
+                )
+
+                lines = [summary]
+                if last_allow:
+                    snapshot_start = cutoff - timedelta(minutes=args.m5_lookback_min)
+                    try:
+                        df_m5 = fetch_m5(connector, symbol, snapshot_start, cutoff)
+                        df_m5 = df_m5[df_m5.index <= cutoff]
+                    except Exception as exc:
+                        lines.append(f"Warning: M5 fetch failed for {symbol}: {exc}")
+                        summaries.append("\n".join(lines))
+                        last_seen[symbol] = last_bar_ts
+                        continue
+
+                    if df_m5.empty:
+                        lines.append(f"Warning: no M5 data for {symbol} in window.")
+                        summaries.append("\n".join(lines))
+                        last_seen[symbol] = last_bar_ts
+                        continue
+
+                    df_m5_ctx = build_m5_context(df_m5, outputs, gating)
+                    try:
+                        events_df = detect_events(df_m5_ctx)
+                    except Exception as exc:
+                        lines.append(f"Warning: event detection failed for {symbol}: {exc}")
+                        summaries.append("\n".join(lines))
+                        last_seen[symbol] = last_bar_ts
+                        continue
+
+                    event_counts = events_df["family_id"].value_counts().to_dict()
+                    lines.extend(
+                        [
+                            "=== Event Scorer (M5) Snapshot ===",
+                            f"Window: {snapshot_start} -> {cutoff}",
+                            f"Events detected: total={len(events_df)} | by_family={event_counts}",
+                        ]
                     )
+                    if events_df.empty:
+                        lines.append("no events detected in M5 window.")
+                    else:
+                        scorer = scorers.get(symbol)
+                        if scorer is None:
+                            lines.append("scorer not available – cannot rank opportunities.")
+                        else:
+                            try:
+                                base_features = feature_builder.build(df_m5_ctx)
+                                event_features = base_features.loc[events_df.index]
+                                event_features = feature_builder.add_family_features(
+                                    event_features, events_df["family_id"]
+                                )
+                                edge_scores = scorer.predict_proba(event_features)
+                                ranked = events_df.copy()
+                                ranked["edge_score"] = edge_scores
+                                ranked = _entry_proxy(ranked, df_m5)
+                                if args.min_edge_score is not None:
+                                    ranked = ranked[ranked["edge_score"] >= args.min_edge_score]
+                                ranked = ranked.sort_values("edge_score", ascending=False)
+                                lines.append("Top events (sorted by edge_score desc):")
+                                for idx, (ts, row) in enumerate(
+                                    ranked.head(args.top_events).iterrows(), start=1
+                                ):
+                                    side = str(row.get("side", "")).upper()
+                                    edge = row.get("edge_score")
+                                    edge_value = f"{edge:.2f}" if pd.notna(edge) else "NA"
+                                    entry_time = row.get("entry_proxy_time")
+                                    entry_price = row.get("entry_proxy_price")
+                                    lines.append(
+                                        f"{idx}) ts={ts} | family={row.get('family_id')} | "
+                                        f"side={side} | edge={edge_value}"
+                                    )
+                                    lines.append(
+                                        f"   entry_proxy_time={entry_time} | "
+                                        f"entry_proxy_price={entry_price}"
+                                    )
+                                if ranked.empty:
+                                    lines.append("no events above edge_score threshold.")
+                            except Exception as exc:
+                                lines.append(f"scorer error – cannot rank opportunities: {exc}")
+
+                summaries.append("\n".join(lines))
 
                 last_seen[symbol] = last_bar_ts
 
