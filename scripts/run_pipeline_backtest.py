@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 
 from state_engine.backtest import BacktestConfig, Signal, run_backtest
-from state_engine.events import detect_events
+from state_engine.events import EventFamily, detect_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
@@ -120,17 +120,24 @@ def build_signals(
         if pd.isna(atr_value):
             continue
         sl_proxy = float(atr_value * sl_mult)
+        trigger_required = row["family_id"] != EventFamily.TREND_CONTINUATION.value
         if row["side"] == "long":
             sl = entry_price - sl_proxy
             tp = entry_price + reward_r * sl_proxy
-            trigger_price = row["high"]
-            triggered = df_m5["high"].iloc[entry_idx] >= trigger_price
+            if trigger_required:
+                trigger_price = row["high"]
+                triggered = df_m5["high"].iloc[entry_idx] >= trigger_price
+            else:
+                triggered = True
         else:
             sl = entry_price + sl_proxy
             tp = entry_price - reward_r * sl_proxy
-            trigger_price = row["low"]
-            triggered = df_m5["low"].iloc[entry_idx] <= trigger_price
-        if not triggered:
+            if trigger_required:
+                trigger_price = row["low"]
+                triggered = df_m5["low"].iloc[entry_idx] <= trigger_price
+            else:
+                triggered = True
+        if trigger_required and not triggered:
             continue
         if entry_time <= ts:
             continue

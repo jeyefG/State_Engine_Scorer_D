@@ -25,6 +25,10 @@ class EventDetectionConfig:
     transition_window: int = 12
     trend_window: int = 6
     trend_pullback_edge: float = 0.30
+    trend_continuation_comp_window: int = 6
+    trend_continuation_break_window: int = 6
+    trend_continuation_comp_thr: float = 1.2
+    trend_continuation_momentum_window: int = 3
 
 
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
@@ -35,7 +39,12 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
     if missing:
         raise ValueError(f"Missing required columns for event detection: {sorted(missing)}")
 
-    allow_cols = {"ALLOW_trend_pullback", "ALLOW_balance_fade", "ALLOW_transition_failure"}
+    allow_cols = {
+        "ALLOW_trend_pullback",
+        "ALLOW_trend_continuation",
+        "ALLOW_balance_fade",
+        "ALLOW_transition_failure",
+    }
     missing_allow = allow_cols - set(df_m5_ctx.columns)
     if missing_allow:
         raise ValueError(f"Missing required ALLOW_* columns: {sorted(missing_allow)}")
@@ -103,6 +112,46 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
         subset = df.loc[down_pullback].copy()
         subset["family_id"] = EventFamily.TREND_PULLBACK.value
         subset["side"] = "short"
+        events.append(subset)
+
+    # TREND CONTINUATION: compression + breakout aligned with momentum.
+    continuation_mask = df["ALLOW_trend_continuation"] == 1
+    momentum_tc = close - close.shift(cfg.trend_continuation_momentum_window)
+    momentum_sign = np.sign(momentum_tc)
+    side_long = continuation_mask & (momentum_sign > 0)
+    side_short = continuation_mask & (momentum_sign < 0)
+
+    range_last_n = high.rolling(cfg.trend_continuation_comp_window).max() - low.rolling(cfg.trend_continuation_comp_window).min()
+    if "atr_short" in df.columns:
+        atr_short = df["atr_short"]
+    else:
+        atr_short = _atr(high, low, close, 14)
+    compression = (range_last_n / atr_short) < cfg.trend_continuation_comp_thr
+
+    breakout_high = high.shift(1).rolling(cfg.trend_continuation_break_window).max()
+    breakout_low = low.shift(1).rolling(cfg.trend_continuation_break_window).min()
+    breakout_long = close > breakout_high
+    breakout_short = close < breakout_low
+
+    trend_cont_long = side_long & compression & breakout_long
+    trend_cont_short = side_short & compression & breakout_short
+    if trend_cont_long.any():
+        subset = df.loc[trend_cont_long].copy()
+        subset["family_id"] = EventFamily.TREND_CONTINUATION.value
+        subset["side"] = "long"
+        subset["tc_n_comp"] = cfg.trend_continuation_comp_window
+        subset["tc_n_brk"] = cfg.trend_continuation_break_window
+        subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
+        subset["tc_momentum_window"] = cfg.trend_continuation_momentum_window
+        events.append(subset)
+    if trend_cont_short.any():
+        subset = df.loc[trend_cont_short].copy()
+        subset["family_id"] = EventFamily.TREND_CONTINUATION.value
+        subset["side"] = "short"
+        subset["tc_n_comp"] = cfg.trend_continuation_comp_window
+        subset["tc_n_brk"] = cfg.trend_continuation_break_window
+        subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
+        subset["tc_momentum_window"] = cfg.trend_continuation_momentum_window
         events.append(subset)
 
     if not events:

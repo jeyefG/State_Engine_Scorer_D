@@ -35,6 +35,7 @@ class GatingPolicy:
         state_hat = outputs["state_hat"]
         margin = outputs["margin"]
         allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
+        allow_trend_continuation = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
 
         allow_transition_failure = (state_hat == StateLabels.TRANSITION) & (margin >= th.transition_margin_min)
@@ -51,6 +52,7 @@ class GatingPolicy:
         return pd.DataFrame(
             {
                 "ALLOW_trend_pullback": allow_trend_pullback.astype(int),
+                "ALLOW_trend_continuation": allow_trend_continuation.astype(int),
                 "ALLOW_balance_fade": allow_balance_fade.astype(int),
                 "ALLOW_transition_failure": allow_transition_failure.astype(int),
             },

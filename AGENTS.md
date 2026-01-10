@@ -193,6 +193,7 @@ Regla general:
 
 Ejemplos:
 - `ALLOW_trend_pullback = 1` si `state_hat == TENDENCIA` y `margin ≥ 0.15`
+- `ALLOW_trend_continuation = 1` si `state_hat == TENDENCIA` y `margin ≥ 0.15`
 - `ALLOW_balance_fade = 1` si `state_hat == BALANCE` y `margin ≥ 0.10`
 - `ALLOW_transition_failure = 1` si:
   - `state_hat == TRANSICIÓN`
@@ -330,6 +331,7 @@ Por defecto:
 
 Ejemplos implementados:
    - ALLOW_trend_pullback
+   - ALLOW_trend_continuation
    - ALLOW_balance_fade
    - ALLOW_transition_failure
 

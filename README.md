@@ -21,6 +21,38 @@ Opciones útiles:
 - `--class-weight-balanced` (usa `class_weight="balanced"` en LightGBM)
 - `--report-out` (guarda un reporte JSON con métricas, gating y metadatos)
 
+## Event Scorer (M5) + Backtesting
+
+Entrena el Event Scorer (M5) usando el contexto H1 ya desplazado y el etiquetado proxy:
+
+```bash
+python scripts/train_event_scorer.py \
+  --symbol XAUUSD \
+  --start 2024-01-01 \
+  --end 2025-12-31 \
+  --model-dir models \
+  --k-bars 24 \
+  --reward-r 1.0 \
+  --sl-mult 1.0
+```
+
+Ejecuta el pipeline de backtest (State Engine H1 → Events M5 → Scorer → Signals → Backtest):
+
+```bash
+python scripts/run_pipeline_backtest.py \
+  --symbol XAUUSD \
+  --start 2024-01-01 \
+  --end 2025-12-31 \
+  --model-dir models \
+  --edge-threshold 0.6 \
+  --max-holding-bars 24 \
+  --reward-r 1.0 \
+  --sl-mult 1.0 \
+  --output-dir outputs
+```
+
+Eventos cubiertos: balance/transition/trend pullback y **trend continuation** (E_TREND_CONTINUATION) cuando `ALLOW_trend_continuation` está activo en H1.
+
 ## Before (salida anterior, simplificada)
 
 ```
