@@ -78,6 +78,32 @@ class FeatureBuilder:
         dist_to_low = (close - recent_low) / atr_short.replace(0, np.nan)
         mom_atr = close.diff(self.micro_window) / atr_short.replace(0, np.nan)
 
+        balance_window = 12
+        trend_window = 6
+        continuation_comp_window = 6
+        continuation_break_window = 6
+
+        balance_high = high.rolling(balance_window).max()
+        balance_low = low.rolling(balance_window).min()
+        balance_width = (balance_high - balance_low).replace(0, np.nan)
+        range_width_atr = balance_width / atr_short.replace(0, np.nan)
+        location_0_1 = (close - balance_low) / balance_width
+
+        trend_high = high.rolling(trend_window).max()
+        trend_low = low.rolling(trend_window).min()
+        trend_width = (trend_high - trend_low).replace(0, np.nan)
+        trend_location = (close - trend_low) / trend_width
+        momentum_norm = (close - close.shift(trend_window)) / atr_short.replace(0, np.nan)
+        pullback_depth_0_1 = np.where(momentum_norm >= 0, 1.0 - trend_location, trend_location)
+
+        comp_range = high.rolling(continuation_comp_window).max() - low.rolling(continuation_comp_window).min()
+        compression_ratio = comp_range / atr_short.replace(0, np.nan)
+        breakout_high = high.shift(1).rolling(continuation_break_window).max()
+        breakout_low = low.shift(1).rolling(continuation_break_window).min()
+        breakout_dist_long = (breakout_high - close) / atr_short.replace(0, np.nan)
+        breakout_dist_short = (close - breakout_low) / atr_short.replace(0, np.nan)
+        breakout_dist_atr = np.where(momentum_norm >= 0, breakout_dist_long, breakout_dist_short)
+
         hours = df.index.hour.to_series(index=df.index)
         hour_sin = np.sin(2 * np.pi * hours / 24.0)
         hour_cos = np.cos(2 * np.pi * hours / 24.0)
@@ -99,6 +125,12 @@ class FeatureBuilder:
                 "dist_to_high_atr": dist_to_high,
                 "dist_to_low_atr": dist_to_low,
                 "mom_atr": mom_atr,
+                "range_width_atr": range_width_atr,
+                "location_0_1": location_0_1,
+                "momentum_norm": momentum_norm,
+                "compression_ratio": compression_ratio,
+                "breakout_dist_atr": breakout_dist_atr,
+                "pullback_depth_0_1": pullback_depth_0_1,
                 "hour_sin": hour_sin,
                 "hour_cos": hour_cos,
                 "margin_H1": df["margin_H1"],
