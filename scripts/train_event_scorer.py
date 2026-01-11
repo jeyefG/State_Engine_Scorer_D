@@ -32,6 +32,7 @@ from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.labels import StateLabels
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
+from state_engine.transition_shadow import print_transition_shadow_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -283,6 +284,12 @@ def main() -> None:
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
 
     events_all = events.copy()
+    print_transition_shadow_report(
+        events_all,
+        state_col="state_hat_H1",
+        margin_col="margin_H1",
+        pnl_col="r_outcome",
+    )
     allow_cols = [col for col in events_all.columns if col.startswith("ALLOW_")]
     if not allow_cols:
         logger.warning("No ALLOW_* columns found on events; meta policy will be empty.")
