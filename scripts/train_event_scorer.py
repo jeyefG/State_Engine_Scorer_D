@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
@@ -27,7 +27,7 @@ from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
-from state_engine.scoring import EventScorerBundle, EventScorerConfig, FeatureBuilder
+from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,17 +83,28 @@ def build_h1_context(
 
 
 def merge_h1_m5(ctx_h1: pd.DataFrame, ohlcv_m5: pd.DataFrame) -> pd.DataFrame:
-    h1 = ctx_h1.reset_index().rename(columns={"time": "time"}).sort_values("time")
-    m5 = ohlcv_m5.reset_index().rename(columns={"time": "time"}).sort_values("time")
+    logger = logging.getLogger("event_scorer")
+    h1 = ctx_h1.copy().sort_index()
+    m5 = ohlcv_m5.copy().sort_index()
+    if getattr(h1.index, "tz", None) is not None:
+        h1.index = h1.index.tz_localize(None)
+    if getattr(m5.index, "tz", None) is not None:
+        m5.index = m5.index.tz_localize(None)
+    h1 = h1.reset_index().rename(columns={h1.index.name or "index": "time"})
+    m5 = m5.reset_index().rename(columns={m5.index.name or "index": "time"})
     merged = pd.merge_asof(m5, h1, on="time", direction="backward")
     merged = merged.set_index("time")
     merged = merged.rename(columns={"state_hat": "state_hat_H1", "margin": "margin_H1"})
+    missing_ctx = merged[["state_hat_H1", "margin_H1"]].isna().mean()
+    if (missing_ctx > 0.25).any():
+        logger.warning("High missing context after merge: %s", missing_ctx.to_dict())
     return merged
 
 
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.log_level)
+    min_samples_train = 200
 
     def _safe_symbol(sym: str) -> str:
         return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in sym)
@@ -118,6 +129,14 @@ def main() -> None:
     m5_cutoff = server_now.floor("5min")
     ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < h1_cutoff]
     ohlcv_m5 = ohlcv_m5[ohlcv_m5.index < m5_cutoff]
+    logger.info(
+        "Period: %s -> %s | h1_cutoff=%s m5_cutoff=%s",
+        fecha_inicio,
+        fecha_fin,
+        h1_cutoff,
+        m5_cutoff,
+    )
+    logger.info("Rows: H1=%s M5=%s", len(ohlcv_h1), len(ohlcv_m5))
 
     if not model_path.exists():
         raise FileNotFoundError(f"State model not found: {model_path}")
@@ -130,12 +149,15 @@ def main() -> None:
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating)
 
     df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
+    logger.info("Rows after merge: M5_ctx=%s", len(df_m5_ctx))
     df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
+    logger.info("Rows after dropna ctx: M5_ctx=%s", len(df_m5_ctx))
 
     events = detect_events(df_m5_ctx)
     if events.empty:
         logger.warning("No events detected; exiting.")
         return
+    logger.info("Detected events by family:\n%s", events["family_id"].value_counts().to_string())
 
     events = label_events(
         events,
@@ -152,6 +174,7 @@ def main() -> None:
     if events.empty:
         logger.warning("No labeled events after filtering.")
         return
+    logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
 
     feature_builder = FeatureBuilder()
     features_all = feature_builder.build(df_m5_ctx)
@@ -175,17 +198,52 @@ def main() -> None:
     )
     family_summary["samples_train"] = family_summary["family_id"].map(fam_train.value_counts()).fillna(0).astype(int)
     family_summary["samples_calib"] = family_summary["family_id"].map(fam_calib.value_counts()).fillna(0).astype(int)
+    family_summary["base_rate_train"] = family_summary["family_id"].map(y_train.groupby(fam_train).mean())
+    family_summary["base_rate_calib"] = family_summary["family_id"].map(y_calib.groupby(fam_calib).mean())
     logger.info("Family counts:\n%s", family_summary.to_string(index=False))
 
+    if y_train.nunique() < 2:
+        logger.error("Global training labels have a single class; cannot train scorer.")
+        return
+
     scorer = EventScorerBundle(EventScorerConfig())
-    scorer.fit(
-        X_train,
-        y_train,
-        fam_train,
-        calib_features=X_calib,
-        calib_labels=y_calib,
-        calib_family_ids=fam_calib,
-    )
+    global_scorer = EventScorer(scorer.config)
+    global_scorer.fit(X_train, y_train, X_calib, y_calib)
+    scorer.scorers[scorer.global_key] = global_scorer
+
+    family_summary["train_unique"] = family_summary["family_id"].map(y_train.groupby(fam_train).nunique())
+    family_summary["calib_unique"] = family_summary["family_id"].map(y_calib.groupby(fam_calib).nunique())
+    family_summary["status"] = "TRAINED"
+
+    for family_id in family_summary["family_id"]:
+        train_mask = fam_train == family_id
+        calib_mask = fam_calib == family_id
+        train_count = int(train_mask.sum())
+        calib_count = int(calib_mask.sum())
+        train_unique = int(family_summary.loc[family_summary["family_id"] == family_id, "train_unique"].fillna(0).iloc[0])
+        calib_unique = int(family_summary.loc[family_summary["family_id"] == family_id, "calib_unique"].fillna(0).iloc[0])
+
+        if train_count < min_samples_train:
+            family_summary.loc[family_summary["family_id"] == family_id, "status"] = "SKIP_FAMILY_LOW_SAMPLES"
+            logger.warning("Skip %s: low samples (%s)", family_id, train_count)
+            continue
+        if train_unique < 2 or calib_unique < 2:
+            family_summary.loc[family_summary["family_id"] == family_id, "status"] = "SKIP_FAMILY_SINGLE_CLASS"
+            logger.warning(
+                "Skip %s: missing class (train_unique=%s calib_unique=%s)",
+                family_id,
+                train_unique,
+                calib_unique,
+            )
+            continue
+
+        scorer_family = EventScorer(scorer.config)
+        calib_X = X_calib.loc[calib_mask] if calib_count else None
+        calib_y = y_calib.loc[calib_mask] if calib_count else None
+        scorer_family.fit(X_train.loc[train_mask], y_train.loc[train_mask], calib_X, calib_y)
+        scorer.scorers[str(family_id)] = scorer_family
+
+    logger.info("Family training status:\n%s", family_summary.to_string(index=False))
 
     def _topk_indices(scores: pd.Series, labels_: pd.Series, k: int, seed: int = 7) -> pd.Index:
         if scores.empty:
@@ -275,12 +333,15 @@ def main() -> None:
             )
 
         margin_series = df_m5_ctx["margin_H1"].reindex(y_calib.index)
-        try:
-            bins = pd.qcut(margin_series, q=3, duplicates="drop")
-        except ValueError:
-            bins = pd.Series(index=margin_series.index, dtype="object")
-        if not bins.empty:
-            for bin_label, bin_labels in y_calib.groupby(bins):
+        bins = pd.Series(index=margin_series.index, dtype="object")
+        margin_non_na = margin_series.dropna()
+        if not margin_non_na.empty:
+            try:
+                bins.loc[margin_non_na.index] = pd.qcut(margin_non_na, q=3, duplicates="drop")
+            except ValueError:
+                bins = pd.Series(index=margin_series.index, dtype="object")
+        if not bins.dropna().empty:
+            for bin_label, bin_labels in y_calib.groupby(bins, observed=True):
                 bin_scores = preds.loc[bin_labels.index]
                 bin_r = r_calib.loc[bin_labels.index]
                 metrics_rows.append(summarize_metrics(f"margin_bin_{bin_label}", bin_scores, bin_labels, bin_r))
@@ -331,7 +392,7 @@ def main() -> None:
         "r_thr": args.r_thr,
         "tie_break": args.tie_break,
         "feature_count": event_features.shape[1],
-        "train_date": datetime.utcnow().isoformat(),
+        "train_date": datetime.now(timezone.utc).isoformat(),
         "metrics_summary": metrics_summary,
     }
     scorer.save(scorer_out, metadata=metadata)
@@ -349,11 +410,30 @@ def main() -> None:
     logger.info("label_distribution=%s", labels.value_counts(normalize=True).to_dict())
     logger.info("model_out=%s", scorer_out)
 
+    args.model_dir.mkdir(parents=True, exist_ok=True)
     if not metrics_df.empty:
         metrics_path = args.model_dir / f"metrics_{_safe_symbol(args.symbol)}_event_scorer.csv"
-        args.model_dir.mkdir(parents=True, exist_ok=True)
         metrics_df.to_csv(metrics_path, index=False)
         logger.info("metrics_out=%s", metrics_path)
+    family_path = args.model_dir / f"family_summary_{_safe_symbol(args.symbol)}_event_scorer.csv"
+    family_summary.to_csv(family_path, index=False)
+    logger.info("family_summary_out=%s", family_path)
+
+    if not y_calib.empty:
+        sample_cols = ["family_id", "side", "label", "r_outcome"]
+        sample_df = events.loc[y_calib.index, sample_cols].copy()
+        sample_df["score"] = preds
+        sample_df["margin_H1"] = df_m5_ctx["margin_H1"].reindex(sample_df.index)
+        sample_df = sample_df.sort_values("score", ascending=False).head(10)
+        sample_df = sample_df.reset_index().rename(columns={sample_df.index.name or "index": "time"})
+        sample_path = args.model_dir / f"calib_top_scored_{_safe_symbol(args.symbol)}_event_scorer.csv"
+        sample_df.to_csv(sample_path, index=False)
+        logger.info("calib_top_scored_out=%s", sample_path)
+
+    if global_scorer._model is not None and hasattr(global_scorer._model, "feature_importances_"):
+        importances = pd.Series(global_scorer._model.feature_importances_, index=event_features.columns)
+        top_features = importances.sort_values(ascending=False).head(10)
+        logger.info("Top-10 feature importances:\n%s", top_features.to_string())
 
 
 if __name__ == "__main__":

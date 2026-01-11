@@ -23,14 +23,21 @@ class EventDetectionConfig:
     balance_window: int = 12
     balance_edge: float = 0.20
     balance_min_range_atr: float = 0.8
+    balance_soft_edge: float = 0.35
+    balance_soft_range_mult: float = 0.5
     transition_window: int = 12
+    transition_near_edge_atr: float = 0.25
     trend_window: int = 6
     trend_pullback_edge: float = 0.30
     trend_momentum_atr_thr: float = 0.3
+    trend_pullback_momentum_mult: float = 0.5
+    trend_pullback_edge_mult: float = 0.6
     trend_continuation_comp_window: int = 6
     trend_continuation_break_window: int = 6
     trend_continuation_comp_thr: float = 1.2
     trend_continuation_momentum_window: int = 3
+    trend_continuation_comp_mult: float = 1.5
+    trend_continuation_break_atr: float = 0.25
 
 
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
@@ -63,15 +70,42 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
     else:
         atr_short = _atr(high, low, close, 14)
 
-    # BALANCE FADE: extreme location within recent range.
+    # Shared context features to enrich candidates (proposal engine).
     range_high = high.rolling(cfg.balance_window).max()
     range_low = low.rolling(cfg.balance_window).min()
     range_width = (range_high - range_low).replace(0, np.nan)
-    location = (close - range_low) / range_width
-    range_filter = (range_width / atr_short.replace(0, np.nan)) > cfg.balance_min_range_atr
+    range_width_atr = range_width / atr_short.replace(0, np.nan)
+    location_0_1 = (close - range_low) / range_width
+
+    trend_momentum = close - close.shift(cfg.trend_window)
+    momentum_norm = trend_momentum / atr_short.replace(0, np.nan)
+
+    trend_range_high = high.rolling(cfg.trend_window).max()
+    trend_range_low = low.rolling(cfg.trend_window).min()
+    trend_range_width = (trend_range_high - trend_range_low).replace(0, np.nan)
+    trend_location = (close - trend_range_low) / trend_range_width
+
+    range_last_n = high.rolling(cfg.trend_continuation_comp_window).max() - low.rolling(
+        cfg.trend_continuation_comp_window
+    ).min()
+    compression_ratio = range_last_n / atr_short.replace(0, np.nan)
+    breakout_high = high.shift(1).rolling(cfg.trend_continuation_break_window).max()
+    breakout_low = low.shift(1).rolling(cfg.trend_continuation_break_window).min()
+    breakout_dist_long = (breakout_high - close) / atr_short.replace(0, np.nan)
+    breakout_dist_short = (close - breakout_low) / atr_short.replace(0, np.nan)
+
+    df["range_width_atr"] = range_width_atr
+    df["location_0_1"] = location_0_1
+    df["momentum_norm"] = momentum_norm
+    df["compression_ratio"] = compression_ratio
+    df["breakout_dist_atr"] = np.where(momentum_norm >= 0, breakout_dist_long, breakout_dist_short)
+
+    # BALANCE FADE: softer extreme location within recent range.
+    range_filter = range_width_atr > (cfg.balance_min_range_atr * cfg.balance_soft_range_mult)
     balance_mask = df["ALLOW_balance_fade"] == 1
-    balance_short = balance_mask & range_filter & (location >= (1.0 - cfg.balance_edge))
-    balance_long = balance_mask & range_filter & (location <= cfg.balance_edge)
+    balance_edge = max(cfg.balance_edge, cfg.balance_soft_edge)
+    balance_short = balance_mask & range_filter & (location_0_1 >= (1.0 - balance_edge))
+    balance_long = balance_mask & range_filter & (location_0_1 <= balance_edge)
     if balance_short.any():
         subset = df.loc[balance_short].copy()
         subset["family_id"] = EventFamily.BALANCE_FADE.value
@@ -83,34 +117,46 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
         subset["side"] = "long"
         events.append(subset)
 
-    # TRANSITION FAILURE: re-entry after a brief break.
+    # TRANSITION FAILURE: re-entry after a brief break or near-edge reclaim.
     prev_close = close.shift(1)
     range_high_prev = high.shift(1).rolling(cfg.transition_window).max()
     range_low_prev = low.shift(1).rolling(cfg.transition_window).min()
     inside_now = (close >= range_low_prev) & (close <= range_high_prev)
     outside_prev = (prev_close > range_high_prev) | (prev_close < range_low_prev)
+    dist_to_high = (range_high_prev - close) / atr_short.replace(0, np.nan)
+    dist_to_low = (close - range_low_prev) / atr_short.replace(0, np.nan)
+    near_edge = (dist_to_high <= cfg.transition_near_edge_atr) | (dist_to_low <= cfg.transition_near_edge_atr)
     transition_mask = df["ALLOW_transition_failure"] == 1
-    transition_event = transition_mask & inside_now & outside_prev
+    transition_event = transition_mask & inside_now & (outside_prev | near_edge)
     if transition_event.any():
         subset = df.loc[transition_event].copy()
         subset["family_id"] = EventFamily.TRANSITION_FAILURE.value
-        subset["side"] = np.where(prev_close.loc[transition_event] > range_high_prev.loc[transition_event], "short", "long")
+        side_series = np.where(
+            outside_prev.loc[transition_event],
+            np.where(prev_close.loc[transition_event] > range_high_prev.loc[transition_event], "short", "long"),
+            np.where(dist_to_high.loc[transition_event] <= dist_to_low.loc[transition_event], "short", "long"),
+        )
+        subset["side"] = side_series
+        subset["breakout_dist_atr"] = np.where(
+            subset["side"] == "short",
+            dist_to_high.loc[transition_event],
+            dist_to_low.loc[transition_event],
+        )
         events.append(subset)
 
     # TREND PULLBACK: direction inferred from recent momentum + pullback location.
     trend_mask = df["ALLOW_trend_pullback"] == 1
-    momentum = close - close.shift(cfg.trend_window)
-    trend_range_high = high.rolling(cfg.trend_window).max()
-    trend_range_low = low.rolling(cfg.trend_window).min()
-    trend_range_width = (trend_range_high - trend_range_low).replace(0, np.nan)
-    pullback_edge = cfg.trend_pullback_edge
-    momentum_norm = momentum / atr_short.replace(0, np.nan)
+    pullback_edge = cfg.trend_pullback_edge * cfg.trend_pullback_edge_mult
+    momentum_thr = cfg.trend_momentum_atr_thr * cfg.trend_pullback_momentum_mult
 
-    uptrend = trend_mask & (momentum_norm > cfg.trend_momentum_atr_thr)
-    downtrend = trend_mask & (momentum_norm < -cfg.trend_momentum_atr_thr)
+    uptrend = trend_mask & (momentum_norm >= momentum_thr)
+    downtrend = trend_mask & (momentum_norm <= -momentum_thr)
 
-    up_pullback = uptrend & (close <= (trend_range_low + pullback_edge * trend_range_width)) & (close < close.shift(1))
-    down_pullback = downtrend & (close >= (trend_range_high - pullback_edge * trend_range_width)) & (close > close.shift(1))
+    pullback_depth = np.where(momentum_norm >= 0, 1.0 - trend_location, trend_location)
+    df["pullback_depth_0_1"] = pullback_depth
+
+    up_pullback = uptrend & (pullback_depth >= pullback_edge)
+    down_pullback = downtrend & (pullback_depth >= pullback_edge)
 
     if up_pullback.any():
         subset = df.loc[up_pullback].copy()
@@ -123,27 +169,27 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
         subset["side"] = "short"
         events.append(subset)
 
-    # TREND CONTINUATION: compression + breakout aligned with momentum.
+    # TREND CONTINUATION: compression + breakout aligned with momentum (soft pre-breakout allowed).
     continuation_mask = df["ALLOW_trend_continuation"] == 1
     momentum_tc = close - close.shift(cfg.trend_continuation_momentum_window)
     momentum_sign = np.sign(momentum_tc)
     side_long = continuation_mask & (momentum_sign > 0)
     side_short = continuation_mask & (momentum_sign < 0)
 
-    range_last_n = high.rolling(cfg.trend_continuation_comp_window).max() - low.rolling(cfg.trend_continuation_comp_window).min()
-    compression = (range_last_n / atr_short) < cfg.trend_continuation_comp_thr
+    compression = compression_ratio < (cfg.trend_continuation_comp_thr * cfg.trend_continuation_comp_mult)
 
-    breakout_high = high.shift(1).rolling(cfg.trend_continuation_break_window).max()
-    breakout_low = low.shift(1).rolling(cfg.trend_continuation_break_window).min()
     breakout_long = close > breakout_high
     breakout_short = close < breakout_low
+    prebreak_long = breakout_dist_long <= cfg.trend_continuation_break_atr
+    prebreak_short = breakout_dist_short <= cfg.trend_continuation_break_atr
 
-    trend_cont_long = side_long & compression & breakout_long
-    trend_cont_short = side_short & compression & breakout_short
+    trend_cont_long = side_long & compression & (breakout_long | prebreak_long)
+    trend_cont_short = side_short & compression & (breakout_short | prebreak_short)
     if trend_cont_long.any():
         subset = df.loc[trend_cont_long].copy()
         subset["family_id"] = EventFamily.TREND_CONTINUATION.value
         subset["side"] = "long"
+        subset["breakout_dist_atr"] = breakout_dist_long.loc[trend_cont_long]
         subset["tc_n_comp"] = cfg.trend_continuation_comp_window
         subset["tc_n_brk"] = cfg.trend_continuation_break_window
         subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
@@ -153,6 +199,7 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
         subset = df.loc[trend_cont_short].copy()
         subset["family_id"] = EventFamily.TREND_CONTINUATION.value
         subset["side"] = "short"
+        subset["breakout_dist_atr"] = breakout_dist_short.loc[trend_cont_short]
         subset["tc_n_comp"] = cfg.trend_continuation_comp_window
         subset["tc_n_brk"] = cfg.trend_continuation_break_window
         subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
@@ -187,7 +234,14 @@ def label_events(
     if missing:
         raise ValueError(f"Missing required OHLC columns in df_m5: {sorted(missing)}")
 
-    df = events_df.copy()
+    df = events_df.copy().sort_index()
+    if df.index.has_duplicates:
+        df = df[~df.index.duplicated(keep="last")]
+
+    df_m5 = df_m5.copy().sort_index()
+    if df_m5.index.has_duplicates:
+        df_m5 = df_m5[~df_m5.index.duplicated(keep="last")]
+
     atr_short = _atr(df_m5["high"], df_m5["low"], df_m5["close"], atr_window)
 
     if tie_break not in {"worst", "distance"}:
@@ -198,17 +252,21 @@ def label_events(
     tp_prices: list[float | None] = []
     labels: list[int | None] = []
     r_outcomes: list[float | None] = []
+    r_mean_k: list[float | None] = []
 
-    for ts, row in df.iterrows():
-        if ts not in df_m5.index:
+    indexer = df_m5.index.get_indexer(df.index)
+
+    for i, (ts, row) in enumerate(df.iterrows()):
+        idx = indexer[i]
+        if idx == -1:
             entry_prices.append(None)
             sl_prices.append(None)
             tp_prices.append(None)
             labels.append(None)
             r_outcomes.append(None)
+            r_mean_k.append(None)
             continue
 
-        idx = df_m5.index.get_loc(ts)
         entry_idx = idx + 1
         if entry_idx >= len(df_m5.index):
             entry_prices.append(None)
@@ -216,6 +274,7 @@ def label_events(
             tp_prices.append(None)
             labels.append(None)
             r_outcomes.append(None)
+            r_mean_k.append(None)
             continue
 
         entry_price = float(df_m5["open"].iloc[entry_idx])
@@ -226,6 +285,7 @@ def label_events(
             tp_prices.append(None)
             labels.append(None)
             r_outcomes.append(None)
+            r_mean_k.append(None)
             continue
 
         sl_proxy = float(atr_value * sl_mult)
@@ -239,15 +299,18 @@ def label_events(
             direction = -1.0
 
         outcome: float | None = None
-        for future_idx in range(entry_idx, min(entry_idx + k_bars, len(df_m5.index))):
-            high = df_m5["high"].iloc[future_idx]
-            low = df_m5["low"].iloc[future_idx]
+        end_idx = min(entry_idx + k_bars, len(df_m5.index))
+        future_slice = df_m5.iloc[entry_idx:end_idx]
+        for future_idx, (high_val, low_val) in enumerate(
+            zip(future_slice["high"].to_numpy(), future_slice["low"].to_numpy()),
+            start=entry_idx,
+        ):
             if row["side"] == "long":
-                hit_sl = low <= sl
-                hit_tp = high >= tp
+                hit_sl = low_val <= sl
+                hit_tp = high_val >= tp
             else:
-                hit_sl = high >= sl
-                hit_tp = low <= tp
+                hit_sl = high_val >= sl
+                hit_tp = low_val <= tp
 
             if hit_sl and hit_tp:
                 if tie_break == "worst":
@@ -266,12 +329,18 @@ def label_events(
                 break
 
         if outcome is None:
-            end_idx = min(entry_idx + k_bars - 1, len(df_m5.index) - 1)
-            close_end = float(df_m5["close"].iloc[end_idx])
+            end_idx_mtm = min(entry_idx + k_bars - 1, len(df_m5.index) - 1)
+            close_end = float(df_m5["close"].iloc[end_idx_mtm])
             sl_dist = sl_proxy if sl_proxy != 0 else np.nan
             outcome = direction * (close_end - entry_price) / sl_dist
             if clip_mtm and not pd.isna(outcome):
                 outcome = float(np.clip(outcome, -1.0, reward_r))
+
+        if sl_proxy != 0 and not future_slice.empty:
+            mtm_series = direction * (future_slice["close"] - entry_price) / sl_proxy
+            r_mean_k.append(float(mtm_series.mean()))
+        else:
+            r_mean_k.append(None)
 
         entry_prices.append(entry_price)
         sl_prices.append(sl)
@@ -288,6 +357,7 @@ def label_events(
     df["tp_price"] = tp_prices
     df["label"] = labels
     df["r_outcome"] = r_outcomes
+    df["r_mean_k"] = r_mean_k
     return df
 
 
