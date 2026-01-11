@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 
+import numpy as np
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -162,6 +164,7 @@ def main() -> None:
     y_train = labels.iloc[:split_idx]
     X_calib = event_features.iloc[split_idx:]
     y_calib = labels.iloc[split_idx:]
+    r_calib = events["r_outcome"].iloc[split_idx:]
     fam_train = events["family_id"].iloc[:split_idx]
     fam_calib = events["family_id"].iloc[split_idx:]
 
@@ -184,29 +187,57 @@ def main() -> None:
         calib_family_ids=fam_calib,
     )
 
-    def precision_at_k(scores: pd.Series, labels_: pd.Series, k: int) -> float:
+    def _topk_indices(scores: pd.Series, labels_: pd.Series, k: int, seed: int = 7) -> pd.Index:
         if scores.empty:
-            return float("nan")
+            return pd.Index([])
         k_eff = min(k, len(scores))
-        top_idx = scores.nlargest(k_eff).index
+        if k_eff == 0:
+            return pd.Index([])
+        if scores.nunique(dropna=False) <= 1:
+            rng = np.random.default_rng(seed)
+            chosen = rng.choice(labels_.index.to_numpy(), size=k_eff, replace=False)
+            return pd.Index(chosen)
+        return scores.nlargest(k_eff).index
+
+    def precision_at_k(scores: pd.Series, labels_: pd.Series, k: int, seed: int = 7) -> float:
+        top_idx = _topk_indices(scores, labels_, k, seed=seed)
+        if top_idx.empty:
+            return float("nan")
         return float(labels_.loc[top_idx].mean())
 
-    def lift_at_k(scores: pd.Series, labels_: pd.Series, k: int) -> float:
+    def lift_at_k(scores: pd.Series, labels_: pd.Series, k: int, seed: int = 7) -> float:
         base_rate = float(labels_.mean())
         if base_rate == 0 or scores.empty:
             return float("nan")
-        return precision_at_k(scores, labels_, k) / base_rate
+        return precision_at_k(scores, labels_, k, seed=seed) / base_rate
 
-    def summarize_metrics(scope: str, scores: pd.Series, labels_: pd.Series) -> dict[str, float]:
+    def mean_r_topk(scores: pd.Series, r_outcome: pd.Series, k: int, seed: int = 7) -> float:
+        top_idx = _topk_indices(scores, r_outcome, k, seed=seed)
+        if top_idx.empty:
+            return float("nan")
+        return float(r_outcome.loc[top_idx].mean())
+
+    def summarize_metrics(
+        scope: str,
+        scores: pd.Series,
+        labels_: pd.Series,
+        r_outcome: pd.Series,
+        seed: int = 7,
+    ) -> dict[str, float]:
         base_rate = float(labels_.mean()) if not labels_.empty else float("nan")
+        r_mean_all = float(r_outcome.mean()) if not r_outcome.empty else float("nan")
         metrics = {
             "scope": scope,
             "samples": len(labels_),
             "base_rate": base_rate,
             "auc": float("nan"),
-            "lift@10": lift_at_k(scores, labels_, 10),
-            "lift@20": lift_at_k(scores, labels_, 20),
-            "lift@50": lift_at_k(scores, labels_, 50),
+            "lift@10": lift_at_k(scores, labels_, 10, seed=seed),
+            "lift@20": lift_at_k(scores, labels_, 20, seed=seed),
+            "lift@50": lift_at_k(scores, labels_, 50, seed=seed),
+            "r_mean@10": mean_r_topk(scores, r_outcome, 10, seed=seed),
+            "r_mean@20": mean_r_topk(scores, r_outcome, 20, seed=seed),
+            "r_mean@50": mean_r_topk(scores, r_outcome, 50, seed=seed),
+            "r_mean_all": r_mean_all,
         }
         if len(labels_.unique()) > 1:
             metrics["auc"] = roc_auc_score(labels_, scores)
@@ -217,14 +248,31 @@ def main() -> None:
 
     if not y_calib.empty:
         preds = scorer.predict_proba(X_calib, fam_calib)
-        metrics_rows.append(summarize_metrics("global", preds, y_calib))
-        baseline_scores = pd.Series(0.0, index=y_calib.index)
-        baseline_rows.append(summarize_metrics("global_baseline", baseline_scores, y_calib))
+        metrics_rows.append(summarize_metrics("global", preds, y_calib, r_calib))
+        rng = np.random.default_rng(7)
+        baseline_scores = pd.Series(rng.random(len(y_calib)), index=y_calib.index)
+        logger.debug(
+            "baseline_scores stats: nunique=%s min=%s max=%s",
+            baseline_scores.nunique(dropna=False),
+            baseline_scores.min(),
+            baseline_scores.max(),
+        )
+        if baseline_scores.nunique(dropna=False) <= 1:
+            logger.warning("Baseline scores are constant; using random sampling for topK metrics.")
+        baseline_rows.append(summarize_metrics("global_baseline", baseline_scores, y_calib, r_calib))
 
         for family_id, fam_labels in y_calib.groupby(fam_calib):
             fam_scores = preds.loc[fam_labels.index]
-            metrics_rows.append(summarize_metrics(family_id, fam_scores, fam_labels))
-            baseline_rows.append(summarize_metrics(f"{family_id}_baseline", baseline_scores.loc[fam_labels.index], fam_labels))
+            fam_r = r_calib.loc[fam_labels.index]
+            metrics_rows.append(summarize_metrics(family_id, fam_scores, fam_labels, fam_r))
+            baseline_rows.append(
+                summarize_metrics(
+                    f"{family_id}_baseline",
+                    baseline_scores.loc[fam_labels.index],
+                    fam_labels,
+                    fam_r,
+                )
+            )
 
         margin_series = df_m5_ctx["margin_H1"].reindex(y_calib.index)
         try:
@@ -234,7 +282,16 @@ def main() -> None:
         if not bins.empty:
             for bin_label, bin_labels in y_calib.groupby(bins):
                 bin_scores = preds.loc[bin_labels.index]
-                metrics_rows.append(summarize_metrics(f"margin_bin_{bin_label}", bin_scores, bin_labels))
+                bin_r = r_calib.loc[bin_labels.index]
+                metrics_rows.append(summarize_metrics(f"margin_bin_{bin_label}", bin_scores, bin_labels, bin_r))
+                baseline_rows.append(
+                    summarize_metrics(
+                        f"margin_bin_{bin_label}_baseline",
+                        baseline_scores.loc[bin_labels.index],
+                        bin_labels,
+                        bin_r,
+                    )
+                )
 
     metrics_df = pd.DataFrame(metrics_rows)
     baseline_df = pd.DataFrame(baseline_rows)

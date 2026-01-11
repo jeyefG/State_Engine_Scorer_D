@@ -58,15 +58,16 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
 
     events: list[pd.DataFrame] = []
 
+    if "atr_short" in df.columns:
+        atr_short = df["atr_short"]
+    else:
+        atr_short = _atr(high, low, close, 14)
+
     # BALANCE FADE: extreme location within recent range.
     range_high = high.rolling(cfg.balance_window).max()
     range_low = low.rolling(cfg.balance_window).min()
     range_width = (range_high - range_low).replace(0, np.nan)
     location = (close - range_low) / range_width
-    if "atr_short" in df.columns:
-        atr_short = df["atr_short"]
-    else:
-        atr_short = _atr(high, low, close, 14)
     range_filter = (range_width / atr_short.replace(0, np.nan)) > cfg.balance_min_range_atr
     balance_mask = df["ALLOW_balance_fade"] == 1
     balance_short = balance_mask & range_filter & (location >= (1.0 - cfg.balance_edge))
@@ -130,10 +131,6 @@ def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None =
     side_short = continuation_mask & (momentum_sign < 0)
 
     range_last_n = high.rolling(cfg.trend_continuation_comp_window).max() - low.rolling(cfg.trend_continuation_comp_window).min()
-    if "atr_short" in df.columns:
-        atr_short = df["atr_short"]
-    else:
-        atr_short = _atr(high, low, close, 14)
     compression = (range_last_n / atr_short) < cfg.trend_continuation_comp_thr
 
     breakout_high = high.shift(1).rolling(cfg.trend_continuation_break_window).max()
