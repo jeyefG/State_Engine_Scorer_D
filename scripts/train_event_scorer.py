@@ -30,6 +30,7 @@ from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
+from state_engine.labels import StateLabels
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 
 
@@ -54,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sl-mult", type=float, default=1.0, help="Multiplicador de ATR para SL proxy")
     parser.add_argument("--r-thr", type=float, default=0.0, help="Umbral para label binario basado en r_outcome")
     parser.add_argument("--tie-break", default="distance", choices=["distance", "worst"], help="Tie-break TP/SL")
+    parser.add_argument(
+        "--meta-policy",
+        default="on",
+        choices=["on", "off"],
+        help="Activar meta policy (gating superior) para regímenes operables",
+    )
+    parser.add_argument("--meta-margin-min", type=float, default=0.10, help="Margen mínimo H1 para meta policy")
+    parser.add_argument("--meta-margin-max", type=float, default=0.95, help="Margen máximo H1 para meta policy")
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
     return parser.parse_args()
 
@@ -115,6 +124,47 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.S
         axis=1,
     ).max(axis=1)
     return tr.rolling(window).mean()
+
+
+def _format_interval(interval: pd.Interval | str) -> str:
+    if isinstance(interval, pd.Interval):
+        left = f"{interval.left:.2f}"
+        right = f"{interval.right:.2f}"
+        return f"m({left}-{right}]"
+    if isinstance(interval, str):
+        return f"m{interval}"
+    return "mNA"
+
+
+def _margin_bins(series: pd.Series, q: int = 3) -> pd.Series:
+    bins = pd.Series(index=series.index, dtype="object")
+    non_na = series.dropna()
+    if non_na.empty:
+        return bins
+    try:
+        bins.loc[non_na.index] = pd.qcut(non_na, q=q, duplicates="drop")
+    except ValueError:
+        rank_pct = non_na.rank(pct=True)
+        bins.loc[non_na.index] = pd.cut(rank_pct, bins=q, include_lowest=True)
+    return bins
+
+
+def _state_label(value: int | float) -> str:
+    try:
+        return StateLabels(int(value)).name
+    except Exception:
+        return "UNKNOWN"
+
+
+def _meta_policy_mask(
+    events_df: pd.DataFrame,
+    allow_cols: list[str],
+    margin_min: float,
+    margin_max: float,
+) -> pd.Series:
+    allow_active = events_df[allow_cols].fillna(0).sum(axis=1) > 0 if allow_cols else pd.Series(False, index=events_df.index)
+    margin_ok = events_df["margin_H1"].between(margin_min, margin_max, inclusive="both")
+    return allow_active & margin_ok
 
 
 def main() -> None:
@@ -232,24 +282,108 @@ def main() -> None:
         return
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
 
+    events_all = events.copy()
+    allow_cols = [col for col in events_all.columns if col.startswith("ALLOW_")]
+    if not allow_cols:
+        logger.warning("No ALLOW_* columns found on events; meta policy will be empty.")
+    margin_bins = _margin_bins(events_all["margin_H1"], q=3)
+    margin_bin_label = margin_bins.map(_format_interval)
+    allow_family_map = {
+        "E_BALANCE_FADE": "ALLOW_balance_fade",
+        "E_BALANCE_REVERT": "ALLOW_balance_fade",
+        "E_TRANSITION_TEST": "ALLOW_transition_failure",
+        "E_TRANSITION_FAILURE": "ALLOW_transition_failure",
+        "E_TREND_PULLBACK": "ALLOW_trend_pullback",
+        "E_TREND_CONTINUATION": "ALLOW_trend_continuation",
+    }
+    allow_family = events_all["family_id"].map(allow_family_map).fillna("ALLOW_unknown")
+    state_label = events_all["state_hat_H1"].map(_state_label)
+    events_all["state_label"] = state_label
+    events_all["margin_bin"] = margin_bin_label
+    events_all["allow_family"] = allow_family
+    events_all["regime_id"] = (
+        state_label.astype(str) + "|" + margin_bin_label.fillna("mNA") + "|" + allow_family
+    )
+
+    meta_policy_on = args.meta_policy == "on"
+    meta_mask = _meta_policy_mask(events_all, allow_cols, args.meta_margin_min, args.meta_margin_max)
+    events_meta = events_all.loc[meta_mask].copy()
+
+    if meta_policy_on and events_meta.empty:
+        logger.warning("Meta policy filtered all events; exiting.")
+        return
+
+    if meta_policy_on:
+        kept_pct = (len(events_meta) / len(events_all)) * 100 if len(events_all) else 0.0
+        logger.info(
+            "INFO | META | before_rows=%s after_rows=%s kept_pct=%.2f",
+            len(events_all),
+            len(events_meta),
+            kept_pct,
+        )
+
+        def _mix_table(series: pd.Series, title: str) -> pd.DataFrame:
+            before_counts = series.value_counts(dropna=False)
+            after_counts = series.loc[events_meta.index].value_counts(dropna=False)
+            table = pd.DataFrame(
+                {
+                    "id": before_counts.index,
+                    "before_count": before_counts.values,
+                    "before_pct": (before_counts / before_counts.sum()).mul(100).round(2).values,
+                }
+            )
+            table["after_count"] = table["id"].map(after_counts).fillna(0).astype(int)
+            table["after_pct"] = (table["after_count"] / max(after_counts.sum(), 1)).mul(100).round(2)
+            logger.info("INFO | META | %s before/after:\n%s", title, table.to_string(index=False))
+            return table
+
+        _mix_table(events_all["family_id"], "family mix")
+        _mix_table(events_all["state_label"], "state mix")
+        _mix_table(events_all["margin_bin"].fillna("mNA"), "margin bins")
+
+    events_for_training = events_meta if meta_policy_on else events_all
+    events = events_for_training
+
     feature_builder = FeatureBuilder()
     features_all = feature_builder.build(df_m5_ctx)
-    event_features = features_all.reindex(events.index)
-    event_features = feature_builder.add_family_features(event_features, events["family_id"])
+    event_features_all = features_all.reindex(events_all.index)
+    event_features_all = feature_builder.add_family_features(event_features_all, events_all["family_id"])
 
-    labels = events["label"].astype(int)
-    split_idx = int(len(events) * args.train_ratio)
-    X_train = event_features.iloc[:split_idx]
-    y_train = labels.iloc[:split_idx]
-    X_calib = event_features.iloc[split_idx:]
-    y_calib = labels.iloc[split_idx:]
-    r_calib = events["r_outcome"].iloc[split_idx:]
-    fam_train = events["family_id"].iloc[:split_idx]
-    fam_calib = events["family_id"].iloc[split_idx:]
+    def _split_dataset(events_df: pd.DataFrame, feature_df: pd.DataFrame) -> dict[str, pd.Series | pd.DataFrame]:
+        labels_series = events_df["label"].astype(int)
+        split_idx = int(len(events_df) * args.train_ratio)
+        return {
+            "X_train": feature_df.loc[events_df.index].iloc[:split_idx],
+            "y_train": labels_series.iloc[:split_idx],
+            "X_calib": feature_df.loc[events_df.index].iloc[split_idx:],
+            "y_calib": labels_series.iloc[split_idx:],
+            "r_calib": events_df["r_outcome"].iloc[split_idx:],
+            "fam_train": events_df["family_id"].iloc[:split_idx],
+            "fam_calib": events_df["family_id"].iloc[split_idx:],
+            "regime_calib": events_df["regime_id"].iloc[split_idx:],
+        }
+
+    dataset_main = _split_dataset(events_for_training, event_features_all)
+    dataset_no_meta = _split_dataset(events_all, event_features_all)
+
+    X_train = dataset_main["X_train"]
+    y_train = dataset_main["y_train"]
+    X_calib = dataset_main["X_calib"]
+    y_calib = dataset_main["y_calib"]
+    r_calib = dataset_main["r_calib"]
+    fam_train = dataset_main["fam_train"]
+    fam_calib = dataset_main["fam_calib"]
+    regime_calib = dataset_main["regime_calib"]
+
+    X_calib_no_meta = dataset_no_meta["X_calib"]
+    y_calib_no_meta = dataset_no_meta["y_calib"]
+    r_calib_no_meta = dataset_no_meta["r_calib"]
+    fam_calib_no_meta = dataset_no_meta["fam_calib"]
+    regime_calib_no_meta = dataset_no_meta["regime_calib"]
 
     family_summary = pd.DataFrame(
         {
-            "family_id": sorted(set(events["family_id"])),
+            "family_id": sorted(set(events_for_training["family_id"])),
         }
     )
     family_summary["samples_train"] = family_summary["family_id"].map(fam_train.value_counts()).fillna(0).astype(int)
@@ -415,66 +549,71 @@ def main() -> None:
         metrics["delta_r_mean@20_neg"] = float(metrics["delta_r_mean@20"] < 0)
         return metrics
 
-    metrics_rows: list[dict[str, float]] = []
-    baseline_rows: list[dict[str, float]] = []
-    bins_margin = pd.Series(dtype="object")
+    def _global_metrics_table(
+        label: str,
+        scores: pd.Series,
+        labels_: pd.Series,
+        r_outcome: pd.Series,
+        seed: int = 7,
+    ) -> dict[str, float | str]:
+        metrics = summarize_metrics(label, scores, labels_, r_outcome, seed=seed)
+        spearman = scores.corr(r_outcome, method="spearman") if len(scores) else float("nan")
+        return {
+            "model": label,
+            "auc": metrics["auc"],
+            "lift@10": metrics["lift@10"],
+            "lift@20": metrics["lift@20"],
+            "lift@50": metrics["lift@50"],
+            "r_mean@10": metrics["r_mean@10"],
+            "r_mean@20": metrics["r_mean@20"],
+            "r_mean@50": metrics["r_mean@50"],
+            "delta_r_mean@20": metrics["delta_r_mean@20"],
+            "spearman": spearman,
+        }
 
-    if not y_calib.empty:
-        preds = scorer.predict_proba(X_calib, fam_calib)
-        margin_series = df_m5_ctx["margin_H1"].reindex(y_calib.index)
-        bins_margin = pd.Series(index=margin_series.index, dtype="object")
-        margin_non_na = margin_series.dropna()
-        if not margin_non_na.empty:
-            try:
-                bins_margin.loc[margin_non_na.index] = pd.qcut(margin_non_na, q=3, duplicates="drop")
-            except ValueError:
-                bins_margin = pd.Series(index=margin_series.index, dtype="object")
-        metrics_rows.append(summarize_metrics("global", preds, y_calib, r_calib, seed=seed))
+    def _metrics_block(
+        block_name: str,
+        X_block: pd.DataFrame,
+        y_block: pd.Series,
+        r_block: pd.Series,
+        fam_block: pd.Series,
+    ) -> tuple[pd.DataFrame, pd.Series | None, pd.Series | None, pd.Series | None]:
+        if y_block.empty:
+            logger.warning("WARNING | DIAG | Empty calib set for %s metrics", block_name)
+            return pd.DataFrame(), None, None, None
+        scores_block = scorer.predict_proba(X_block, fam_block)
         rng = np.random.default_rng(seed)
-        baseline_scores = pd.Series(rng.random(len(y_calib)), index=y_calib.index)
-        logger.debug(
-            "baseline_scores stats: nunique=%s min=%s max=%s",
-            baseline_scores.nunique(dropna=False),
-            baseline_scores.min(),
-            baseline_scores.max(),
+        baseline_scores = pd.Series(rng.random(len(y_block)), index=y_block.index)
+        table = pd.DataFrame(
+            [
+                _global_metrics_table("SCORER", scores_block, y_block, r_block, seed=seed),
+                _global_metrics_table("BASELINE", baseline_scores, y_block, r_block, seed=seed),
+            ]
         )
-        if baseline_scores.nunique(dropna=False) <= 1:
-            logger.warning("Baseline scores are constant; using random sampling for topK metrics.")
-        baseline_rows.append(summarize_metrics("global_baseline", baseline_scores, y_calib, r_calib, seed=seed))
+        logger.info("INFO | GLOBAL | METRICS (%s)\n%s", block_name, table.to_string(index=False))
+        return table, scores_block, baseline_scores, y_block
 
-        for family_id, fam_labels in y_calib.groupby(fam_calib):
-            fam_scores = preds.loc[fam_labels.index]
-            fam_r = r_calib.loc[fam_labels.index]
-            metrics_rows.append(summarize_metrics(family_id, fam_scores, fam_labels, fam_r, seed=seed))
-            baseline_rows.append(
-                summarize_metrics(
-                    f"{family_id}_baseline",
-                    baseline_scores.loc[fam_labels.index],
-                    fam_labels,
-                    fam_r,
-                    seed=seed,
-                )
-            )
+    table_no_meta, preds_no_meta, baseline_no_meta, _ = _metrics_block(
+        "NO_META",
+        X_calib_no_meta,
+        y_calib_no_meta,
+        r_calib_no_meta,
+        fam_calib_no_meta,
+    )
+    if meta_policy_on:
+        table_meta, preds_meta, baseline_meta, _ = _metrics_block(
+            "META",
+            X_calib,
+            y_calib,
+            r_calib,
+            fam_calib,
+        )
+    else:
+        table_meta = table_no_meta.copy()
+        preds_meta = preds_no_meta
+        baseline_meta = baseline_no_meta
 
-        if not bins_margin.dropna().empty:
-            for bin_label, bin_labels in y_calib.groupby(bins_margin, observed=True):
-                bin_scores = preds.loc[bin_labels.index]
-                bin_r = r_calib.loc[bin_labels.index]
-                metrics_rows.append(
-                    summarize_metrics(f"margin_bin_{bin_label}", bin_scores, bin_labels, bin_r, seed=seed)
-                )
-                baseline_rows.append(
-                    summarize_metrics(
-                        f"margin_bin_{bin_label}_baseline",
-                        baseline_scores.loc[bin_labels.index],
-                        bin_labels,
-                        bin_r,
-                        seed=seed,
-                    )
-                )
-
-    metrics_df = pd.DataFrame(metrics_rows)
-    baseline_df = pd.DataFrame(baseline_rows)
+    metrics_df = table_meta.copy()
     report_header = {
         "symbol": args.symbol,
         "start": args.start,
@@ -486,9 +625,12 @@ def main() -> None:
         "sl_mult": args.sl_mult,
         "r_thr": args.r_thr,
         "tie_break": args.tie_break,
-        "feature_count": event_features.shape[1],
+        "feature_count": event_features_all.shape[1],
         "min_samples_train": min_samples_train,
         "seed": seed,
+        "meta_policy": args.meta_policy,
+        "meta_margin_min": args.meta_margin_min,
+        "meta_margin_max": args.meta_margin_max,
     }
     header_table = pd.DataFrame([report_header])
     logger.info("=" * 96)
@@ -527,10 +669,10 @@ def main() -> None:
             "share_pct": family_summary["family_id"].map(family_share).fillna(0.0),
         }
     )
-    logger.info("-" * 96)
-    logger.info("A) Coverage (supply)")
-    logger.info("Global coverage:\n%s", coverage_global.to_string(index=False))
-    logger.info("Coverage by family:\n%s", coverage_by_family.to_string(index=False))
+    logger.debug("-" * 96)
+    logger.debug("A) Coverage (supply)")
+    logger.debug("Global coverage:\n%s", coverage_global.to_string(index=False))
+    logger.debug("Coverage by family:\n%s", coverage_by_family.to_string(index=False))
 
     base_rate_global = pd.DataFrame(
         [
@@ -544,9 +686,9 @@ def main() -> None:
     family_base_rate = family_summary[
         ["family_id", "base_rate_train", "base_rate_calib"]
     ].copy()
-    logger.info("-" * 96)
-    logger.info("B) Label quality & hardness")
-    logger.info("Base rates:\n%s", pd.concat([base_rate_global, family_base_rate]).to_string(index=False))
+    logger.debug("-" * 96)
+    logger.debug("B) Label quality & hardness")
+    logger.debug("Base rates:\n%s", pd.concat([base_rate_global, family_base_rate]).to_string(index=False))
 
     r_stats = (
         r_calib.groupby(fam_calib)
@@ -575,221 +717,85 @@ def main() -> None:
             }
         ]
     )
-    logger.info("r_outcome distribution (calib):\n%s", pd.concat([r_stats_global, r_stats]).to_string(index=False))
+    logger.debug("r_outcome distribution (calib):\n%s", pd.concat([r_stats_global, r_stats]).to_string(index=False))
 
-    spearman_rows = []
-    if not y_calib.empty:
-        global_corr = preds.corr(r_calib, method="spearman") if len(preds) else float("nan")
-        spearman_rows.append({"scope": "global", "spearman": global_corr})
-        for family_id, fam_labels in y_calib.groupby(fam_calib):
-            fam_scores = preds.loc[fam_labels.index]
-            fam_r = r_calib.loc[fam_labels.index]
-            spearman_rows.append(
-                {"scope": family_id, "spearman": fam_scores.corr(fam_r, method="spearman")}
-            )
-    if spearman_rows:
-        logger.info("Spearman(score, r_outcome):\n%s", pd.DataFrame(spearman_rows).to_string(index=False))
-
-    if not metrics_df.empty:
-        logger.info("-" * 96)
-        logger.info("C) Ranking metrics (calib)")
-        logger.info("Event scorer metrics:\n%s", metrics_df.to_string(index=False))
-    if not baseline_df.empty:
-        logger.info("Baseline metrics:\n%s", baseline_df.to_string(index=False))
-
-    verdict_rows = []
-    improved_any_scope = False
-    if not metrics_df.empty and not baseline_df.empty:
-        lift_cols = ["lift@10", "lift@20", "lift@50"]
-        metrics_eval = metrics_df.set_index("scope").fillna(0)
-        baseline_eval = baseline_df.set_index("scope").fillna(0)
-        for scope in metrics_eval.index:
-            if scope.endswith("_baseline"):
+    def _regime_breakdown(
+        scores: pd.Series,
+        labels_: pd.Series,
+        r_outcome: pd.Series,
+        regimes: pd.Series,
+        seed: int = 7,
+    ) -> pd.DataFrame:
+        if labels_.empty:
+            return pd.DataFrame()
+        rows: list[dict[str, float | str | int]] = []
+        for regime_id, regime_labels in labels_.groupby(regimes, observed=True):
+            if isinstance(regime_id, float) and np.isnan(regime_id):
                 continue
-            base_scope = f"{scope}_baseline"
-            if base_scope not in baseline_eval.index:
-                continue
-            lift_wins = int((metrics_eval.loc[scope, lift_cols] > baseline_eval.loc[base_scope, lift_cols]).sum())
-            lift_losses = int((metrics_eval.loc[scope, lift_cols] < baseline_eval.loc[base_scope, lift_cols]).sum())
-            delta_r_mean_20 = float(metrics_eval.loc[scope, "delta_r_mean@20"])
-            if lift_wins >= 2 and delta_r_mean_20 >= 0:
-                verdict = "WIN"
-                improved_any_scope = True
-            elif lift_losses >= 2 or delta_r_mean_20 < 0:
-                verdict = "LOSE"
-            else:
-                verdict = "MIXED"
-            verdict_rows.append(
+            scope_scores = scores.loc[regime_labels.index]
+            scope_r = r_outcome.loc[regime_labels.index]
+            metrics = summarize_metrics(str(regime_id), scope_scores, regime_labels, scope_r, seed=seed)
+            top_idx = _topk_indices(scope_scores, regime_labels, 10, seed=seed)
+            bottom_idx = _bottomk_indices(scope_scores, regime_labels, 10, seed=seed)
+            top_mean = float(scope_r.loc[top_idx].mean()) if len(top_idx) else float("nan")
+            bottom_mean = float(scope_r.loc[bottom_idx].mean()) if len(bottom_idx) else float("nan")
+            rank_inverted = bool(bottom_mean > top_mean)
+            flag = "MIXED"
+            if metrics["delta_r_mean@20"] >= 0.10 and metrics["lift@20"] > 1.05:
+                flag = "WIN"
+            elif metrics["delta_r_mean@20"] <= 0 or metrics["lift@20"] < 1.0:
+                flag = "LOSE"
+            flag_parts = [flag]
+            if rank_inverted:
+                flag_parts.append("RANK_INVERTED")
+            if metrics["samples"] < 100:
+                flag_parts.append("LOW_SAMPLES")
+            rows.append(
                 {
-                    "scope": scope,
-                    "lift_win_count": lift_wins,
-                    "lift_loss_count": lift_losses,
-                    "delta_r_mean@20": delta_r_mean_20,
-                    "verdict": verdict,
+                    "regime_id": metrics["scope"],
+                    "samples_calib": metrics["samples"],
+                    "base_rate_calib": metrics["base_rate"],
+                    "auc": metrics["auc"],
+                    "lift@20": metrics["lift@20"],
+                    "r_mean_all": metrics["r_mean_all"],
+                    "r_mean@20": metrics["r_mean@20"],
+                    "delta_r_mean@20": metrics["delta_r_mean@20"],
+                    "spearman": scope_scores.corr(scope_r, method="spearman") if len(scope_scores) else float("nan"),
+                    "flag": "|".join(flag_parts),
                 }
             )
-    if verdict_rows:
-        logger.info("-" * 96)
-        logger.info("D) Scorer vs baseline verdicts")
-        logger.info("%s", pd.DataFrame(verdict_rows).to_string(index=False))
-    if not improved_any_scope and verdict_rows:
-        logger.warning("No scope improved vs baseline under WIN criteria; review signal quality.")
+        return pd.DataFrame(rows)
 
-    if not y_calib.empty:
-        top_bottom_rows = []
-        for family_id, fam_labels in y_calib.groupby(fam_calib):
-            fam_scores = preds.loc[fam_labels.index]
-            fam_r = r_calib.loc[fam_labels.index]
-            fam_labels_series = fam_labels
-            top_idx = _topk_indices(fam_scores, fam_labels_series, 10, seed=seed)
-            bottom_idx = _bottomk_indices(fam_scores, fam_labels_series, 10, seed=seed)
-            top_r = fam_r.loc[top_idx]
-            bottom_r = fam_r.loc[bottom_idx]
-            top_mean = float(top_r.mean()) if not top_r.empty else float("nan")
-            bottom_mean = float(bottom_r.mean()) if not bottom_r.empty else float("nan")
-            rank_flag = "RANK_INVERTED" if top_mean < bottom_mean else ""
-            top_bottom_rows.append(
-                {
-                    "family_id": family_id,
-                    "top10_mean": top_mean,
-                    "top10_median": float(top_r.median()) if not top_r.empty else float("nan"),
-                    "top10_pos_pct": float((y_calib.loc[top_idx].mean() * 100) if len(top_idx) else float("nan")),
-                    "bottom10_mean": bottom_mean,
-                    "bottom10_median": float(bottom_r.median()) if not bottom_r.empty else float("nan"),
-                    "bottom10_pos_pct": float(
-                        (y_calib.loc[bottom_idx].mean() * 100) if len(bottom_idx) else float("nan")
-                    ),
-                    "flag": rank_flag,
-                }
-            )
-        if top_bottom_rows:
-            logger.info("-" * 96)
-            logger.info("E) Top/Bottom inspection (calib)")
-            logger.info("%s", pd.DataFrame(top_bottom_rows).to_string(index=False))
+    regime_df = pd.DataFrame()
+    if preds_meta is not None and not y_calib.empty:
+        regime_df = _regime_breakdown(preds_meta, y_calib, r_calib, regime_calib, seed=seed)
+        if not regime_df.empty:
+            regime_top = regime_df.sort_values("samples_calib", ascending=False).head(8)
+            logger.info("INFO | REGIME | TOP regimes (calib)\n%s", regime_top.to_string(index=False))
 
-    margin_bin_rows = []
-    margin_reading = "No margin bins available."
-    if not y_calib.empty and not bins_margin.dropna().empty:
-        for bin_label, bin_labels in y_calib.groupby(bins_margin, observed=True):
-            bin_scores = preds.loc[bin_labels.index]
-            bin_r = r_calib.loc[bin_labels.index]
-            bin_metrics = summarize_metrics(
-                f"margin_bin_{bin_label}",
-                bin_scores,
-                bin_labels,
-                bin_r,
-                seed=seed,
-            )
-            margin_bin_rows.append(bin_metrics)
-        if margin_bin_rows:
-            margin_df = pd.DataFrame(margin_bin_rows)
-            best_bin = margin_df.loc[margin_df["delta_r_mean@20"].idxmax(), "scope"]
-            worst_bin = margin_df.loc[margin_df["delta_r_mean@20"].idxmin(), "scope"]
-            if best_bin == worst_bin:
-                margin_reading = "No clear margin bin separation."
-            else:
-                margin_reading = f"Best delta_r_mean@20 in {best_bin}; worst in {worst_bin}."
-    if margin_bin_rows:
-        logger.info("-" * 96)
-        logger.info("F) Margin_H1 stability (calib bins)")
-        logger.info("%s", pd.DataFrame(margin_bin_rows).to_string(index=False))
-        logger.info("Margin reading: %s", margin_reading)
-
-    if not y_calib.empty:
-        def _choose_bucket_q(sample_count: int) -> int:
-            return 10 if sample_count >= 1000 else 5
-
-        def _score_buckets(scores: pd.Series, q: int) -> pd.Series:
-            buckets = pd.Series(index=scores.index, dtype="object")
-            scores_non_na = scores.dropna()
-            if scores_non_na.empty:
-                return buckets
-            try:
-                buckets.loc[scores_non_na.index] = pd.qcut(scores_non_na, q=q, duplicates="drop")
-            except ValueError:
-                rank_pct = scores_non_na.rank(pct=True)
-                buckets.loc[scores_non_na.index] = pd.cut(rank_pct, bins=5, include_lowest=True)
-            return buckets
-
-        def _bucket_rows(
-            scope: str,
-            scores: pd.Series,
-            labels_: pd.Series,
-            r_outcome: pd.Series,
-            q: int,
-        ) -> list[dict[str, float | str | int]]:
-            buckets = _score_buckets(scores, q=q)
-            if buckets.dropna().empty:
-                return []
-            rows: list[dict[str, float | str | int]] = []
-            for bucket_id, bucket_labels in labels_.groupby(buckets, observed=True):
-                bucket_scores = scores.loc[bucket_labels.index]
-                bucket_r = r_outcome.loc[bucket_labels.index]
-                rows.append(
-                    {
-                        "scope": scope,
-                        "bucket_id": str(bucket_id),
-                        "n": len(bucket_labels),
-                        "score_min": float(bucket_scores.min()) if not bucket_scores.empty else float("nan"),
-                        "score_max": float(bucket_scores.max()) if not bucket_scores.empty else float("nan"),
-                        "label_mean": float(bucket_labels.mean()) if not bucket_labels.empty else float("nan"),
-                        "r_mean": float(bucket_r.mean()) if not bucket_r.empty else float("nan"),
-                        "r_median": float(bucket_r.median()) if not bucket_r.empty else float("nan"),
-                        "r_p25": float(bucket_r.quantile(0.25)) if not bucket_r.empty else float("nan"),
-                        "r_p75": float(bucket_r.quantile(0.75)) if not bucket_r.empty else float("nan"),
-                    }
-                )
-            return rows
-
-        bucket_rows: list[dict[str, float | str | int]] = []
-        global_q = _choose_bucket_q(len(y_calib))
-        bucket_rows.extend(_bucket_rows("global", preds, y_calib, r_calib, q=global_q))
-        for family_id, fam_labels in y_calib.groupby(fam_calib):
-            if len(fam_labels) < 200:
-                logger.debug("skip bucket diag low calib samples: %s n=%s", family_id, len(fam_labels))
-                continue
-            fam_scores = preds.loc[fam_labels.index]
-            fam_r = r_calib.loc[fam_labels.index]
-            fam_q = _choose_bucket_q(len(fam_labels))
-            bucket_rows.extend(_bucket_rows(str(family_id), fam_scores, fam_labels, fam_r, q=fam_q))
-        if bucket_rows:
-            logger.info("-" * 96)
-            logger.info("G) Score buckets diagnostics (calib)")
-            logger.info("%s", pd.DataFrame(bucket_rows).to_string(index=False))
-
-        def _binary_sep_row(scope: str, scores: pd.Series, labels_: pd.Series) -> dict[str, float | str | int]:
-            pos_scores = scores[labels_ == 1]
-            neg_scores = scores[labels_ == 0]
-            n = len(labels_)
-            score_mean_pos = float(pos_scores.mean()) if not pos_scores.empty else float("nan")
-            score_mean_neg = float(neg_scores.mean()) if not neg_scores.empty else float("nan")
-            score_gap = score_mean_pos - score_mean_neg if n else float("nan")
-            if n < 3 or scores.std() == 0 or labels_.std() == 0:
-                corr_score_label = float("nan")
-            else:
-                corr_score_label = float(scores.corr(labels_, method="pearson"))
-            return {
-                "scope": scope,
-                "n": n,
-                "score_mean_pos": score_mean_pos,
-                "score_mean_neg": score_mean_neg,
-                "score_gap": score_gap,
-                "corr_score_label": corr_score_label,
-            }
-
-        binary_rows = [_binary_sep_row("global", preds, y_calib)]
-        for family_id, fam_labels in y_calib.groupby(fam_calib):
-            fam_scores = preds.loc[fam_labels.index]
-            binary_rows.append(_binary_sep_row(str(family_id), fam_scores, fam_labels))
-        logger.info("-" * 96)
-        logger.info("H) Binary separation sanity (calib)")
-        logger.info("%s", pd.DataFrame(binary_rows).to_string(index=False))
+    best_regime = "NA"
+    worst_regime = "NA"
+    recommendation = "NO_EDGE_GENERAL; CONSIDER_SYMBOL_SPECIFIC"
+    if not regime_df.empty:
+        best_idx = regime_df["delta_r_mean@20"].idxmax()
+        worst_idx = regime_df["delta_r_mean@20"].idxmin()
+        best_regime = regime_df.loc[best_idx, "regime_id"]
+        worst_regime = regime_df.loc[worst_idx, "regime_id"]
+        win_mask = regime_df["flag"].str.contains("WIN") & (regime_df["samples_calib"] >= 300)
+        if win_mask.any():
+            recommendation = "EDGE_FOUND_META"
+    logger.info(
+        "INFO | SUMMARY | BEST_REGIME=%s WORST_REGIME=%s",
+        best_regime,
+        worst_regime,
+    )
+    logger.info("INFO | SUMMARY | RECOMMENDATION=%s", recommendation)
 
     metrics_summary = {}
     if not metrics_df.empty:
-        global_row = metrics_df[metrics_df["scope"] == "global"]
-        if not global_row.empty:
-            metrics_summary = global_row.iloc[0].to_dict()
+        scorer_row = metrics_df[metrics_df["model"] == "SCORER"]
+        if not scorer_row.empty:
+            metrics_summary = scorer_row.iloc[0].to_dict()
 
     metadata = {
         "symbol": args.symbol,
@@ -799,7 +805,7 @@ def main() -> None:
         "sl_mult": args.sl_mult,
         "r_thr": args.r_thr,
         "tie_break": args.tie_break,
-        "feature_count": event_features.shape[1],
+        "feature_count": event_features_all.shape[1],
         "train_date": datetime.now(timezone.utc).isoformat(),
         "metrics_summary": metrics_summary,
     }
@@ -809,13 +815,13 @@ def main() -> None:
         [
             {
                 "events_total": len(events),
-                "labeled": len(labels),
-                "feature_count": event_features.shape[1],
+                "labeled": len(events),
+                "feature_count": event_features_all.shape[1],
             }
         ]
     )
     logger.info("Summary:\n%s", summary_table.to_string(index=False))
-    logger.info("label_distribution=%s", labels.value_counts(normalize=True).to_dict())
+    logger.info("label_distribution=%s", events["label"].value_counts(normalize=True).to_dict())
     logger.info("model_out=%s", scorer_out)
 
     args.model_dir.mkdir(parents=True, exist_ok=True)
@@ -827,10 +833,10 @@ def main() -> None:
     family_summary.to_csv(family_path, index=False)
     logger.info("family_summary_out=%s", family_path)
 
-    if not y_calib.empty:
+    if not y_calib.empty and preds_meta is not None:
         sample_cols = ["family_id", "side", "label", "r_outcome"]
         sample_df = events.loc[y_calib.index, sample_cols].copy()
-        sample_df["score"] = preds
+        sample_df["score"] = preds_meta
         sample_df["margin_H1"] = df_m5_ctx["margin_H1"].reindex(sample_df.index)
         sample_df = sample_df.sort_values("score", ascending=False).head(10)
         sample_df = sample_df.reset_index().rename(columns={sample_df.index.name or "index": "time"})
@@ -839,10 +845,10 @@ def main() -> None:
         logger.info("calib_top_scored_out=%s", sample_path)
 
     if global_scorer._model is not None and hasattr(global_scorer._model, "feature_importances_"):
-        importances = pd.Series(global_scorer._model.feature_importances_, index=event_features.columns)
+        importances = pd.Series(global_scorer._model.feature_importances_, index=event_features_all.columns)
         top_features = importances.sort_values(ascending=False).head(20)
-        logger.info("Model signature (features=%s):", event_features.shape[1])
-        logger.info("%s", textwrap.fill(", ".join(event_features.columns), width=120))
+        logger.info("Model signature (features=%s):", event_features_all.shape[1])
+        logger.info("%s", textwrap.fill(", ".join(event_features_all.columns), width=120))
         logger.info("Top-20 feature importances:\n%s", top_features.to_string())
 
     warning_summary = pd.DataFrame(warning_summary_rows)
