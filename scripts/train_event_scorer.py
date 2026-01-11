@@ -32,7 +32,7 @@ from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConf
 
 def parse_args() -> argparse.Namespace:
     default_end = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    default_start = (datetime.today() - timedelta(days=180)).strftime("%Y-%m-%d")
+    default_start = (datetime.today() - timedelta(days=340)).strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(description="Train Event Scorer model.")
     parser.add_argument("--symbol", default="EURUSD", help="Símbolo MT5 (ej. EURUSD)")
     parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD) para descarga M5/H1")
