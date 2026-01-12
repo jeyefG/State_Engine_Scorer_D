@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         default=Path(PROJECT_ROOT / "state_engine" / "models"),
         help="Directorio base para modelos",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directorio base para resultados")
+    parser.add_argument("--output-dir", type=Path, default=Path(PROJECT_ROOT / "state_engine" / "models" / "backtests"), help="Directorio base para resultados")
     parser.add_argument("--edge-threshold", type=float, default=0.6, help="Threshold global edge_score")
     parser.add_argument("--max-holding-bars", type=int, default=24, help="Máximo de velas M5 por trade")
     parser.add_argument("--reward-r", type=float, default=1.0, help="R múltiplo para TP")
