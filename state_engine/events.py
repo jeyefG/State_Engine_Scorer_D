@@ -1,4 +1,4 @@
-"""Event detection and labeling for the M5 Event Scorer."""
+"""Event detection and feature extraction for the M5 Event Scorer (Layer A)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,13 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
+
+EPS = 1e-9
+
+
+class EventType(str, Enum):
+    TOUCH_VWAP = "E_TOUCH_VWAP"
+    REJECTION_VWAP = "E_REJECTION_VWAP"
 
 
 class EventFamily(str, Enum):
@@ -40,178 +47,106 @@ class EventDetectionConfig:
     trend_continuation_break_atr: float = 0.25
 
 
+class EventExtractor:
+    """Layer A extractor: detect events and compute event features without leakage."""
+
+    def __init__(self, *, eps: float = EPS) -> None:
+        self.eps = eps
+
+    def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
+        if vwap_col not in df_m5.columns:
+            raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
+
+        required = {"open", "high", "low", "close"}
+        missing = required - set(df_m5.columns)
+        if missing:
+            raise ValueError(f"Missing required OHLC columns: {sorted(missing)}")
+
+        df = df_m5.copy()
+        ts = _extract_timestamp(df)
+
+        open_ = df["open"]
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        vwap = df[vwap_col]
+
+        dist_to_vwap = close - vwap
+        abs_dist_to_vwap = dist_to_vwap.abs()
+        vwap_slope_5 = (vwap - vwap.shift(5)) / 5.0
+        range_1 = (high - low)
+        body_ratio = (close - open_).abs() / (range_1 + self.eps)
+        upper_wick = high - np.maximum(open_, close)
+        lower_wick = np.minimum(open_, close) - low
+        upper_wick_ratio = upper_wick / (range_1 + self.eps)
+        lower_wick_ratio = lower_wick / (range_1 + self.eps)
+
+        if "atr" in df.columns:
+            atr_14 = df["atr"]
+        else:
+            atr_14 = _atr(high, low, close, 14)
+
+        dist_to_vwap_atr = dist_to_vwap / (atr_14 + self.eps)
+
+        if "volume" in df.columns:
+            volume_rel = df["volume"] / df["volume"].rolling(20).mean()
+        else:
+            volume_rel = pd.Series(np.nan, index=df.index)
+
+        features = pd.DataFrame(
+            {
+                "dist_to_vwap": dist_to_vwap,
+                "abs_dist_to_vwap": abs_dist_to_vwap,
+                "vwap_slope_5": vwap_slope_5,
+                "range_1": range_1,
+                "body_ratio": body_ratio,
+                "upper_wick_ratio": upper_wick_ratio,
+                "lower_wick_ratio": lower_wick_ratio,
+                "atr_14": atr_14,
+                "dist_to_vwap_atr": dist_to_vwap_atr,
+                "volume_rel": volume_rel,
+                "hour": ts.dt.hour,
+                "minute": ts.dt.minute,
+            },
+            index=df.index,
+        )
+
+        touch_mask = (low <= vwap) & (high >= vwap)
+        rejection_mask = touch_mask & (
+            ((close > vwap) & (open_ <= vwap)) | ((close < vwap) & (open_ >= vwap))
+        )
+
+        events = [
+            _build_events(features, ts, symbol, touch_mask, EventType.TOUCH_VWAP),
+            _build_events(features, ts, symbol, rejection_mask, EventType.REJECTION_VWAP),
+        ]
+
+        events_df = pd.concat([frame for frame in events if not frame.empty], axis=0)
+        if events_df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "ts",
+                    "family_id",
+                    "event_id",
+                    *features.columns,
+                    "event_features",
+                ]
+            )
+
+        events_df = events_df.sort_values("ts")
+        events_df["event_id"] = range(1, len(events_df) + 1)
+        return events_df.reset_index(drop=True)
+
+
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
-    """Detect candidate events on M5 given H1 context (shifted)."""
-    cfg = config or EventDetectionConfig()
-    required = {"open", "high", "low", "close"}
-    missing = required - set(df_m5_ctx.columns)
-    if missing:
-        raise ValueError(f"Missing required columns for event detection: {sorted(missing)}")
-
-    allow_cols = {
-        "ALLOW_trend_pullback",
-        "ALLOW_trend_continuation",
-        "ALLOW_balance_fade",
-        "ALLOW_transition_failure",
-    }
-    missing_allow = allow_cols - set(df_m5_ctx.columns)
-    if missing_allow:
-        raise ValueError(f"Missing required ALLOW_* columns: {sorted(missing_allow)}")
-
-    df = df_m5_ctx.copy()
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    events: list[pd.DataFrame] = []
-
-    if "atr_short" in df.columns:
-        atr_short = df["atr_short"]
-    else:
-        atr_short = _atr(high, low, close, 14)
-
-    # Shared context features to enrich candidates (proposal engine).
-    range_high = high.rolling(cfg.balance_window).max()
-    range_low = low.rolling(cfg.balance_window).min()
-    range_width = (range_high - range_low).replace(0, np.nan)
-    range_width_atr = range_width / atr_short.replace(0, np.nan)
-    location_0_1 = (close - range_low) / range_width
-
-    trend_momentum = close - close.shift(cfg.trend_window)
-    momentum_norm = trend_momentum / atr_short.replace(0, np.nan)
-
-    trend_range_high = high.rolling(cfg.trend_window).max()
-    trend_range_low = low.rolling(cfg.trend_window).min()
-    trend_range_width = (trend_range_high - trend_range_low).replace(0, np.nan)
-    trend_location = (close - trend_range_low) / trend_range_width
-
-    range_last_n = high.rolling(cfg.trend_continuation_comp_window).max() - low.rolling(
-        cfg.trend_continuation_comp_window
-    ).min()
-    compression_ratio = range_last_n / atr_short.replace(0, np.nan)
-    breakout_high = high.shift(1).rolling(cfg.trend_continuation_break_window).max()
-    breakout_low = low.shift(1).rolling(cfg.trend_continuation_break_window).min()
-    breakout_dist_long = (breakout_high - close) / atr_short.replace(0, np.nan)
-    breakout_dist_short = (close - breakout_low) / atr_short.replace(0, np.nan)
-
-    df["range_width_atr"] = range_width_atr
-    df["location_0_1"] = location_0_1
-    df["momentum_norm"] = momentum_norm
-    df["compression_ratio"] = compression_ratio
-    df["breakout_dist_atr"] = np.where(momentum_norm >= 0, breakout_dist_long, breakout_dist_short)
-
-    # BALANCE FADE: softer extreme location within recent range.
-    range_filter = range_width_atr > (cfg.balance_min_range_atr * cfg.balance_soft_range_mult)
-    balance_mask = df["ALLOW_balance_fade"] == 1
-    balance_edge = max(cfg.balance_edge, cfg.balance_soft_edge)
-    balance_short = balance_mask & range_filter & (location_0_1 >= (1.0 - balance_edge))
-    balance_long = balance_mask & range_filter & (location_0_1 <= balance_edge)
-    if balance_short.any():
-        subset = df.loc[balance_short].copy()
-        subset["family_id"] = EventFamily.BALANCE_FADE.value
-        subset["side"] = "short"
-        events.append(subset)
-    if balance_long.any():
-        subset = df.loc[balance_long].copy()
-        subset["family_id"] = EventFamily.BALANCE_FADE.value
-        subset["side"] = "long"
-        events.append(subset)
-
-    # TRANSITION FAILURE: re-entry after a brief break or near-edge reclaim.
-    prev_close = close.shift(1)
-    range_high_prev = high.shift(1).rolling(cfg.transition_window).max()
-    range_low_prev = low.shift(1).rolling(cfg.transition_window).min()
-    inside_now = (close >= range_low_prev) & (close <= range_high_prev)
-    outside_prev = (prev_close > range_high_prev) | (prev_close < range_low_prev)
-    dist_to_high = (range_high_prev - close) / atr_short.replace(0, np.nan)
-    dist_to_low = (close - range_low_prev) / atr_short.replace(0, np.nan)
-    near_edge = (dist_to_high <= cfg.transition_near_edge_atr) | (dist_to_low <= cfg.transition_near_edge_atr)
-    transition_mask = df["ALLOW_transition_failure"] == 1
-    transition_event = transition_mask & inside_now & (outside_prev | near_edge)
-    if transition_event.any():
-        subset = df.loc[transition_event].copy()
-        subset["family_id"] = EventFamily.TRANSITION_FAILURE.value
-        side_series = np.where(
-            outside_prev.loc[transition_event],
-            np.where(prev_close.loc[transition_event] > range_high_prev.loc[transition_event], "short", "long"),
-            np.where(dist_to_high.loc[transition_event] <= dist_to_low.loc[transition_event], "short", "long"),
-        )
-        subset["side"] = side_series
-        subset["breakout_dist_atr"] = np.where(
-            subset["side"] == "short",
-            dist_to_high.loc[transition_event],
-            dist_to_low.loc[transition_event],
-        )
-        events.append(subset)
-
-    # TREND PULLBACK: direction inferred from recent momentum + pullback location.
-    trend_mask = df["ALLOW_trend_pullback"] == 1
-    pullback_edge = cfg.trend_pullback_edge * cfg.trend_pullback_edge_mult
-    momentum_thr = cfg.trend_momentum_atr_thr * cfg.trend_pullback_momentum_mult
-
-    uptrend = trend_mask & (momentum_norm >= momentum_thr)
-    downtrend = trend_mask & (momentum_norm <= -momentum_thr)
-
-    pullback_depth = np.where(momentum_norm >= 0, 1.0 - trend_location, trend_location)
-    df["pullback_depth_0_1"] = pullback_depth
-
-    up_pullback = uptrend & (pullback_depth >= pullback_edge)
-    down_pullback = downtrend & (pullback_depth >= pullback_edge)
-
-    if up_pullback.any():
-        subset = df.loc[up_pullback].copy()
-        subset["family_id"] = EventFamily.TREND_PULLBACK.value
-        subset["side"] = "long"
-        events.append(subset)
-    if down_pullback.any():
-        subset = df.loc[down_pullback].copy()
-        subset["family_id"] = EventFamily.TREND_PULLBACK.value
-        subset["side"] = "short"
-        events.append(subset)
-
-    # TREND CONTINUATION: compression + breakout aligned with momentum (soft pre-breakout allowed).
-    continuation_mask = df["ALLOW_trend_continuation"] == 1
-    momentum_tc = close - close.shift(cfg.trend_continuation_momentum_window)
-    momentum_sign = np.sign(momentum_tc)
-    side_long = continuation_mask & (momentum_sign > 0)
-    side_short = continuation_mask & (momentum_sign < 0)
-
-    compression = compression_ratio < (cfg.trend_continuation_comp_thr * cfg.trend_continuation_comp_mult)
-
-    breakout_long = close > breakout_high
-    breakout_short = close < breakout_low
-    prebreak_long = breakout_dist_long <= cfg.trend_continuation_break_atr
-    prebreak_short = breakout_dist_short <= cfg.trend_continuation_break_atr
-
-    trend_cont_long = side_long & compression & (breakout_long | prebreak_long)
-    trend_cont_short = side_short & compression & (breakout_short | prebreak_short)
-    if trend_cont_long.any():
-        subset = df.loc[trend_cont_long].copy()
-        subset["family_id"] = EventFamily.TREND_CONTINUATION.value
-        subset["side"] = "long"
-        subset["breakout_dist_atr"] = breakout_dist_long.loc[trend_cont_long]
-        subset["tc_n_comp"] = cfg.trend_continuation_comp_window
-        subset["tc_n_brk"] = cfg.trend_continuation_break_window
-        subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
-        subset["tc_momentum_window"] = cfg.trend_continuation_momentum_window
-        events.append(subset)
-    if trend_cont_short.any():
-        subset = df.loc[trend_cont_short].copy()
-        subset["family_id"] = EventFamily.TREND_CONTINUATION.value
-        subset["side"] = "short"
-        subset["breakout_dist_atr"] = breakout_dist_short.loc[trend_cont_short]
-        subset["tc_n_comp"] = cfg.trend_continuation_comp_window
-        subset["tc_n_brk"] = cfg.trend_continuation_break_window
-        subset["tc_comp_thr"] = cfg.trend_continuation_comp_thr
-        subset["tc_momentum_window"] = cfg.trend_continuation_momentum_window
-        events.append(subset)
-
-    if not events:
-        return pd.DataFrame(columns=[*df.columns, "family_id", "side"])
-
-    events_df = pd.concat(events).sort_index()
-    events_df["event_price"] = events_df["close"]
-    return events_df
+    """Backward-compatible wrapper around EventExtractor.extract."""
+    _ = config
+    symbol = "UNKNOWN"
+    if "symbol" in df_m5_ctx.columns and not df_m5_ctx["symbol"].empty:
+        symbol = str(df_m5_ctx["symbol"].iloc[0])
+    extractor = EventExtractor()
+    return extractor.extract(df_m5_ctx, symbol=symbol)
 
 
 def label_events(
@@ -361,6 +296,35 @@ def label_events(
     return df
 
 
+def _extract_timestamp(df: pd.DataFrame) -> pd.Series:
+    if isinstance(df.index, pd.DatetimeIndex):
+        return pd.Series(df.index, index=df.index)
+    if "ts" in df.columns:
+        return pd.to_datetime(df["ts"])
+    if "time" in df.columns:
+        return pd.to_datetime(df["time"])
+    raise ValueError("Missing datetime index or 'ts'/'time' column for timestamps")
+
+
+def _build_events(
+    features: pd.DataFrame,
+    ts: pd.Series,
+    symbol: str,
+    mask: pd.Series,
+    event_type: EventType,
+) -> pd.DataFrame:
+    if not mask.any():
+        return pd.DataFrame()
+
+    subset = features.loc[mask].copy()
+    subset.insert(0, "symbol", symbol)
+    subset.insert(1, "ts", ts.loc[mask])
+    subset.insert(2, "family_id", event_type.value)
+    subset["event_id"] = np.nan
+    subset["event_features"] = subset[features.columns].to_dict(orient="records")
+    return subset
+
+
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -374,4 +338,11 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.S
     return tr.rolling(window).mean()
 
 
-__all__ = ["EventFamily", "EventDetectionConfig", "detect_events", "label_events"]
+__all__ = [
+    "EventType",
+    "EventExtractor",
+    "EventFamily",
+    "EventDetectionConfig",
+    "detect_events",
+    "label_events",
+]
