@@ -138,6 +138,7 @@ class EventExtractor:
                 .rolling(cooldown, min_periods=1)
                 .max()
                 .fillna(False)
+                .gt(0)
             )
             before_count = int(enter_mask.sum())
             enter_mask = enter_mask & ~recent_enter
