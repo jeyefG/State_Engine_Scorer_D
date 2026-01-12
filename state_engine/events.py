@@ -51,6 +51,7 @@ class EventDetectionConfig:
     near_vwap_atr: float = 0.35
     near_vwap_cooldown_bars: int = 3
     vwap_reset_mode: str | None = None
+    vwap_session_cut_hour: int = 22
     near_vwap_mode: str = "enter"
     touch_mode: str = "on"
     rejection_mode: str = "on"
@@ -67,14 +68,37 @@ class EventExtractor:
     def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
         df = df_m5.copy()
         if vwap_col not in df.columns:
+            ts = pd.to_datetime(_extract_timestamp(df))
+            ts = pd.Series(ts.to_numpy(), index=df.index)
+            has_session_col = any(col in df.columns for col in ("session_id", "session"))
+            created_session_id = False
+            if self.config.vwap_reset_mode in {None, "session"} and not has_session_col:
+                cut_hour = int(self.config.vwap_session_cut_hour)
+                session_day = ts - pd.to_timedelta((ts.dt.hour < cut_hour).astype(int), unit="D")
+                df["session_id"] = session_day.dt.date.astype(str)
+                created_session_id = True
             reset_mode = _resolve_vwap_reset_mode(df, self.config.vwap_reset_mode)
             if reset_mode == "cumulative":
                 self.logger.warning("USING CUMULATIVE VWAP FALLBACK – supply may be broken.")
             else:
                 self.logger.warning("VWAP column missing; computing %s VWAP fallback.", reset_mode)
-            df[vwap_col] = _compute_vwap(df, vwap_col=vwap_col, reset_mode=reset_mode)
+            sort_order = np.arange(len(df))
+            df_sorted = df.assign(
+                _sort_ts=ts.to_numpy(),
+                _sort_order=sort_order,
+            ).sort_values(["_sort_ts", "_sort_order"], kind="mergesort")
+            vwap_sorted = _compute_vwap(
+                df_sorted.drop(columns=["_sort_ts", "_sort_order"]),
+                vwap_col=vwap_col,
+                reset_mode=reset_mode,
+            )
+            df_sorted[vwap_col] = vwap_sorted
+            df[vwap_col] = df_sorted.sort_values("_sort_order")[vwap_col].to_numpy()
+            df_sorted = df_sorted.drop(columns=["_sort_ts", "_sort_order"])
             vwap_nan_pct = float(df[vwap_col].isna().mean() * 100)
             self.logger.info("VWAP fallback computed: mode=%s nan_pct=%.2f%%", reset_mode, vwap_nan_pct)
+            if created_session_id:
+                df = df.drop(columns=["session_id"])
             if df[vwap_col].isna().all():
                 raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
 
