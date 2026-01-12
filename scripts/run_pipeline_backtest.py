@@ -27,7 +27,7 @@ from state_engine.sweep import run_param_sweep
 
 def parse_args() -> argparse.Namespace:
     default_end = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    default_start = (datetime.today() - timedelta(days=60)).strftime("%Y-%m-%d")
+    default_start = (datetime.today() - timedelta(days=700)).strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(description="Run pipeline backtest.")
     parser.add_argument("--symbol", default="EURUSD", help="Símbolo MT5 (ej. EURUSD)")
     parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD)")
