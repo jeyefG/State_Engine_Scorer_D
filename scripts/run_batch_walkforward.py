@@ -19,7 +19,7 @@ from scripts.run_walkforward_backtest import run_walkforward, setup_logging
 
 def parse_args() -> argparse.Namespace:
     default_end = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    default_start = (datetime.today() - timedelta(days=240)).strftime("%Y-%m-%d")
+    default_start = (datetime.today() - timedelta(days=700)).strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(description="Batch walk-forward evaluation.")
     parser.add_argument("--symbols", required=True, help="Lista de símbolos separados por coma")
     parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD)")
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-days", type=int, default=30, help="Paso (rolling) entre folds")
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--model-dir", type=Path, default=Path(PROJECT_ROOT / "state_engine" / "models"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directorio base para resultados")
+    parser.add_argument("--output-dir", type=Path, default=Path(PROJECT_ROOT / "state_engine" / "models" / "walkforward"), help="Directorio base para resultados")
     parser.add_argument("--edge-threshold", type=float, default=0.6, help="Threshold global edge_score")
     parser.add_argument("--max-holding-bars", type=int, default=24, help="Máximo de velas M5 por trade")
     parser.add_argument("--reward-r", type=float, default=1.0, help="R múltiplo para TP")
