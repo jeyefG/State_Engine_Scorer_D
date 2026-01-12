@@ -145,6 +145,13 @@ def _ensure_atr_14(df: pd.DataFrame) -> pd.Series:
     return _atr(df["high"], df["low"], df["close"], 14).rename("atr_14")
 
 
+def _reset_index_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    index_name = df.index.name or "index"
+    if index_name in df.columns:
+        return df.reset_index(drop=True)
+    return df.reset_index()
+
+
 def _format_interval(interval: pd.Interval | str) -> str:
     if isinstance(interval, pd.Interval):
         left = f"{interval.left:.2f}"
@@ -1098,8 +1105,8 @@ def main() -> None:
         args.model_dir.mkdir(parents=True, exist_ok=True)
         detected_path = args.model_dir / f"events_detected_{_safe_symbol(args.symbol)}.csv"
         labeled_path = args.model_dir / f"events_labeled_{_safe_symbol(args.symbol)}.csv"
-        detected_events.reset_index().to_csv(detected_path, index=False)
-        labeled_events.reset_index().to_csv(labeled_path, index=False)
+        _reset_index_for_export(detected_events).to_csv(detected_path, index=False)
+        _reset_index_for_export(labeled_events).to_csv(labeled_path, index=False)
         logger.info("fallback_events_detected_out=%s", detected_path)
         logger.info("fallback_events_labeled_out=%s", labeled_path)
         if not events_for_training.empty:
@@ -1172,8 +1179,8 @@ def main() -> None:
         args.model_dir.mkdir(parents=True, exist_ok=True)
         detected_path = args.model_dir / f"events_detected_{_safe_symbol(args.symbol)}.csv"
         labeled_path = args.model_dir / f"events_labeled_{_safe_symbol(args.symbol)}.csv"
-        detected_events.reset_index().to_csv(detected_path, index=False)
-        labeled_events.reset_index().to_csv(labeled_path, index=False)
+        _reset_index_for_export(detected_events).to_csv(detected_path, index=False)
+        _reset_index_for_export(labeled_events).to_csv(labeled_path, index=False)
         logger.info("fallback_events_detected_out=%s", detected_path)
         logger.info("fallback_events_labeled_out=%s", labeled_path)
         if not events_for_training.empty:
