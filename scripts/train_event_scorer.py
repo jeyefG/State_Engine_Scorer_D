@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--meta-margin-min", type=float, default=0.10, help="Margen mínimo H1 para meta policy")
     parser.add_argument("--meta-margin-max", type=float, default=0.95, help="Margen máximo H1 para meta policy")
+    parser.add_argument("--decision-n-min", type=int, default=200, help="N mínimo para decision tradeable")
+    parser.add_argument("--decision-r-mean-min", type=float, default=0.02, help="r_mean mínimo para decision tradeable")
+    parser.add_argument("--decision-winrate-min", type=float, default=0.52, help="Winrate mínimo para decision tradeable")
+    parser.add_argument("--decision-p10-min", type=float, default=-0.2, help="p10 mínimo para decision tradeable")
+    parser.add_argument("--fallback-min-samples", type=int, default=300, help="Mínimo de muestras post-meta para metrics")
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
     return parser.parse_args()
 
@@ -157,6 +162,28 @@ def _margin_bins(series: pd.Series, q: int = 3) -> pd.Series:
     return bins
 
 
+def _make_margin_bin_rank(series: pd.Series) -> pd.Series:
+    bins = pd.Series(index=series.index, dtype="object")
+    non_na = series.dropna()
+    if non_na.empty:
+        return bins
+    try:
+        cuts = pd.qcut(non_na, q=3, duplicates="drop")
+    except ValueError:
+        cuts = pd.Series(index=non_na.index, dtype="object")
+    if not isinstance(cuts, pd.Series) or cuts.isna().all():
+        p33, p66 = non_na.quantile([1 / 3, 2 / 3])
+        cuts = pd.cut(
+            non_na,
+            bins=[-np.inf, p33, p66, np.inf],
+            include_lowest=True,
+        )
+    categories = list(pd.Series(cuts).cat.categories)
+    mapping = {cat: f"m{idx}" for idx, cat in enumerate(categories)}
+    bins.loc[non_na.index] = pd.Series(cuts).map(mapping)
+    return bins
+
+
 def _state_label(value: int | float) -> str:
     try:
         return StateLabels(int(value)).name
@@ -189,6 +216,237 @@ def _meta_policy_mask(
     allow_active = events_df[allow_cols].fillna(0).sum(axis=1) > 0 if allow_cols else pd.Series(False, index=events_df.index)
     margin_ok = events_df["margin_H1"].between(margin_min, margin_max, inclusive="both")
     return allow_active & margin_ok
+
+
+def _coverage_table(events_diag: pd.DataFrame, df_m5_ctx: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns_global = [
+        "events_total_post_meta",
+        "events_per_day",
+        "unique_days",
+        "state_balance_pct",
+        "state_trend_pct",
+        "state_transition_pct",
+        "margin_bin_m0_pct",
+        "margin_bin_m1_pct",
+        "margin_bin_m2_pct",
+        "events_index_match_pct",
+    ]
+    columns_by = ["state_hat_H1", "margin_bin", "events_count", "events_pct"]
+    if events_diag.empty:
+        empty_global = pd.DataFrame([{col: 0.0 for col in columns_global}])
+        empty_global["events_index_match_pct"] = float("nan") if df_m5_ctx is None else float("nan")
+        empty_by = pd.DataFrame(columns=columns_by)
+        return empty_global, empty_by
+    total = len(events_diag)
+    unique_days = events_diag.index.normalize().nunique()
+    events_per_day = total / unique_days if unique_days else 0.0
+    state_counts = events_diag["state_hat_H1"].value_counts()
+    margin_counts = events_diag["margin_bin"].value_counts()
+    index_match = (
+        float(events_diag.index.isin(df_m5_ctx.index).mean()) if df_m5_ctx is not None else float("nan")
+    )
+    global_row = {
+        "events_total_post_meta": total,
+        "events_per_day": events_per_day,
+        "unique_days": unique_days,
+        "state_balance_pct": (state_counts.get("BALANCE", 0) / total * 100.0) if total else 0.0,
+        "state_trend_pct": (state_counts.get("TREND", 0) / total * 100.0) if total else 0.0,
+        "state_transition_pct": (state_counts.get("TRANSITION", 0) / total * 100.0) if total else 0.0,
+        "margin_bin_m0_pct": (margin_counts.get("m0", 0) / total * 100.0) if total else 0.0,
+        "margin_bin_m1_pct": (margin_counts.get("m1", 0) / total * 100.0) if total else 0.0,
+        "margin_bin_m2_pct": (margin_counts.get("m2", 0) / total * 100.0) if total else 0.0,
+        "events_index_match_pct": index_match,
+    }
+    coverage_global = pd.DataFrame([global_row])[columns_global]
+    by_state = (
+        events_diag.groupby(["state_hat_H1", "margin_bin"], observed=True)
+        .size()
+        .reset_index(name="events_count")
+    )
+    by_state["events_pct"] = (by_state["events_count"] / total * 100.0) if total else 0.0
+    by_state = by_state.sort_values(["state_hat_H1", "margin_bin"]).reset_index(drop=True)
+    return coverage_global, by_state[columns_by]
+
+
+def _regime_edge_table(events_diag: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = [
+        "state_hat_H1",
+        "margin_bin",
+        "allow_id",
+        "n",
+        "winrate",
+        "r_mean",
+        "r_median",
+        "p10",
+        "p90",
+    ]
+    if events_diag.empty:
+        return pd.DataFrame(columns=columns), pd.DataFrame(columns=columns)
+    grouped = events_diag.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+    summary = grouped.agg(
+        n=("win", "size"),
+        winrate=("win", "mean"),
+        r_mean=("r", "mean"),
+        r_median=("r", "median"),
+        p10=("r", lambda s: s.quantile(0.1)),
+        p90=("r", lambda s: s.quantile(0.9)),
+    ).reset_index()
+    summary = summary.sort_values(["state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    ranked_desc = summary.sort_values(
+        ["r_mean", "n", "winrate", "state_hat_H1", "margin_bin", "allow_id"],
+        ascending=[False, False, False, True, True, True],
+    )
+    ranked_asc = summary.sort_values(
+        ["r_mean", "n", "winrate", "state_hat_H1", "margin_bin", "allow_id"],
+        ascending=[True, False, False, True, True, True],
+    )
+    top10 = ranked_desc.head(10)
+    bottom10 = ranked_asc.head(10)
+    ranked = pd.concat([top10, bottom10], ignore_index=True)
+    return summary[columns], ranked[columns]
+
+
+def _temporal_splits() -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
+    return [
+        ("2024H1", pd.Timestamp("2024-01-01"), pd.Timestamp("2024-06-30 23:59:59")),
+        ("2024H2", pd.Timestamp("2024-07-01"), pd.Timestamp("2024-12-31 23:59:59")),
+        ("2025H1", pd.Timestamp("2025-01-01"), pd.Timestamp("2025-06-30 23:59:59")),
+        ("2025H2", pd.Timestamp("2025-07-01"), pd.Timestamp("2025-12-31 23:59:59")),
+        ("2026YTD", pd.Timestamp("2026-01-01"), pd.Timestamp.max),
+    ]
+
+
+def _stability_table(events_diag: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "split",
+        "state_hat_H1",
+        "margin_bin",
+        "allow_id",
+        "n",
+        "winrate",
+        "r_mean",
+        "r_median",
+        "p10",
+        "p90",
+    ]
+    if events_diag.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[pd.DataFrame] = []
+    for split_name, start_ts, end_ts in _temporal_splits():
+        mask = (events_diag.index >= start_ts) & (events_diag.index <= end_ts)
+        split_events = events_diag.loc[mask]
+        if split_events.empty:
+            continue
+        grouped = split_events.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+        summary = grouped.agg(
+            n=("win", "size"),
+            winrate=("win", "mean"),
+            r_mean=("r", "mean"),
+            r_median=("r", "median"),
+            p10=("r", lambda s: s.quantile(0.1)),
+            p90=("r", lambda s: s.quantile(0.9)),
+        ).reset_index()
+        summary.insert(0, "split", split_name)
+        rows.append(summary)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    table = pd.concat(rows, ignore_index=True)
+    table = table.sort_values(["split", "state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    return table[columns]
+
+
+def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -> pd.DataFrame:
+    columns = [
+        "state_hat_H1",
+        "margin_bin",
+        "allow_id",
+        "n",
+        "winrate",
+        "r_mean",
+        "r_median",
+        "p10",
+        "p90",
+        "decision",
+        "decision_reason",
+    ]
+    if events_diag.empty:
+        return pd.DataFrame(columns=columns)
+    grouped = events_diag.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+    summary = grouped.agg(
+        n=("win", "size"),
+        winrate=("win", "mean"),
+        r_mean=("r", "mean"),
+        r_median=("r", "median"),
+        p10=("r", lambda s: s.quantile(0.1)),
+        p90=("r", lambda s: s.quantile(0.9)),
+    ).reset_index()
+    decisions = []
+    for _, row in summary.iterrows():
+        reasons = []
+        if row["n"] < thresholds.decision_n_min:
+            reasons.append(f"n<{thresholds.decision_n_min}")
+        if row["r_mean"] < thresholds.decision_r_mean_min:
+            reasons.append(f"r_mean<{thresholds.decision_r_mean_min}")
+        if row["winrate"] < thresholds.decision_winrate_min:
+            reasons.append(f"winrate<{thresholds.decision_winrate_min}")
+        if row["p10"] < thresholds.decision_p10_min:
+            reasons.append(f"p10<{thresholds.decision_p10_min}")
+        decision = "TRADEABLE" if not reasons else "NO_TRADEABLE"
+        decisions.append(
+            {
+                "decision": decision,
+                "decision_reason": "|".join(reasons),
+            }
+        )
+    decision_df = pd.DataFrame(decisions)
+    summary = pd.concat([summary, decision_df], axis=1)
+    summary = summary.sort_values(["state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    return summary[columns]
+
+
+def _format_table_block(title: str, df_or_dict: pd.DataFrame | dict) -> str:
+    if isinstance(df_or_dict, dict):
+        df = pd.DataFrame([df_or_dict])
+    else:
+        df = df_or_dict
+    if df.empty:
+        body = "(no rows)"
+    else:
+        body = df.to_string(index=False)
+    return f"{title}\n{body}"
+
+
+def _apply_fallback_guardrails(events_total_post_meta: int, fallback_min_samples: int) -> bool:
+    return events_total_post_meta < fallback_min_samples
+
+
+def _build_training_diagnostic_report(
+    events_diag: pd.DataFrame,
+    df_m5_ctx: pd.DataFrame | None,
+    thresholds: argparse.Namespace,
+) -> dict[str, pd.DataFrame]:
+    report = {}
+    coverage_global, coverage_by = _coverage_table(events_diag, df_m5_ctx)
+    regime_full, regime_ranked = _regime_edge_table(events_diag)
+    stability = _stability_table(events_diag)
+    decision = _decision_table(events_diag, thresholds)
+    for frame in [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision]:
+        numeric_cols = frame.select_dtypes(include=[np.number]).columns
+        frame[numeric_cols] = frame[numeric_cols].round(4)
+    report["coverage_global"] = coverage_global
+    report["coverage_by_state_margin"] = coverage_by
+    report["regime_edge_full"] = regime_full
+    report["regime_edge_ranked"] = regime_ranked
+    report["stability"] = stability
+    report["decision"] = decision
+    print("=== TRAINING DIAGNOSTIC REPORT ===")
+    print(_format_table_block("Coverage (global)", coverage_global))
+    print(_format_table_block("Coverage (by state x margin_bin)", coverage_by))
+    print(_format_table_block("Regime Edge (full)", regime_full))
+    print(_format_table_block("Regime Edge (top 10 / bottom 10 by r_mean)", regime_ranked))
+    print(_format_table_block("Stability temporal (regime edge por split)", stability))
+    print(_format_table_block("Decision", decision))
+    return report
 
 
 def main() -> None:
@@ -283,6 +541,17 @@ def main() -> None:
     events = detect_events(df_m5_ctx)
     if events.empty:
         logger.warning("No events detected; exiting.")
+        events_diag = pd.DataFrame(
+            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
+        )
+        events_diag.index = pd.DatetimeIndex([])
+        is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
+        if is_fallback:
+            print(
+                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
+                f"{args.fallback_min_samples} ==="
+            )
+        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         return
     ctx_cols = [
         col
@@ -351,6 +620,17 @@ def main() -> None:
 
     if events.empty:
         logger.warning("No labeled events after filtering.")
+        events_diag = pd.DataFrame(
+            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
+        )
+        events_diag.index = pd.DatetimeIndex([])
+        is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
+        if is_fallback:
+            print(
+                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
+                f"{args.fallback_min_samples} ==="
+            )
+        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         return
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
 
@@ -396,6 +676,17 @@ def main() -> None:
 
     if meta_policy_on and events_meta.empty:
         logger.warning("Meta policy filtered all events; exiting.")
+        events_diag = pd.DataFrame(
+            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
+        )
+        events_diag.index = pd.DatetimeIndex([])
+        is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
+        if is_fallback:
+            print(
+                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
+                f"{args.fallback_min_samples} ==="
+            )
+        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         return
 
     if meta_policy_on:
@@ -428,6 +719,31 @@ def main() -> None:
 
     events_for_training = events_meta if meta_policy_on else events_all
     events = events_for_training
+    required_columns = {"state_label", "allow_family", "margin_H1", "r_outcome", "label"}
+    missing_columns = sorted(required_columns - set(events_for_training.columns))
+    if missing_columns:
+        raise ValueError(f"Missing required columns in events_for_training: {missing_columns}")
+    if not isinstance(events_for_training.index, pd.DatetimeIndex):
+        raise ValueError("events_for_training index must be DatetimeIndex")
+    events_diag = pd.DataFrame(
+        {
+            "state_hat_H1": events_for_training["state_label"],
+            "allow_id": events_for_training["allow_family"],
+            "margin": events_for_training["margin_H1"],
+            "r": events_for_training["r_outcome"],
+            "win": events_for_training["label"].astype(int),
+        },
+        index=events_for_training.index,
+    )
+    events_diag["margin_bin"] = _make_margin_bin_rank(events_diag["margin"])
+    events_total_post_meta = len(events_for_training)
+    is_fallback = _apply_fallback_guardrails(events_total_post_meta, args.fallback_min_samples)
+    if is_fallback:
+        print(
+            "=== FALLBACK DIAGNÓSTICO: events_total_post_meta="
+            f"{events_total_post_meta} < fallback_min_samples={args.fallback_min_samples} ==="
+        )
+    _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
 
     feature_builder = FeatureBuilder()
     features_all = feature_builder.build(df_m5_ctx)
@@ -682,25 +998,33 @@ def main() -> None:
         logger.info("INFO | GLOBAL | METRICS (%s)\n%s", block_name, table.to_string(index=False))
         return table, scores_block, baseline_scores, y_block
 
-    table_no_meta, preds_no_meta, baseline_no_meta, _ = _metrics_block(
-        "NO_META",
-        X_calib_no_meta,
-        y_calib_no_meta,
-        r_calib_no_meta,
-        fam_calib_no_meta,
-    )
-    if meta_policy_on:
-        table_meta, preds_meta, baseline_meta, _ = _metrics_block(
-            "META",
-            X_calib,
-            y_calib,
-            r_calib,
-            fam_calib,
+    if not is_fallback:
+        table_no_meta, preds_no_meta, baseline_no_meta, _ = _metrics_block(
+            "NO_META",
+            X_calib_no_meta,
+            y_calib_no_meta,
+            r_calib_no_meta,
+            fam_calib_no_meta,
         )
+        if meta_policy_on:
+            table_meta, preds_meta, baseline_meta, _ = _metrics_block(
+                "META",
+                X_calib,
+                y_calib,
+                r_calib,
+                fam_calib,
+            )
+        else:
+            table_meta = table_no_meta.copy()
+            preds_meta = preds_no_meta
+            baseline_meta = baseline_no_meta
     else:
-        table_meta = table_no_meta.copy()
-        preds_meta = preds_no_meta
-        baseline_meta = baseline_no_meta
+        table_no_meta = pd.DataFrame()
+        table_meta = pd.DataFrame()
+        preds_no_meta = None
+        preds_meta = None
+        baseline_no_meta = None
+        baseline_meta = None
 
     def _print_global_metrics(title: str, table: pd.DataFrame) -> None:
         if table.empty:
@@ -722,8 +1046,9 @@ def main() -> None:
             )
         )
 
-    _print_global_metrics("[GLOBAL METRICS | NO_META | POST FILTER]", table_no_meta)
-    _print_global_metrics("[GLOBAL METRICS | META | POST FILTER]", table_meta)
+    if not is_fallback:
+        _print_global_metrics("[GLOBAL METRICS | NO_META | POST FILTER]", table_no_meta)
+        _print_global_metrics("[GLOBAL METRICS | META | POST FILTER]", table_meta)
     print("\n[SANITY]")
     print(f"transition_events_present={transition_events_present}")
     print(f"transition_samples_train={transition_samples_train}")
@@ -883,7 +1208,7 @@ def main() -> None:
         return pd.DataFrame(rows)
 
     regime_df = pd.DataFrame()
-    if preds_meta is not None and not y_calib.empty:
+    if not is_fallback and preds_meta is not None and not y_calib.empty:
         regime_df = _regime_breakdown(preds_meta, y_calib, r_calib, regime_calib, seed=seed)
         if not regime_df.empty:
             regime_top = regime_df.sort_values("samples_calib", ascending=False).head(8)
