@@ -197,6 +197,115 @@ def _state_label(value: int | float) -> str:
         return "UNKNOWN"
 
 
+def _vwap_zone(dist_to_vwap_atr: pd.Series) -> pd.Series:
+    dist_abs = dist_to_vwap_atr.abs()
+    zones = np.select(
+        [
+            dist_abs < 0.35,
+            dist_abs < 0.80,
+            dist_abs < 1.60,
+        ],
+        ["CENTER", "INNER", "OUTER"],
+        default="EXTREME",
+    )
+    zones = pd.Series(zones, index=dist_to_vwap_atr.index)
+    zones = zones.where(dist_to_vwap_atr.notna(), other="UNKNOWN")
+    return zones
+
+
+def _value_state(
+    overlap_ratio: pd.Series,
+    compression_ratio: pd.Series,
+    range_width_atr: pd.Series,
+) -> pd.Series:
+    valid = overlap_ratio.notna() & compression_ratio.notna() & range_width_atr.notna()
+    at_value = (overlap_ratio >= 0.6) & (compression_ratio >= 0.8)
+    far_value = (overlap_ratio <= 0.25) & (range_width_atr >= 1.5)
+    near_value = (overlap_ratio >= 0.4) | (compression_ratio >= 0.6)
+    states = np.select(
+        [at_value, far_value, near_value],
+        ["AT_VALUE", "FAR_FROM_VALUE", "NEAR_VALUE"],
+        default="NEAR_VALUE",
+    )
+    states = pd.Series(states, index=overlap_ratio.index)
+    states = states.where(valid, other="UNKNOWN")
+    return states
+
+
+def _expansion_state(
+    range_atr: pd.Series,
+    atr_ratio: pd.Series,
+    breakout_dist_atr: pd.Series,
+) -> pd.Series:
+    valid = range_atr.notna() & atr_ratio.notna() & breakout_dist_atr.notna()
+    strong = (range_atr >= 1.6) & (breakout_dist_atr >= 0.6) & (atr_ratio >= 1.1)
+    none = (range_atr < 1.0) & (breakout_dist_atr < 0.25) & (atr_ratio <= 1.0)
+    states = np.select(
+        [strong, none],
+        ["STRONG", "NONE"],
+        default="MILD",
+    )
+    states = pd.Series(states, index=range_atr.index)
+    states = states.where(valid, other="UNKNOWN")
+    return states
+
+
+PSEUDO_FEATURES = {
+    "vwap_zone": ["CENTER", "INNER", "OUTER", "EXTREME", "UNKNOWN"],
+    "value_state": ["AT_VALUE", "NEAR_VALUE", "FAR_FROM_VALUE", "UNKNOWN"],
+    "expansion_state": ["NONE", "MILD", "STRONG", "UNKNOWN"],
+}
+
+
+def _encode_pseudo_features(pseudo_features: pd.DataFrame) -> pd.DataFrame:
+    encoded_parts: list[pd.DataFrame] = []
+    for feature_name, categories in PSEUDO_FEATURES.items():
+        series = pseudo_features[feature_name].astype("category")
+        series = series.cat.set_categories(categories)
+        dummies = pd.get_dummies(series, prefix=feature_name)
+        for category in categories:
+            col = f"{feature_name}_{category}"
+            if col not in dummies.columns:
+                dummies[col] = 0
+        encoded_parts.append(dummies)
+    return pd.concat(encoded_parts, axis=1)
+
+
+def _build_pseudo_features(
+    events_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    atr_ratio: pd.Series,
+) -> pd.DataFrame:
+    if "dist_to_vwap_atr" in events_df.columns:
+        dist_to_vwap_atr = pd.to_numeric(events_df["dist_to_vwap_atr"], errors="coerce")
+    else:
+        dist_to_vwap_atr = pd.Series(np.nan, index=events_df.index)
+    overlap_ratio = pd.to_numeric(feature_df.get("overlap_ratio", pd.Series(np.nan, index=events_df.index)), errors="coerce")
+    compression_ratio = pd.to_numeric(
+        feature_df.get("compression_ratio", pd.Series(np.nan, index=events_df.index)),
+        errors="coerce",
+    )
+    range_width_atr = pd.to_numeric(
+        feature_df.get("range_width_atr", pd.Series(np.nan, index=events_df.index)),
+        errors="coerce",
+    )
+    range_atr = pd.to_numeric(feature_df.get("range_atr", pd.Series(np.nan, index=events_df.index)), errors="coerce")
+    breakout_dist_atr = pd.to_numeric(
+        feature_df.get("breakout_dist_atr", pd.Series(np.nan, index=events_df.index)),
+        errors="coerce",
+    )
+    atr_ratio_event = atr_ratio.reindex(feature_df.index)
+    pseudo = pd.DataFrame(
+        {
+            "vwap_zone": _vwap_zone(dist_to_vwap_atr),
+            "value_state": _value_state(overlap_ratio, compression_ratio, range_width_atr),
+            "expansion_state": _expansion_state(range_atr, atr_ratio_event, breakout_dist_atr),
+        },
+        index=events_df.index,
+    )
+    return pseudo
+
+
 def _format_state_mix(counts: pd.Series, state_order: list[str]) -> list[str]:
     total = counts.sum()
     lines = []
@@ -453,6 +562,73 @@ def _build_allow_id(events_df: pd.DataFrame, allow_cols: list[str]) -> pd.Series
     return allow_id
 
 
+def _redistribution_table(events_diag: pd.DataFrame, feature_col: str) -> pd.DataFrame:
+    columns = ["family_id", feature_col, "n", "pct_of_family"]
+    if events_diag.empty or feature_col not in events_diag.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = (
+        events_diag.groupby(["family_id", feature_col], observed=True)
+        .size()
+        .reset_index(name="n")
+    )
+    grouped["pct_of_family"] = (
+        grouped["n"] / grouped.groupby("family_id")["n"].transform("sum") * 100.0
+    ).round(4)
+    grouped = grouped.sort_values(["family_id", feature_col]).reset_index(drop=True)
+    return grouped[columns]
+
+
+def _conditional_edge_table(events_diag: pd.DataFrame, feature_col: str) -> pd.DataFrame:
+    columns = ["family_id", feature_col, "n", "winrate", "r_mean", "p10", "p90"]
+    if events_diag.empty or feature_col not in events_diag.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = events_diag.groupby(["family_id", feature_col], observed=True)
+    summary = grouped.agg(
+        n=("win", "size"),
+        winrate=("win", "mean"),
+        r_mean=("r", "mean"),
+        p10=("r", lambda s: s.quantile(0.1)),
+        p90=("r", lambda s: s.quantile(0.9)),
+    ).reset_index()
+    summary = summary.sort_values(["family_id", feature_col]).reset_index(drop=True)
+    return summary[columns]
+
+
+def _pseudo_temporal_splits() -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
+    return [
+        ("2025H1", pd.Timestamp("2025-01-01"), pd.Timestamp("2025-06-30 23:59:59")),
+        ("2025H2", pd.Timestamp("2025-07-01"), pd.Timestamp("2025-12-31 23:59:59")),
+        ("2026YTD", pd.Timestamp("2026-01-01"), pd.Timestamp.max),
+    ]
+
+
+def _pseudo_stability_table(events_diag: pd.DataFrame, feature_col: str) -> pd.DataFrame:
+    columns = ["split", "family_id", feature_col, "n", "winrate", "r_mean", "p10", "p90"]
+    if events_diag.empty or feature_col not in events_diag.columns:
+        return pd.DataFrame(columns=columns)
+    rows: list[pd.DataFrame] = []
+    for split_name, start_ts, end_ts in _pseudo_temporal_splits():
+        mask = (events_diag.index >= start_ts) & (events_diag.index <= end_ts)
+        split_events = events_diag.loc[mask]
+        if split_events.empty:
+            continue
+        grouped = split_events.groupby(["family_id", feature_col], observed=True)
+        summary = grouped.agg(
+            n=("win", "size"),
+            winrate=("win", "mean"),
+            r_mean=("r", "mean"),
+            p10=("r", lambda s: s.quantile(0.1)),
+            p90=("r", lambda s: s.quantile(0.9)),
+        ).reset_index()
+        summary.insert(0, "split", split_name)
+        rows.append(summary)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    table = pd.concat(rows, ignore_index=True)
+    table = table.sort_values(["split", "family_id", feature_col]).reset_index(drop=True)
+    return table[columns]
+
+
 def _build_training_diagnostic_report(
     events_diag: pd.DataFrame,
     df_m5_ctx: pd.DataFrame | None,
@@ -463,15 +639,24 @@ def _build_training_diagnostic_report(
     regime_full, regime_ranked = _regime_edge_table(events_diag)
     stability = _stability_table(events_diag)
     decision = _decision_table(events_diag, thresholds)
-    for frame in [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision]:
-        numeric_cols = frame.select_dtypes(include=[np.number]).columns
-        frame[numeric_cols] = frame[numeric_cols].round(4)
+    base_frames = [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision]
     report["coverage_global"] = coverage_global
     report["coverage_by_state_margin"] = coverage_by
     report["regime_edge_full"] = regime_full
     report["regime_edge_ranked"] = regime_ranked
     report["stability"] = stability
     report["decision"] = decision
+    for pseudo_col in PSEUDO_FEATURES.keys():
+        redistribution = _redistribution_table(events_diag, pseudo_col)
+        conditional = _conditional_edge_table(events_diag, pseudo_col)
+        stability_pseudo = _pseudo_stability_table(events_diag, pseudo_col)
+        report[f"redistribution_{pseudo_col}"] = redistribution
+        report[f"conditional_edge_{pseudo_col}"] = conditional
+        report[f"stability_{pseudo_col}"] = stability_pseudo
+        base_frames.extend([redistribution, conditional, stability_pseudo])
+    for frame in base_frames:
+        numeric_cols = frame.select_dtypes(include=[np.number]).columns
+        frame[numeric_cols] = frame[numeric_cols].round(4)
     print("=== TRAINING DIAGNOSTIC REPORT ===")
     print(_format_table_block("Coverage (global)", coverage_global))
     print(_format_table_block("Coverage (by state x margin_bin)", coverage_by))
@@ -479,6 +664,10 @@ def _build_training_diagnostic_report(
     print(_format_table_block("Regime Edge (top 10 / bottom 10 by r_mean)", regime_ranked))
     print(_format_table_block("Stability temporal (regime edge por split)", stability))
     print(_format_table_block("Decision", decision))
+    for pseudo_col in PSEUDO_FEATURES.keys():
+        print(_format_table_block(f"Redistribution (family x {pseudo_col})", report[f"redistribution_{pseudo_col}"]))
+        print(_format_table_block(f"Conditional Edge (family x {pseudo_col})", report[f"conditional_edge_{pseudo_col}"]))
+        print(_format_table_block(f"Stability temporal (family x {pseudo_col})", report[f"stability_{pseudo_col}"]))
     return report
 
 
@@ -566,6 +755,10 @@ def main() -> None:
     df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
     logger.info("Rows after dropna ctx: M5_ctx=%s", len(df_m5_ctx))
     m5_ctx_dropna = len(df_m5_ctx)
+    feature_builder = FeatureBuilder()
+    features_all = feature_builder.build(df_m5_ctx)
+    atr_short_mean = features_all["atr_short"].rolling(24, min_periods=6).mean()
+    atr_ratio = features_all["atr_short"] / atr_short_mean.replace(0, np.nan)
 
     state_labels_before = df_m5_ctx["state_hat_H1"].map(_state_label)
     state_counts_before = state_labels_before.value_counts()
@@ -701,6 +894,12 @@ def main() -> None:
             len(events_state_filtered),
         )
 
+    event_features_all = features_all.reindex(events_state_filtered.index)
+    pseudo_features = _build_pseudo_features(events_state_filtered, event_features_all, atr_ratio)
+    events_state_filtered = events_state_filtered.join(pseudo_features)
+    pseudo_encoded = _encode_pseudo_features(pseudo_features)
+    event_features_all = pd.concat([event_features_all, pseudo_encoded], axis=1)
+
     print("\n[STATE MIX | EVENTS POST FILTER]")
     state_counts_events = events_state_filtered["state_label"].value_counts()
     for line in _format_state_mix(state_counts_events, ["BALANCE", "TREND", "TRANSITION"]):
@@ -818,6 +1017,10 @@ def main() -> None:
             "margin": events_for_training["margin_H1"],
             "r": events_for_training["r_outcome"],
             "win": events_for_training["label"].astype(int),
+            "family_id": events_for_training["family_id"],
+            "vwap_zone": events_for_training["vwap_zone"],
+            "value_state": events_for_training["value_state"],
+            "expansion_state": events_for_training["expansion_state"],
         },
         index=events_for_training.index,
     )
@@ -857,9 +1060,6 @@ def main() -> None:
             print(pd.DataFrame([summary]).to_string(index=False))
         return
 
-    feature_builder = FeatureBuilder()
-    features_all = feature_builder.build(df_m5_ctx)
-    event_features_all = features_all.reindex(events_state_filtered.index)
     event_features_all = feature_builder.add_family_features(
         event_features_all,
         events_state_filtered["family_id"],
