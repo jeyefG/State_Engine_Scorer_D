@@ -312,7 +312,10 @@ def main() -> None:
             f"fallback={'YES' if use_fallback else 'NO'}",
         ],
     )
-    top_signals = signals_df.sort_values("edge_score", ascending=False).head(10).to_dict(orient="records")
+    if signals_df.empty or "edge_score" not in signals_df.columns:
+        top_signals = []
+    else:
+        top_signals = signals_df.sort_values("edge_score", ascending=False).head(10).to_dict(orient="records")
     print_section(
         "SIGNALS",
         [
