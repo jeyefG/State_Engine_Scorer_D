@@ -18,6 +18,7 @@ from state_engine.backtest import BacktestConfig, Signal, run_backtest
 from state_engine.events import EventFamily, detect_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
+from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.scoring import EventScorerBundle, FeatureBuilder
@@ -46,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sl-mult", type=float, default=1.0, help="Multiplicador ATR para SL")
     parser.add_argument("--fee", type=float, default=0.0, help="Fee por trade (en unidades de precio)")
     parser.add_argument("--slippage", type=float, default=0.0, help="Slippage en unidades de precio")
+    parser.add_argument(
+        "--spread-per-trade",
+        type=float,
+        default=None,
+        help="Spread por trade (precio). Se aplica como slippage adicional de spread/2",
+    )
     parser.add_argument("--sweep", action="store_true", help="Ejecutar sweep de parámetros")
     parser.add_argument("--sweep-thresholds", type=float, nargs="*", default=[0.5, 0.6, 0.7], help="Edge thresholds")
     parser.add_argument("--sweep-k", type=int, nargs="*", default=[12, 24], help="Max holding bars")
@@ -203,12 +210,16 @@ def main() -> None:
 
     df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
     df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
+    allowed_states = {StateLabels.BALANCE, StateLabels.TREND}
+    df_m5_ctx = df_m5_ctx[df_m5_ctx["state_hat_H1"].isin(allowed_states)]
 
     allow_cols = [col for col in df_m5_ctx.columns if col.startswith("ALLOW_")]
     if not allow_constant_within_hour(df_m5_ctx, allow_cols):
         logger.warning("ALLOW_* changed within an hour. Check H1->M5 bridge.")
 
     events = detect_events(df_m5_ctx)
+    allowed_families = {EventFamily.BALANCE_FADE.value, EventFamily.TREND_PULLBACK.value}
+    events = events[events["family_id"].isin(allowed_families)]
     if events.empty:
         logger.warning("No events detected; exiting.")
         return
@@ -231,11 +242,13 @@ def main() -> None:
     events["edge_score"] = edge_scores
 
     signals = build_signals(events, ohlcv_m5, args.edge_threshold, args.reward_r, args.sl_mult)
+    spread_half = (args.spread_per_trade or 0.0) / 2.0
+    effective_slippage = args.slippage + spread_half
     config = BacktestConfig(
         allow_overlap=False,
         max_holding_bars=args.max_holding_bars,
         fee_per_trade=args.fee,
-        slippage=args.slippage,
+        slippage=effective_slippage,
     )
 
     trades_df, equity_df, metrics = run_backtest(ohlcv_m5, signals, config)
@@ -312,10 +325,16 @@ def main() -> None:
         [
             f"global={metrics.get('global', {})}",
             f"by_family={{{k: v for k, v in metrics.items() if k.startswith('family:')}}}",
+            f"by_edge_bin={{{k: v for k, v in metrics.items() if k.startswith('edge_bin:')}}}",
             f"top10_trades={trades_df.sort_values('pnl', ascending=False).head(10).to_dict(orient='records')}",
             f"worst10_trades={trades_df.sort_values('pnl', ascending=True).head(10).to_dict(orient='records')}",
         ],
     )
+    if not equity_df.empty:
+        monthly_equity = equity_df["equity"].resample("M").last().to_dict()
+    else:
+        monthly_equity = {}
+    print_section("EQUITY_MONTHLY", [f"equity_monthly={monthly_equity}"])
     print_section(
         "SAVE",
         [
@@ -338,7 +357,7 @@ def main() -> None:
                 allow_overlap=False,
                 max_holding_bars=max_hold,
                 fee_per_trade=args.fee,
-                slippage=args.slippage,
+                slippage=effective_slippage,
             )
             trades_df_local, _, metrics_local = run_backtest(ohlcv_m5, signals_local, cfg)
             global_metrics = metrics_local.get("global", {})
