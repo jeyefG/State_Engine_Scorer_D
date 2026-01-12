@@ -54,15 +54,17 @@ class EventExtractor:
         self.eps = eps
 
     def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
-        if vwap_col not in df_m5.columns:
-            raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
+        df = df_m5.copy()
+        if vwap_col not in df.columns:
+            df[vwap_col] = _compute_vwap(df, vwap_col=vwap_col)
+            if df[vwap_col].isna().all():
+                raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
 
         required = {"open", "high", "low", "close"}
-        missing = required - set(df_m5.columns)
+        missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Missing required OHLC columns: {sorted(missing)}")
 
-        df = df_m5.copy()
         ts = _extract_timestamp(df)
 
         open_ = df["open"]
@@ -137,6 +139,29 @@ class EventExtractor:
         events_df = events_df.sort_values("ts")
         events_df["event_id"] = range(1, len(events_df) + 1)
         return events_df.reset_index(drop=True)
+
+
+def _compute_vwap(df: pd.DataFrame, *, vwap_col: str) -> pd.Series:
+    required = {"high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required OHLC columns for VWAP: {sorted(missing)}")
+
+    volume = None
+    for col in ("volume", "tick_volume"):
+        if col in df.columns:
+            volume = df[col]
+            break
+
+    if volume is None:
+        raise ValueError(
+            f"Missing VWAP column '{vwap_col}' and no volume/tick_volume available to compute it"
+        )
+
+    typical_price = df[["high", "low", "close"]].mean(axis=1)
+    cumulative_volume = volume.cumsum()
+    vwap = (typical_price.mul(volume)).cumsum() / cumulative_volume.replace(0, np.nan)
+    return vwap
 
 
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
