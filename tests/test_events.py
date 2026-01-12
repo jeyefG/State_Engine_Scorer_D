@@ -1,6 +1,6 @@
 import pandas as pd
 
-from state_engine.events import EventExtractor, EventType
+from state_engine.events import EventDetectionConfig, EventExtractor, EventFamily, EventType, _compute_vwap
 
 
 def _make_m5_df() -> pd.DataFrame:
@@ -27,6 +27,7 @@ def test_events_schema_has_required_columns() -> None:
     required = {
         "symbol",
         "ts",
+        "event_type",
         "family_id",
         "event_id",
         "dist_to_vwap",
@@ -71,7 +72,7 @@ def test_detects_near_vwap_event() -> None:
 
     events = extractor.extract(df_m5, symbol="TEST")
 
-    assert (events["family_id"] == EventType.NEAR_VWAP.value).any()
+    assert (events["event_type"] == EventType.NEAR_VWAP.value).any()
 
 
 def test_events_have_atr_14_after_warmup() -> None:
@@ -105,3 +106,65 @@ def test_event_timestamp_matches_m5_index() -> None:
     events = extractor.extract(df_m5, symbol="TEST")
     assert not events.empty
     assert events.index[0] in df_m5.index
+
+
+def test_vwap_daily_reset() -> None:
+    idx = pd.to_datetime(
+        ["2024-01-01 00:00", "2024-01-01 00:05", "2024-01-02 00:00", "2024-01-02 00:05"]
+    )
+    df_m5 = pd.DataFrame(
+        {
+            "open": [100, 100, 200, 200],
+            "high": [101, 101, 201, 201],
+            "low": [99, 99, 199, 199],
+            "close": [100, 100, 200, 200],
+            "volume": [10, 10, 10, 10],
+        },
+        index=idx,
+    )
+    vwap = _compute_vwap(df_m5, vwap_col="vwap", reset_mode="daily")
+    assert vwap.iloc[2] == 200
+
+
+def test_family_id_from_allow() -> None:
+    df_m5 = _make_m5_df()
+    df_m5["ALLOW_balance_fade"] = 1
+    df_m5["state_hat_H1"] = 0
+    df_m5["margin_H1"] = 0.2
+    config = EventDetectionConfig(near_vwap_mode="continuous")
+    extractor = EventExtractor(config=config)
+
+    events = extractor.extract(df_m5, symbol="TEST")
+
+    assert (events["family_id"] == EventFamily.BALANCE_FADE.value).any()
+
+
+def test_detect_touch_and_rejection_increases_supply() -> None:
+    idx = pd.date_range("2024-01-01", periods=10, freq="5min")
+    df_m5 = pd.DataFrame(
+        {
+            "open": [99.0] * 10,
+            "high": [101.0] * 10,
+            "low": [98.0] * 10,
+            "close": [101.0] * 10,
+            "vwap": [100.0] * 10,
+            "volume": [10.0] * 10,
+        },
+        index=idx,
+    )
+    config_near_only = EventDetectionConfig(
+        near_vwap_mode="enter",
+        near_vwap_cooldown_bars=0,
+        touch_mode="off",
+        rejection_mode="off",
+    )
+    config_touch_reject = EventDetectionConfig(
+        near_vwap_mode="enter",
+        near_vwap_cooldown_bars=0,
+        touch_mode="on",
+        rejection_mode="on",
+    )
+    events_near_only = EventExtractor(config=config_near_only).extract(df_m5, symbol="TEST")
+    events_touch_reject = EventExtractor(config=config_touch_reject).extract(df_m5, symbol="TEST")
+
+    assert len(events_touch_reject) > len(events_near_only)

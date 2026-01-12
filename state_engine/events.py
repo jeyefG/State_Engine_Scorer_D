@@ -25,6 +25,7 @@ class EventFamily(str, Enum):
     TRANSITION_FAILURE = "E_TRANSITION_FAILURE"
     TREND_PULLBACK = "E_TREND_PULLBACK"
     TREND_CONTINUATION = "E_TREND_CONTINUATION"
+    GENERIC_VWAP = "E_GENERIC_VWAP"
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,10 @@ class EventDetectionConfig:
     trend_continuation_break_atr: float = 0.25
     near_vwap_atr: float = 0.35
     near_vwap_cooldown_bars: int = 3
+    vwap_reset_mode: str | None = None
+    near_vwap_mode: str = "enter"
+    touch_mode: str = "on"
+    rejection_mode: str = "on"
 
 
 class EventExtractor:
@@ -62,7 +67,14 @@ class EventExtractor:
     def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
         df = df_m5.copy()
         if vwap_col not in df.columns:
-            df[vwap_col] = _compute_vwap(df, vwap_col=vwap_col)
+            reset_mode = _resolve_vwap_reset_mode(df, self.config.vwap_reset_mode)
+            if reset_mode == "cumulative":
+                self.logger.warning("USING CUMULATIVE VWAP FALLBACK – supply may be broken.")
+            else:
+                self.logger.warning("VWAP column missing; computing %s VWAP fallback.", reset_mode)
+            df[vwap_col] = _compute_vwap(df, vwap_col=vwap_col, reset_mode=reset_mode)
+            vwap_nan_pct = float(df[vwap_col].isna().mean() * 100)
+            self.logger.info("VWAP fallback computed: mode=%s nan_pct=%.2f%%", reset_mode, vwap_nan_pct)
             if df[vwap_col].isna().all():
                 raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
 
@@ -128,32 +140,66 @@ class EventExtractor:
 
         threshold = self.config.near_vwap_atr
         dist_to_vwap_atr_abs = dist_to_vwap_atr.abs()
+        dist_quantiles = dist_to_vwap_atr_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict()
+        self.logger.info(
+            "VWAP sanity: threshold=%.3f dist_to_vwap_atr_abs_q=%s",
+            threshold,
+            {k: round(v, 4) for k, v in dist_quantiles.items()},
+        )
         near_mask = dist_to_vwap_atr_abs <= threshold
         prev_outside = (dist_to_vwap_atr_abs.shift(1) > threshold).fillna(True)
         enter_mask = near_mask & prev_outside
+        near_mode = self.config.near_vwap_mode
+        if near_mode not in {"enter", "continuous"}:
+            raise ValueError("near_vwap_mode must be 'enter' or 'continuous'")
+        event_near_mask = enter_mask if near_mode == "enter" else near_mask
         cooldown = max(int(self.config.near_vwap_cooldown_bars), 0)
         if cooldown > 0:
             recent_enter = (
-                enter_mask.shift(1)
+                event_near_mask.shift(1)
                 .rolling(cooldown, min_periods=1)
                 .max()
                 .fillna(False)
                 .gt(0)
             )
-            before_count = int(enter_mask.sum())
-            enter_mask = enter_mask & ~recent_enter
-            filtered_count = before_count - int(enter_mask.sum())
+            before_count = int(event_near_mask.sum())
+            event_near_mask = event_near_mask & ~recent_enter
+            filtered_count = before_count - int(event_near_mask.sum())
         else:
             filtered_count = 0
 
         self.logger.info(
-            "E_NEAR_VWAP enter_count=%s cooldown=%s filtered=%s",
-            int(enter_mask.sum()),
+            "E_NEAR_VWAP mode=%s count=%s cooldown=%s filtered=%s",
+            near_mode,
+            int(event_near_mask.sum()),
             cooldown,
             filtered_count,
         )
 
-        events = [_build_events(features, symbol, enter_mask, EventType.NEAR_VWAP)]
+        context_cols = [
+            col for col in df.columns if col in {"state_hat_H1", "margin_H1"} or col.startswith("ALLOW_")
+        ]
+        context = df[context_cols] if context_cols else None
+
+        rejection_mode = self.config.rejection_mode
+        if rejection_mode not in {"on", "off"}:
+            raise ValueError("rejection_mode must be 'on' or 'off'")
+        touch_mode = self.config.touch_mode
+        if touch_mode not in {"on", "off"}:
+            raise ValueError("touch_mode must be 'on' or 'off'")
+
+        rejection_mask = is_rejection if rejection_mode == "on" else pd.Series(False, index=df.index)
+        touch_mask = (
+            is_touch_exact & ~rejection_mask if touch_mode == "on" else pd.Series(False, index=df.index)
+        )
+        near_mask_final = event_near_mask & ~rejection_mask & ~touch_mask
+
+        events = []
+        if rejection_mode == "on":
+            events.append(_build_events(features, context, symbol, rejection_mask, EventType.REJECTION_VWAP))
+        if touch_mode == "on":
+            events.append(_build_events(features, context, symbol, touch_mask, EventType.TOUCH_VWAP))
+        events.append(_build_events(features, context, symbol, near_mask_final, EventType.NEAR_VWAP))
 
         events_df = pd.concat([frame for frame in events if not frame.empty], axis=0)
         if events_df.empty:
@@ -161,6 +207,7 @@ class EventExtractor:
                 columns=[
                     "symbol",
                     "ts",
+                    "event_type",
                     "family_id",
                     "side",
                     "event_id",
@@ -171,6 +218,9 @@ class EventExtractor:
             empty.index.name = "ts"
             return empty
 
+        allow_cols = [col for col in events_df.columns if col.startswith("ALLOW_")]
+        events_df["family_id"] = _infer_family_id(events_df, allow_cols)
+
         events_df.index.name = "ts"
         events_df = events_df.sort_index()
         events_df["event_id"] = range(1, len(events_df) + 1)
@@ -178,7 +228,7 @@ class EventExtractor:
         return events_df
 
 
-def _compute_vwap(df: pd.DataFrame, *, vwap_col: str) -> pd.Series:
+def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str) -> pd.Series:
     required = {"high", "low", "close"}
     missing = required - set(df.columns)
     if missing:
@@ -195,9 +245,34 @@ def _compute_vwap(df: pd.DataFrame, *, vwap_col: str) -> pd.Series:
             f"Missing VWAP column '{vwap_col}' and no volume/tick_volume available to compute it"
         )
 
+    if reset_mode not in {"daily", "session", "cumulative"}:
+        raise ValueError("vwap_reset_mode must be 'daily', 'session', or 'cumulative'")
+
     typical_price = df[["high", "low", "close"]].mean(axis=1)
-    cumulative_volume = volume.cumsum()
-    vwap = (typical_price.mul(volume)).cumsum() / cumulative_volume.replace(0, np.nan)
+    pv = typical_price.mul(volume)
+
+    if reset_mode == "cumulative":
+        cumulative_volume = volume.cumsum()
+        vwap = pv.cumsum() / cumulative_volume.replace(0, np.nan)
+        return vwap
+
+    if reset_mode == "session":
+        session_col = None
+        for col in ("session_id", "session"):
+            if col in df.columns:
+                session_col = col
+                break
+        if session_col is None:
+            raise ValueError("vwap_reset_mode 'session' requires session_id/session column")
+        group_key = df[session_col]
+    else:
+        ts = _extract_timestamp(df)
+        group_key = pd.to_datetime(ts).dt.date
+
+    grouped = df.assign(_pv=pv, _vol=volume).groupby(group_key, sort=False)
+    cumulative_pv = grouped["_pv"].cumsum()
+    cumulative_vol = grouped["_vol"].cumsum().replace(0, np.nan)
+    vwap = cumulative_pv / cumulative_vol
     return vwap
 
 
@@ -369,6 +444,7 @@ def _extract_timestamp(df: pd.DataFrame) -> pd.Series:
 
 def _build_events(
     features: pd.DataFrame,
+    context: pd.DataFrame | None,
     symbol: str,
     mask: pd.Series,
     event_type: EventType,
@@ -377,10 +453,13 @@ def _build_events(
         return pd.DataFrame()
 
     subset = features.loc[mask].copy()
+    if context is not None:
+        subset = subset.join(context.loc[mask], how="left")
     subset.insert(0, "symbol", symbol)
     subset.insert(1, "ts", subset.index)
-    subset.insert(2, "family_id", event_type.value)
-    subset.insert(3, "side", np.where(subset["dist_to_vwap"] >= 0, "long", "short"))
+    subset.insert(2, "event_type", event_type.value)
+    subset.insert(3, "family_id", EventFamily.GENERIC_VWAP.value)
+    subset.insert(4, "side", np.where(subset["dist_to_vwap"] >= 0, "long", "short"))
     subset["event_id"] = np.nan
     subset["event_features"] = subset[features.columns].to_dict(orient="records")
     subset.index.name = "ts"
@@ -405,6 +484,33 @@ def _ensure_atr_14(df: pd.DataFrame) -> pd.Series:
     else:
         atr = _atr(df["high"], df["low"], df["close"], 14)
     return atr.rename("atr_14")
+
+
+def _resolve_vwap_reset_mode(df: pd.DataFrame, mode: str | None) -> str:
+    if mode is not None:
+        return mode
+    if any(col in df.columns for col in ("session_id", "session")):
+        return "session"
+    return "daily"
+
+
+def _infer_family_id(events_df: pd.DataFrame, allow_cols: list[str]) -> pd.Series:
+    if not allow_cols:
+        return pd.Series(EventFamily.GENERIC_VWAP.value, index=events_df.index)
+    allow_active = events_df[allow_cols].fillna(0).astype(int)
+    family = pd.Series(EventFamily.GENERIC_VWAP.value, index=events_df.index)
+    priority = [
+        ("ALLOW_balance_fade", EventFamily.BALANCE_FADE.value),
+        ("ALLOW_transition_failure", EventFamily.TRANSITION_FAILURE.value),
+        ("ALLOW_trend_pullback", EventFamily.TREND_PULLBACK.value),
+        ("ALLOW_trend_continuation", EventFamily.TREND_CONTINUATION.value),
+    ]
+    for allow_col, family_value in priority:
+        if allow_col not in allow_cols:
+            continue
+        mask = allow_active[allow_col].eq(1) & family.eq(EventFamily.GENERIC_VWAP.value)
+        family.loc[mask] = family_value
+    return family
 
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:

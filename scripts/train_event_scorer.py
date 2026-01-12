@@ -25,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from state_engine.events import detect_events, label_events
+from state_engine.events import EventDetectionConfig, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         default="on",
         choices=["on", "off"],
         help="Activar meta policy (gating superior) para regímenes operables",
+    )
+    parser.add_argument(
+        "--include-transition",
+        default="on",
+        choices=["on", "off"],
+        help="Incluir eventos en régimen TRANSITION (default on)",
     )
     parser.add_argument("--meta-margin-min", type=float, default=0.10, help="Margen mínimo H1 para meta policy")
     parser.add_argument("--meta-margin-max", type=float, default=0.95, help="Margen máximo H1 para meta policy")
@@ -213,7 +219,11 @@ def _meta_policy_mask(
     margin_min: float,
     margin_max: float,
 ) -> pd.Series:
-    allow_active = events_df[allow_cols].fillna(0).sum(axis=1) > 0 if allow_cols else pd.Series(False, index=events_df.index)
+    allow_active = (
+        events_df[allow_cols].fillna(0).sum(axis=1) > 0
+        if allow_cols
+        else pd.Series(False, index=events_df.index)
+    )
     margin_ok = events_df["margin_H1"].between(margin_min, margin_max, inclusive="both")
     return allow_active & margin_ok
 
@@ -420,6 +430,29 @@ def _apply_fallback_guardrails(events_total_post_meta: int, fallback_min_samples
     return events_total_post_meta < fallback_min_samples
 
 
+def _save_model_if_ready(
+    is_fallback: bool,
+    scorer: EventScorerBundle,
+    path: Path,
+    metadata: dict[str, object],
+) -> bool:
+    if is_fallback:
+        return False
+    scorer.save(path, metadata=metadata)
+    return True
+
+
+def _build_allow_id(events_df: pd.DataFrame, allow_cols: list[str]) -> pd.Series:
+    if not allow_cols:
+        return pd.Series("ALLOW_none", index=events_df.index)
+    allow_active = events_df[allow_cols].fillna(0).astype(int)
+    allow_id = allow_active.apply(
+        lambda row: ",".join(sorted([col for col, val in row.items() if val == 1])) or "ALLOW_none",
+        axis=1,
+    )
+    return allow_id
+
+
 def _build_training_diagnostic_report(
     events_diag: pd.DataFrame,
     df_m5_ctx: pd.DataFrame | None,
@@ -488,6 +521,21 @@ def main() -> None:
         m5_cutoff,
     )
     logger.info("Rows: H1=%s M5=%s", len(ohlcv_h1), len(ohlcv_m5))
+    print("\n=== EVENT SCORER TRAINING ===")
+    print(
+        "symbol={symbol} start={start} end={end} k_bars={k} reward_r={reward} sl_mult={sl} r_thr={thr} "
+        "meta_policy={meta} include_transition={include_transition}".format(
+            symbol=args.symbol,
+            start=args.start,
+            end=args.end,
+            k=args.k_bars,
+            reward=args.reward_r,
+            sl=args.sl_mult,
+            thr=args.r_thr,
+            meta=args.meta_policy,
+            include_transition=args.include_transition,
+        )
+    )
 
     if not model_path.exists():
         raise FileNotFoundError(f"State model not found: {model_path}")
@@ -503,6 +551,7 @@ def main() -> None:
     if "atr_14" not in df_m5_ctx.columns:
         df_m5_ctx["atr_14"] = _ensure_atr_14(df_m5_ctx)
     logger.info("Rows after merge: M5_ctx=%s", len(df_m5_ctx))
+    m5_ctx_merged = len(df_m5_ctx)
     ctx_nan_cols = ["state_hat_H1", "margin_H1"]
     if "atr_short" in df_m5_ctx.columns:
         ctx_nan_cols.append("atr_short")
@@ -516,29 +565,18 @@ def main() -> None:
     logger.info("Context NaN rates:\n%s", ctx_nan_table.to_string(index=False))
     df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
     logger.info("Rows after dropna ctx: M5_ctx=%s", len(df_m5_ctx))
+    m5_ctx_dropna = len(df_m5_ctx)
 
     state_labels_before = df_m5_ctx["state_hat_H1"].map(_state_label)
     state_counts_before = state_labels_before.value_counts()
-    print("[STATE MIX | BEFORE FILTER]")
+    print("[STATE MIX | M5_CTX]")
     for line in _format_state_mix(state_counts_before, ["BALANCE", "TREND", "TRANSITION"]):
         print(line)
 
-    rows_before = len(df_m5_ctx)
-    df_m5_ctx = df_m5_ctx.loc[df_m5_ctx["state_hat_H1"] != StateLabels.TRANSITION].copy()
-    rows_after = len(df_m5_ctx)
-    kept_pct = (rows_after / rows_before * 100.0) if rows_before else 0.0
+    m5_total = len(ohlcv_m5)
 
-    state_labels_after = df_m5_ctx["state_hat_H1"].map(_state_label)
-    state_counts_after = state_labels_after.value_counts()
-    print("\n[STATE MIX | AFTER FILTER]")
-    for line in _format_state_mix(state_counts_after, ["BALANCE", "TREND"]):
-        print(line)
-    print("\n[FILTER IMPACT]")
-    print(f"rows_before={rows_before}")
-    print(f"rows_after={rows_after}")
-    print(f"kept_pct={kept_pct:.2f}%")
-
-    events = detect_events(df_m5_ctx)
+    event_config = EventDetectionConfig()
+    events = detect_events(df_m5_ctx, config=event_config)
     if events.empty:
         logger.warning("No events detected; exiting.")
         events_diag = pd.DataFrame(
@@ -553,15 +591,10 @@ def main() -> None:
             )
         _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         return
-    ctx_cols = [
-        col
-        for col in df_m5_ctx.columns
-        if col in {"state_hat_H1", "margin_H1"} or col.startswith("ALLOW_")
-    ]
-    if ctx_cols:
-        events = events.join(df_m5_ctx[ctx_cols], how="left")
+
     detected_events = events.copy()
     events_dupes = int(detected_events.index.duplicated().sum())
+    logger.info("Detected events by type:\n%s", events["event_type"].value_counts().to_string())
     logger.info("Detected events by family:\n%s", events["family_id"].value_counts().to_string())
 
     event_indexer = ohlcv_m5.index.get_indexer(events.index)
@@ -633,6 +666,7 @@ def main() -> None:
         _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         return
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
+    logger.info("Labeled events by type:\n%s", events["event_type"].value_counts().to_string())
 
     events_all = events.copy()
     allow_cols = [col for col in events_all.columns if col.startswith("ALLOW_")]
@@ -640,27 +674,54 @@ def main() -> None:
         logger.warning("No ALLOW_* columns found on events; meta policy will be empty.")
     margin_bins = _margin_bins(events_all["margin_H1"], q=3)
     margin_bin_label = margin_bins.map(_format_interval)
-    allow_family_map = {
-        "E_BALANCE_FADE": "ALLOW_balance_fade",
-        "E_BALANCE_REVERT": "ALLOW_balance_fade",
-        "E_TRANSITION_TEST": "ALLOW_transition_failure",
-        "E_TRANSITION_FAILURE": "ALLOW_transition_failure",
-        "E_TREND_PULLBACK": "ALLOW_trend_pullback",
-        "E_TREND_CONTINUATION": "ALLOW_trend_continuation",
-    }
-    allow_family = events_all["family_id"].map(allow_family_map).fillna("ALLOW_unknown")
     state_label = events_all["state_hat_H1"].map(_state_label)
     events_all["state_label"] = state_label
     events_all["margin_bin"] = margin_bin_label
-    events_all["allow_family"] = allow_family
+    events_all["allow_id"] = _build_allow_id(events_all, allow_cols)
     events_all["regime_id"] = (
-        state_label.astype(str) + "|" + margin_bin_label.fillna("mNA") + "|" + allow_family
+        state_label.astype(str)
+        + "|"
+        + margin_bin_label.fillna("mNA")
+        + "|"
+        + events_all["allow_id"]
+        + "|"
+        + events_all["family_id"].astype(str)
+        + "|"
+        + events_all["event_type"].astype(str)
     )
 
+    include_transition = args.include_transition == "on"
+    events_state_filtered = (
+        events_all if include_transition else events_all.loc[events_all["state_label"] != "TRANSITION"]
+    )
+    if not include_transition:
+        logger.info(
+            "STATE FILTER | include_transition=off removed=%s kept=%s",
+            len(events_all) - len(events_state_filtered),
+            len(events_state_filtered),
+        )
+
+    print("\n[STATE MIX | EVENTS POST FILTER]")
+    state_counts_events = events_state_filtered["state_label"].value_counts()
+    for line in _format_state_mix(state_counts_events, ["BALANCE", "TREND", "TRANSITION"]):
+        print(line)
+
+    vwap_mode = "provided" if "vwap" in df_m5_ctx.columns else (
+        event_config.vwap_reset_mode
+        if event_config.vwap_reset_mode is not None
+        else ("session" if any(col in df_m5_ctx.columns for col in ("session_id", "session")) else "daily")
+    )
+    dist_abs = events_all["dist_to_vwap_atr"].abs()
+    vwap_quantiles = dist_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict() if not dist_abs.empty else {}
+    print("\n[VWAP SANITY]")
+    print(f"vwap_mode={vwap_mode} near_vwap_atr={event_config.near_vwap_atr}")
+    if vwap_quantiles:
+        print("dist_to_vwap_atr_abs_q=" + str({k: round(v, 4) for k, v in vwap_quantiles.items()}))
+
     print("\n[BASELINE BY STATE | POST FILTER]")
-    for state_name in ["BALANCE", "TREND"]:
-        state_mask = events_all["state_label"] == state_name
-        state_events = events_all.loc[state_mask]
+    for state_name in ["BALANCE", "TREND", "TRANSITION"]:
+        state_mask = events_state_filtered["state_label"] == state_name
+        state_events = events_state_filtered.loc[state_mask]
         trades = len(state_events)
         winrate = float(state_events["label"].mean()) if trades else float("nan")
         avg_pnl = float(state_events["r_outcome"].mean()) if trades else float("nan")
@@ -671,29 +732,46 @@ def main() -> None:
         )
 
     meta_policy_on = args.meta_policy == "on"
-    meta_mask = _meta_policy_mask(events_all, allow_cols, args.meta_margin_min, args.meta_margin_max)
-    events_meta = events_all.loc[meta_mask].copy()
+    allow_active_series = (
+        events_state_filtered[allow_cols].fillna(0).sum(axis=1) > 0
+        if allow_cols
+        else pd.Series(False, index=events_state_filtered.index)
+    )
+    allow_active_pct = float(allow_active_series.mean() * 100) if len(allow_active_series) else 0.0
+    allow_id_top = events_state_filtered["allow_id"].value_counts().head(10)
+    print("\n[ALLOW SANITY]")
+    print(f"allow_active_pct={allow_active_pct:.2f}%")
+    if not allow_id_top.empty:
+        print("allow_id_top:\n" + allow_id_top.to_string())
+    margin_ok_series = events_state_filtered["margin_H1"].between(
+        args.meta_margin_min,
+        args.meta_margin_max,
+        inclusive="both",
+    )
+    logger.info(
+        "INFO | META | allow_active_count=%s margin_ok_count=%s",
+        int(allow_active_series.sum()),
+        int(margin_ok_series.sum()),
+    )
+
+    meta_mask = _meta_policy_mask(
+        events_state_filtered,
+        allow_cols,
+        args.meta_margin_min,
+        args.meta_margin_max,
+    )
+    events_meta = events_state_filtered.loc[meta_mask].copy()
 
     if meta_policy_on and events_meta.empty:
-        logger.warning("Meta policy filtered all events; exiting.")
-        events_diag = pd.DataFrame(
-            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
-        )
-        events_diag.index = pd.DatetimeIndex([])
-        is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
-        if is_fallback:
-            print(
-                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
-                f"{args.fallback_min_samples} ==="
-            )
-        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
-        return
+        logger.warning("Meta policy filtered all events; continuing with fallback diagnostics.")
 
     if meta_policy_on:
-        kept_pct = (len(events_meta) / len(events_all)) * 100 if len(events_all) else 0.0
+        kept_pct = (
+            (len(events_meta) / len(events_state_filtered)) * 100 if len(events_state_filtered) else 0.0
+        )
         logger.info(
             "INFO | META | before_rows=%s after_rows=%s kept_pct=%.2f",
-            len(events_all),
+            len(events_state_filtered),
             len(events_meta),
             kept_pct,
         )
@@ -713,13 +791,21 @@ def main() -> None:
             logger.info("INFO | META | %s before/after:\n%s", title, table.to_string(index=False))
             return table
 
-        _mix_table(events_all["family_id"], "family mix")
-        _mix_table(events_all["state_label"], "state mix")
-        _mix_table(events_all["margin_bin"].fillna("mNA"), "margin bins")
+        _mix_table(events_state_filtered["family_id"], "family mix")
+        _mix_table(events_state_filtered["state_label"], "state mix")
+        _mix_table(events_state_filtered["margin_bin"].fillna("mNA"), "margin bins")
 
-    events_for_training = events_meta if meta_policy_on else events_all
+    events_for_training = events_meta if meta_policy_on else events_state_filtered
     events = events_for_training
-    required_columns = {"state_label", "allow_family", "margin_H1", "r_outcome", "label"}
+    print("\n[SUPPLY FUNNEL]")
+    print(f"m5_total={m5_total}")
+    print(f"after_merge={m5_ctx_merged}")
+    print(f"after_ctx_dropna={m5_ctx_dropna}")
+    print(f"events_detected={len(detected_events)}")
+    print(f"events_labeled={len(labeled_events)}")
+    print(f"events_post_state_filter={len(events_state_filtered)}")
+    print(f"events_post_meta={len(events_for_training)}")
+    required_columns = {"state_label", "allow_id", "margin_H1", "r_outcome", "label"}
     missing_columns = sorted(required_columns - set(events_for_training.columns))
     if missing_columns:
         raise ValueError(f"Missing required columns in events_for_training: {missing_columns}")
@@ -728,7 +814,7 @@ def main() -> None:
     events_diag = pd.DataFrame(
         {
             "state_hat_H1": events_for_training["state_label"],
-            "allow_id": events_for_training["allow_family"],
+            "allow_id": events_for_training["allow_id"],
             "margin": events_for_training["margin_H1"],
             "r": events_for_training["r_outcome"],
             "win": events_for_training["label"].astype(int),
@@ -737,18 +823,47 @@ def main() -> None:
     )
     events_diag["margin_bin"] = _make_margin_bin_rank(events_diag["margin"])
     events_total_post_meta = len(events_for_training)
-    is_fallback = _apply_fallback_guardrails(events_total_post_meta, args.fallback_min_samples)
+    fallback_reasons = []
+    if _apply_fallback_guardrails(events_total_post_meta, args.fallback_min_samples):
+        fallback_reasons.append(f"events<{args.fallback_min_samples}")
+    if events_for_training["label"].nunique() < 2:
+        fallback_reasons.append("single_class_labels")
+    is_fallback = bool(fallback_reasons)
     if is_fallback:
         print(
             "=== FALLBACK DIAGNÓSTICO: events_total_post_meta="
-            f"{events_total_post_meta} < fallback_min_samples={args.fallback_min_samples} ==="
+            f"{events_total_post_meta} reasons={','.join(fallback_reasons)} ==="
         )
     _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
 
+    if is_fallback:
+        args.model_dir.mkdir(parents=True, exist_ok=True)
+        detected_path = args.model_dir / f"events_detected_{_safe_symbol(args.symbol)}.csv"
+        labeled_path = args.model_dir / f"events_labeled_{_safe_symbol(args.symbol)}.csv"
+        detected_events.reset_index().to_csv(detected_path, index=False)
+        labeled_events.reset_index().to_csv(labeled_path, index=False)
+        logger.info("fallback_events_detected_out=%s", detected_path)
+        logger.info("fallback_events_labeled_out=%s", labeled_path)
+        if not events_for_training.empty:
+            r_values = events_for_training["r_outcome"]
+            summary = {
+                "base_rate": float(events_for_training["label"].mean()),
+                "winrate": float(events_for_training["label"].mean()),
+                "r_mean_all": float(r_values.mean()),
+                "p10": float(r_values.quantile(0.1)),
+                "p90": float(r_values.quantile(0.9)),
+            }
+            print("\n[FALLBACK METRICS]")
+            print(pd.DataFrame([summary]).to_string(index=False))
+        return
+
     feature_builder = FeatureBuilder()
     features_all = feature_builder.build(df_m5_ctx)
-    event_features_all = features_all.reindex(events_all.index)
-    event_features_all = feature_builder.add_family_features(event_features_all, events_all["family_id"])
+    event_features_all = features_all.reindex(events_state_filtered.index)
+    event_features_all = feature_builder.add_family_features(
+        event_features_all,
+        events_state_filtered["family_id"],
+    )
 
     def _split_dataset(events_df: pd.DataFrame, feature_df: pd.DataFrame) -> dict[str, pd.Series | pd.DataFrame]:
         labels_series = events_df["label"].astype(int)
@@ -765,7 +880,7 @@ def main() -> None:
         }
 
     dataset_main = _split_dataset(events_for_training, event_features_all)
-    dataset_no_meta = _split_dataset(events_all, event_features_all)
+    dataset_no_meta = _split_dataset(events_state_filtered, event_features_all)
 
     X_train = dataset_main["X_train"]
     y_train = dataset_main["y_train"]
@@ -782,7 +897,7 @@ def main() -> None:
     fam_calib_no_meta = dataset_no_meta["fam_calib"]
     regime_calib_no_meta = dataset_no_meta["regime_calib"]
 
-    transition_events_present = bool((events_all["state_label"] == "TRANSITION").any())
+    transition_events_present = bool((events_state_filtered["state_label"] == "TRANSITION").any())
     transition_samples_train = int((events_for_training.loc[X_train.index, "state_label"] == "TRANSITION").sum())
     transition_samples_calib = int((events_for_training.loc[X_calib.index, "state_label"] == "TRANSITION").sum())
 
@@ -799,6 +914,24 @@ def main() -> None:
 
     if y_train.nunique() < 2:
         logger.error("Global training labels have a single class; cannot train scorer.")
+        args.model_dir.mkdir(parents=True, exist_ok=True)
+        detected_path = args.model_dir / f"events_detected_{_safe_symbol(args.symbol)}.csv"
+        labeled_path = args.model_dir / f"events_labeled_{_safe_symbol(args.symbol)}.csv"
+        detected_events.reset_index().to_csv(detected_path, index=False)
+        labeled_events.reset_index().to_csv(labeled_path, index=False)
+        logger.info("fallback_events_detected_out=%s", detected_path)
+        logger.info("fallback_events_labeled_out=%s", labeled_path)
+        if not events_for_training.empty:
+            r_values = events_for_training["r_outcome"]
+            summary = {
+                "base_rate": float(events_for_training["label"].mean()),
+                "winrate": float(events_for_training["label"].mean()),
+                "r_mean_all": float(r_values.mean()),
+                "p10": float(r_values.quantile(0.1)),
+                "p90": float(r_values.quantile(0.9)),
+            }
+            print("\n[FALLBACK METRICS]")
+            print(pd.DataFrame([summary]).to_string(index=False))
         return
 
     warning_summary_rows: list[dict[str, int | str | float]] = []
@@ -1072,6 +1205,7 @@ def main() -> None:
         "meta_policy": args.meta_policy,
         "meta_margin_min": args.meta_margin_min,
         "meta_margin_max": args.meta_margin_max,
+        "include_transition": args.include_transition,
     }
     header_table = pd.DataFrame([report_header])
     logger.info("=" * 96)
@@ -1250,7 +1384,7 @@ def main() -> None:
         "train_date": datetime.now(timezone.utc).isoformat(),
         "metrics_summary": metrics_summary,
     }
-    scorer.save(scorer_out, metadata=metadata)
+    _save_model_if_ready(is_fallback=is_fallback, scorer=scorer, path=scorer_out, metadata=metadata)
 
     summary_table = pd.DataFrame(
         [
