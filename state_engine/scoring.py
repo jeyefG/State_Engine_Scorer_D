@@ -186,10 +186,11 @@ class EventScorer:
         self._model = model
 
         if calib_features is not None and calib_labels is not None and not calib_labels.empty:
-            if len(calib_labels) < 2:
+            class_counts = calib_labels.value_counts()
+            if calib_labels.nunique() < 2 or class_counts.min() < 2:
                 self._calibrator = None
             else:
-                cv_folds = min(5, len(calib_labels))
+                cv_folds = min(5, int(class_counts.min()))
                 calibrator = CalibratedClassifierCV(
                     FrozenEstimator(model),
                     method=self.config.calibration_method,
