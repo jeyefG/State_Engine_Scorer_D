@@ -130,6 +130,7 @@ class EventExtractor:
                     "symbol",
                     "ts",
                     "family_id",
+                    "side",
                     "event_id",
                     *features.columns,
                     "event_features",
@@ -348,6 +349,7 @@ def _build_events(
     subset.insert(0, "symbol", symbol)
     subset.insert(1, "ts", subset.index)
     subset.insert(2, "family_id", event_type.value)
+    subset.insert(3, "side", np.where(subset["dist_to_vwap"] >= 0, "long", "short"))
     subset["event_id"] = np.nan
     subset["event_features"] = subset[features.columns].to_dict(orient="records")
     subset.index.name = "ts"
