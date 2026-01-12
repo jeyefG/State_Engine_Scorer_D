@@ -67,14 +67,16 @@ class EventExtractor:
 
     def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
         df = df_m5.copy()
+        vwap_metadata: dict[str, object] = {}
         if vwap_col not in df.columns:
             ts = pd.to_datetime(_extract_timestamp(df))
             ts = pd.Series(ts.to_numpy(), index=df.index)
             has_session_col = any(col in df.columns for col in ("session_id", "session"))
             created_session_id = False
+            cut_hour_used: int | None = None
             if self.config.vwap_reset_mode in {None, "session"} and not has_session_col:
-                cut_hour = int(self.config.vwap_session_cut_hour)
-                session_day = ts - pd.to_timedelta((ts.dt.hour < cut_hour).astype(int), unit="D")
+                cut_hour_used = int(self.config.vwap_session_cut_hour)
+                session_day = ts - pd.to_timedelta((ts.dt.hour < cut_hour_used).astype(int), unit="D")
                 df["session_id"] = session_day.dt.date.astype(str)
                 created_session_id = True
             reset_mode = _resolve_vwap_reset_mode(df, self.config.vwap_reset_mode)
@@ -82,6 +84,9 @@ class EventExtractor:
                 self.logger.warning("USING CUMULATIVE VWAP FALLBACK – supply may be broken.")
             else:
                 self.logger.warning("VWAP column missing; computing %s VWAP fallback.", reset_mode)
+            vwap_metadata["vwap_reset_mode_effective"] = reset_mode
+            if cut_hour_used is not None:
+                vwap_metadata["vwap_session_cut_hour"] = cut_hour_used
             sort_order = np.arange(len(df))
             df_sorted = df.assign(
                 _sort_ts=ts.to_numpy(),
@@ -96,11 +101,19 @@ class EventExtractor:
             df[vwap_col] = df_sorted.sort_values("_sort_order")[vwap_col].to_numpy()
             df_sorted = df_sorted.drop(columns=["_sort_ts", "_sort_order"])
             vwap_nan_pct = float(df[vwap_col].isna().mean() * 100)
-            self.logger.info("VWAP fallback computed: mode=%s nan_pct=%.2f%%", reset_mode, vwap_nan_pct)
+            self.logger.info(
+                "VWAP fallback computed: effective_mode=%s cut_hour=%s created_session_id=%s",
+                reset_mode,
+                cut_hour_used,
+                created_session_id,
+            )
+            self.logger.info("VWAP fallback nan_pct=%.2f%%", vwap_nan_pct)
             if created_session_id:
                 df = df.drop(columns=["session_id"])
             if df[vwap_col].isna().all():
                 raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
+        else:
+            vwap_metadata["vwap_reset_mode_effective"] = "provided"
 
         required = {"open", "high", "low", "close"}
         missing = required - set(df.columns)
@@ -240,6 +253,8 @@ class EventExtractor:
                 ]
             )
             empty.index.name = "ts"
+            if vwap_metadata:
+                empty.attrs.update(vwap_metadata)
             return empty
 
         allow_cols = [col for col in events_df.columns if col.startswith("ALLOW_")]
@@ -249,6 +264,8 @@ class EventExtractor:
         events_df = events_df.sort_index()
         events_df["event_id"] = range(1, len(events_df) + 1)
         events_df["ts"] = events_df.index
+        if vwap_metadata:
+            events_df.attrs.update(vwap_metadata)
         return events_df
 
 

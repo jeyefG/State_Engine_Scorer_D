@@ -219,6 +219,26 @@ def _vwap_zone(dist_to_vwap_atr: pd.Series) -> pd.Series:
     zones = zones.where(dist_to_vwap_atr.notna(), other="UNKNOWN")
     return zones
 
+
+def _resolve_vwap_report_mode(
+    events_df: pd.DataFrame,
+    df_m5_ctx: pd.DataFrame,
+    event_config: EventDetectionConfig,
+) -> str:
+    attrs_mode = events_df.attrs.get("vwap_reset_mode_effective")
+    if attrs_mode is None and "vwap_reset_mode_effective" in events_df.columns and not events_df.empty:
+        attrs_mode = events_df["vwap_reset_mode_effective"].iloc[0]
+    if attrs_mode is not None:
+        return str(attrs_mode)
+    if "vwap" in df_m5_ctx.columns:
+        return "provided (no metadata)"
+    config_mode = (
+        event_config.vwap_reset_mode
+        if event_config.vwap_reset_mode is not None
+        else ("session" if any(col in df_m5_ctx.columns for col in ("session_id", "session")) else "daily")
+    )
+    return f"config_{config_mode} (no metadata)"
+
 def _value_state(
     overlap_ratio: pd.Series,
     compression_ratio: pd.Series,
@@ -967,11 +987,7 @@ def main() -> None:
     for line in _format_state_mix(state_counts_events, ["BALANCE", "TREND", "TRANSITION"]):
         print(line)
 
-    vwap_mode = "provided" if "vwap" in df_m5_ctx.columns else (
-        event_config.vwap_reset_mode
-        if event_config.vwap_reset_mode is not None
-        else ("session" if any(col in df_m5_ctx.columns for col in ("session_id", "session")) else "daily")
-    )
+    vwap_mode = _resolve_vwap_report_mode(detected_events, df_m5_ctx, event_config)
     dist_abs = events_all["dist_to_vwap_atr"].abs()
     vwap_quantiles = dist_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict() if not dist_abs.empty else {}
     print("\n[VWAP SANITY]")
