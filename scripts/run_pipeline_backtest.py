@@ -320,12 +320,14 @@ def main() -> None:
             f"top10={top_signals}",
         ],
     )
+    metrics_by_family = {key: value for key, value in metrics.items() if key.startswith("family:")}
+    metrics_by_edge_bin = {key: value for key, value in metrics.items() if key.startswith("edge_bin:")}
     print_section(
         "BACKTEST",
         [
             f"global={metrics.get('global', {})}",
-            f"by_family={{{k: v for k, v in metrics.items() if k.startswith('family:')}}}",
-            f"by_edge_bin={{{k: v for k, v in metrics.items() if k.startswith('edge_bin:')}}}",
+            f"by_family={metrics_by_family}",
+            f"by_edge_bin={metrics_by_edge_bin}",
             f"top10_trades={trades_df.sort_values('pnl', ascending=False).head(10).to_dict(orient='records')}",
             f"worst10_trades={trades_df.sort_values('pnl', ascending=True).head(10).to_dict(orient='records')}",
         ],
