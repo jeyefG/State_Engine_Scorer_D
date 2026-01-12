@@ -1711,7 +1711,7 @@ def main() -> None:
             "LightGBM split warnings detected. Consider raising min_samples_train or revisiting features."
         )
         logger.info("Split warning summary:\n%s", warning_summary.to_string(index=False))
-        coverage_global = diagnostic_report.get("coverage_global", pd.DataFrame())
+    coverage_global = diagnostic_report.get("coverage_global", pd.DataFrame())
 
     def _scorer_metric(table: pd.DataFrame, metric: str) -> float | None:
         if table.empty:
