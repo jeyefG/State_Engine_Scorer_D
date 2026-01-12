@@ -66,6 +66,9 @@ class EventExtractor:
             raise ValueError(f"Missing required OHLC columns: {sorted(missing)}")
 
         ts = _extract_timestamp(df)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df = df.set_index(ts)
+            ts = pd.Series(df.index, index=df.index)
 
         open_ = df["open"]
         high = df["high"]
@@ -116,13 +119,13 @@ class EventExtractor:
         )
 
         events = [
-            _build_events(features, ts, symbol, touch_mask, EventType.TOUCH_VWAP),
-            _build_events(features, ts, symbol, rejection_mask, EventType.REJECTION_VWAP),
+            _build_events(features, symbol, touch_mask, EventType.TOUCH_VWAP),
+            _build_events(features, symbol, rejection_mask, EventType.REJECTION_VWAP),
         ]
 
         events_df = pd.concat([frame for frame in events if not frame.empty], axis=0)
         if events_df.empty:
-            return pd.DataFrame(
+            empty = pd.DataFrame(
                 columns=[
                     "symbol",
                     "ts",
@@ -132,10 +135,14 @@ class EventExtractor:
                     "event_features",
                 ]
             )
+            empty.index.name = "ts"
+            return empty
 
-        events_df = events_df.sort_values("ts")
+        events_df.index.name = "ts"
+        events_df = events_df.sort_index()
         events_df["event_id"] = range(1, len(events_df) + 1)
-        return events_df.reset_index(drop=True)
+        events_df["ts"] = events_df.index
+        return events_df
 
 
 def _compute_vwap(df: pd.DataFrame, *, vwap_col: str) -> pd.Series:
@@ -330,7 +337,6 @@ def _extract_timestamp(df: pd.DataFrame) -> pd.Series:
 
 def _build_events(
     features: pd.DataFrame,
-    ts: pd.Series,
     symbol: str,
     mask: pd.Series,
     event_type: EventType,
@@ -340,10 +346,11 @@ def _build_events(
 
     subset = features.loc[mask].copy()
     subset.insert(0, "symbol", symbol)
-    subset.insert(1, "ts", ts.loc[mask])
+    subset.insert(1, "ts", subset.index)
     subset.insert(2, "family_id", event_type.value)
     subset["event_id"] = np.nan
     subset["event_features"] = subset[features.columns].to_dict(orient="records")
+    subset.index.name = "ts"
     return subset
 
 

@@ -50,7 +50,7 @@ def test_events_no_leakage_features_ignore_future_changes() -> None:
     extractor = EventExtractor()
 
     events = extractor.extract(df_m5, symbol="TEST")
-    event_ts = events.loc[0, "ts"]
+    event_ts = events["ts"].iloc[0]
     baseline = events.loc[events["ts"] == event_ts, "dist_to_vwap"].iloc[0]
 
     df_future = df_m5.copy()
@@ -94,3 +94,12 @@ def test_events_have_atr_14_after_warmup() -> None:
     warm_events = events.loc[events["ts"] >= warm_idx]
     assert not warm_events.empty
     assert warm_events["atr_14"].notna().all()
+
+
+def test_event_timestamp_matches_m5_index() -> None:
+    df_m5 = _make_m5_df()
+    extractor = EventExtractor()
+
+    events = extractor.extract(df_m5, symbol="TEST")
+    assert not events.empty
+    assert events.index[0] in df_m5.index

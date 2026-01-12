@@ -291,6 +291,7 @@ def main() -> None:
     event_indexer = ohlcv_m5.index.get_indexer(events.index)
     missing_index = int((event_indexer == -1).sum())
     missing_future = int(((event_indexer != -1) & (event_indexer + 1 >= len(ohlcv_m5.index))).sum())
+    events_index_match_pct = float(detected_events.index.isin(df_m5_ctx.index).mean())
     missing_atr_pct = float(events["atr_14"].isna().mean() * 100)
     m5_atr14_nan_pct = float(df_m5_ctx["atr_14"].isna().mean() * 100)
     events_atr14_nan_pct = float(events["atr_14"].isna().mean() * 100)
@@ -303,12 +304,27 @@ def main() -> None:
                 "events_missing_index": missing_index,
                 "events_missing_future_slice": missing_future,
                 "events_missing_atr_pct": round(missing_atr_pct, 2),
+                "events_index_match_pct": round(events_index_match_pct, 4),
                 "m5_atr14_nan_pct": round(m5_atr14_nan_pct, 2),
                 "events_atr14_nan_pct": round(events_atr14_nan_pct, 2),
             }
         ]
     )
     logger.info("Data quality checks:\n%s", sanity_table.to_string(index=False))
+    if events_index_match_pct < 0.99:
+        event_ts = detected_events["ts"] if "ts" in detected_events.columns else detected_events.index
+        event_sample = None if detected_events.empty else detected_events.index[0]
+        ctx_sample = None if df_m5_ctx.empty else df_m5_ctx.index[0]
+        logger.warning(
+            "Index mismatch details: events_ts_dtype=%s m5_ctx_index_dtype=%s events_tz=%s m5_ctx_tz=%s "
+            "events_sample=%r m5_ctx_sample=%r",
+            getattr(event_ts, "dtype", None),
+            getattr(df_m5_ctx.index, "dtype", None),
+            getattr(getattr(event_ts, "dt", event_ts), "tz", None),
+            getattr(df_m5_ctx.index, "tz", None),
+            event_sample,
+            ctx_sample,
+        )
 
     events = label_events(
         detected_events,
