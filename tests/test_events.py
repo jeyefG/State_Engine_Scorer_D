@@ -39,6 +39,8 @@ def test_events_schema_has_required_columns() -> None:
         "atr_14",
         "dist_to_vwap_atr",
         "volume_rel",
+        "is_touch_exact",
+        "is_rejection",
         "hour",
         "minute",
     }
@@ -63,13 +65,13 @@ def test_events_no_leakage_features_ignore_future_changes() -> None:
     assert baseline == updated
 
 
-def test_detects_touch_vwap_event() -> None:
+def test_detects_near_vwap_event() -> None:
     df_m5 = _make_m5_df()
     extractor = EventExtractor()
 
     events = extractor.extract(df_m5, symbol="TEST")
 
-    assert (events["family_id"] == EventType.TOUCH_VWAP.value).any()
+    assert (events["family_id"] == EventType.NEAR_VWAP.value).any()
 
 
 def test_events_have_atr_14_after_warmup() -> None:

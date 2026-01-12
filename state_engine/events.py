@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import logging
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ EPS = 1e-9
 class EventType(str, Enum):
     TOUCH_VWAP = "E_TOUCH_VWAP"
     REJECTION_VWAP = "E_REJECTION_VWAP"
+    NEAR_VWAP = "E_NEAR_VWAP"
 
 
 class EventFamily(str, Enum):
@@ -45,13 +47,17 @@ class EventDetectionConfig:
     trend_continuation_momentum_window: int = 3
     trend_continuation_comp_mult: float = 1.5
     trend_continuation_break_atr: float = 0.25
+    near_vwap_atr: float = 0.35
+    near_vwap_cooldown_bars: int = 3
 
 
 class EventExtractor:
     """Layer A extractor: detect events and compute event features without leakage."""
 
-    def __init__(self, *, eps: float = EPS) -> None:
+    def __init__(self, *, eps: float = EPS, config: EventDetectionConfig | None = None) -> None:
         self.eps = eps
+        self.config = config or EventDetectionConfig()
+        self.logger = logging.getLogger(__name__)
 
     def extract(self, df_m5: pd.DataFrame, symbol: str, *, vwap_col: str = "vwap") -> pd.DataFrame:
         df = df_m5.copy()
@@ -95,6 +101,11 @@ class EventExtractor:
         else:
             volume_rel = pd.Series(np.nan, index=df.index)
 
+        is_touch_exact = (low <= vwap) & (high >= vwap)
+        is_rejection = is_touch_exact & (
+            ((close > vwap) & (open_ <= vwap)) | ((close < vwap) & (open_ >= vwap))
+        )
+
         features = pd.DataFrame(
             {
                 "dist_to_vwap": dist_to_vwap,
@@ -107,21 +118,41 @@ class EventExtractor:
                 "atr_14": atr_14,
                 "dist_to_vwap_atr": dist_to_vwap_atr,
                 "volume_rel": volume_rel,
+                "is_touch_exact": is_touch_exact.astype(int),
+                "is_rejection": is_rejection.astype(int),
                 "hour": ts.dt.hour,
                 "minute": ts.dt.minute,
             },
             index=df.index,
         )
 
-        touch_mask = (low <= vwap) & (high >= vwap)
-        rejection_mask = touch_mask & (
-            ((close > vwap) & (open_ <= vwap)) | ((close < vwap) & (open_ >= vwap))
+        threshold = self.config.near_vwap_atr
+        dist_to_vwap_atr_abs = dist_to_vwap_atr.abs()
+        near_mask = dist_to_vwap_atr_abs <= threshold
+        prev_outside = (dist_to_vwap_atr_abs.shift(1) > threshold).fillna(True)
+        enter_mask = near_mask & prev_outside
+        cooldown = max(int(self.config.near_vwap_cooldown_bars), 0)
+        if cooldown > 0:
+            recent_enter = (
+                enter_mask.shift(1)
+                .rolling(cooldown, min_periods=1)
+                .max()
+                .fillna(False)
+            )
+            before_count = int(enter_mask.sum())
+            enter_mask = enter_mask & ~recent_enter
+            filtered_count = before_count - int(enter_mask.sum())
+        else:
+            filtered_count = 0
+
+        self.logger.info(
+            "E_NEAR_VWAP enter_count=%s cooldown=%s filtered=%s",
+            int(enter_mask.sum()),
+            cooldown,
+            filtered_count,
         )
 
-        events = [
-            _build_events(features, symbol, touch_mask, EventType.TOUCH_VWAP),
-            _build_events(features, symbol, rejection_mask, EventType.REJECTION_VWAP),
-        ]
+        events = [_build_events(features, symbol, enter_mask, EventType.NEAR_VWAP)]
 
         events_df = pd.concat([frame for frame in events if not frame.empty], axis=0)
         if events_df.empty:
@@ -171,11 +202,10 @@ def _compute_vwap(df: pd.DataFrame, *, vwap_col: str) -> pd.Series:
 
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
     """Backward-compatible wrapper around EventExtractor.extract."""
-    _ = config
     symbol = "UNKNOWN"
     if "symbol" in df_m5_ctx.columns and not df_m5_ctx["symbol"].empty:
         symbol = str(df_m5_ctx["symbol"].iloc[0])
-    extractor = EventExtractor()
+    extractor = EventExtractor(config=config)
     return extractor.extract(df_m5_ctx, symbol=symbol)
 
 
