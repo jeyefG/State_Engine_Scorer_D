@@ -284,6 +284,13 @@ def main() -> None:
     if events.empty:
         logger.warning("No events detected; exiting.")
         return
+    ctx_cols = [
+        col
+        for col in df_m5_ctx.columns
+        if col in {"state_hat_H1", "margin_H1"} or col.startswith("ALLOW_")
+    ]
+    if ctx_cols:
+        events = events.join(df_m5_ctx[ctx_cols], how="left")
     detected_events = events.copy()
     events_dupes = int(detected_events.index.duplicated().sum())
     logger.info("Detected events by family:\n%s", events["family_id"].value_counts().to_string())
