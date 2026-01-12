@@ -15,6 +15,7 @@ from sklearn.frozen import FrozenEstimator
 
 from .events import EventFamily
 from .labels import StateLabels
+from .session import SESSION_BUCKETS, get_session_bucket
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,13 @@ class FeatureBuilder:
             raise ValueError(f"Missing required columns for feature building: {sorted(missing)}")
 
         df = df_m5_ctx.copy()
+        if "pf_session_bucket" not in df.columns:
+            symbol_series = df.get("symbol", pd.Series("UNKNOWN", index=df.index))
+            session_bucket = [
+                get_session_bucket(ts, symbol)
+                for ts, symbol in zip(df.index, symbol_series)
+            ]
+            df["pf_session_bucket"] = session_bucket
         close = df["close"]
         high = df["high"]
         low = df["low"]
@@ -146,7 +154,13 @@ class FeatureBuilder:
         allow_cols = [col for col in df.columns if col.startswith("ALLOW_")]
         allow_features = df[allow_cols].astype(float) if allow_cols else pd.DataFrame(index=df.index)
 
-        features = pd.concat([features, state_one_hot, allow_features], axis=1)
+        session_one_hot = pd.get_dummies(df["pf_session_bucket"], prefix="pf_session_bucket")
+        for bucket in SESSION_BUCKETS:
+            col = f"pf_session_bucket_{bucket}"
+            if col not in session_one_hot.columns:
+                session_one_hot[col] = 0.0
+
+        features = pd.concat([features, state_one_hot, allow_features, session_one_hot], axis=1)
         return features
 
     def add_family_features(self, features: pd.DataFrame, family_ids: pd.Series) -> pd.DataFrame:

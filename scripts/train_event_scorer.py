@@ -33,6 +33,7 @@ from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.labels import StateLabels
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
+from state_engine.session import get_session_bucket
 
 
 def parse_args() -> argparse.Namespace:
@@ -698,6 +699,26 @@ def _pseudo_stability_table(events_diag: pd.DataFrame, feature_col: str) -> pd.D
     return table[columns]
 
 
+def _session_bucket_distribution(df_m5_ctx: pd.DataFrame) -> pd.DataFrame:
+    if df_m5_ctx.empty:
+        return pd.DataFrame(columns=["symbol", "pf_session_bucket", "n", "pct"])
+    df = df_m5_ctx.copy()
+    if "pf_session_bucket" not in df.columns:
+        symbol_series = df.get("symbol", pd.Series("UNKNOWN", index=df.index))
+        df["pf_session_bucket"] = [
+            get_session_bucket(ts, symbol)
+            for ts, symbol in zip(df.index, symbol_series)
+        ]
+    if "symbol" not in df.columns:
+        df["symbol"] = "UNKNOWN"
+    counts = df.groupby(["symbol", "pf_session_bucket"]).size().reset_index(name="n")
+    counts["pct"] = (
+        counts["n"] / counts.groupby("symbol")["n"].transform("sum") * 100.0
+    ).round(2)
+    counts = counts.sort_values(["symbol", "n"], ascending=[True, False]).reset_index(drop=True)
+    return counts[["symbol", "pf_session_bucket", "n", "pct"]]
+
+
 def _build_training_diagnostic_report(
     events_diag: pd.DataFrame,
     df_m5_ctx: pd.DataFrame | None,
@@ -745,6 +766,9 @@ def _build_training_diagnostic_report(
         print(_format_table_block(f"Conditional Edge (family x {pseudo_col})", report[f"conditional_edge_{pseudo_col}"]))
         print(_format_table_block(f"Stability temporal (family x {pseudo_col})", report[f"stability_{pseudo_col}"]))
         print(_format_table_block(f"Conditional Edge REGIME (state x margin x allow x family x {pseudo_col})", report[f"conditional_edge_regime_{pseudo_col}"]))
+    if df_m5_ctx is not None:
+        session_table = _session_bucket_distribution(df_m5_ctx)
+        print(_format_table_block("Session Bucket Distribution (M5)", session_table))
     return report
 
 
@@ -771,6 +795,7 @@ def main() -> None:
 
     ohlcv_h1 = connector.obtener_h1(args.symbol, fecha_inicio, fecha_fin)
     ohlcv_m5 = connector.obtener_m5(args.symbol, fecha_inicio, fecha_fin)
+    ohlcv_m5["symbol"] = args.symbol
     server_now = connector.server_now(args.symbol).tz_localize(None)
 
     h1_cutoff = server_now.floor("h")

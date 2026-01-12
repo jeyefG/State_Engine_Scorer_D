@@ -187,7 +187,12 @@ def build_m5_context(
     df_m5: pd.DataFrame,
     outputs: pd.DataFrame,
     gating: pd.DataFrame,
+    *,
+    symbol: str | None = None,
 ) -> pd.DataFrame:
+    if symbol is not None and "symbol" not in df_m5.columns:
+        df_m5 = df_m5.copy()
+        df_m5["symbol"] = symbol
     h1_ctx = outputs[["state_hat", "margin"]].rename(
         columns={"state_hat": "state_hat_H1", "margin": "margin_H1"}
     )
@@ -402,7 +407,7 @@ def main() -> None:
                         last_seen[symbol] = last_bar_ts
                         continue
 
-                    df_m5_ctx = build_m5_context(df_m5, outputs, gating)
+                    df_m5_ctx = build_m5_context(df_m5, outputs, gating, symbol=symbol)
                     try:
                         events_df = detect_events(df_m5_ctx)
                     except Exception as exc:

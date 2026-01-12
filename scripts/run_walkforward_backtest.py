@@ -295,6 +295,7 @@ def run_walkforward(symbol: str, args: argparse.Namespace, logger: logging.Logge
     fecha_fin = pd.to_datetime(args.end)
     ohlcv_h1 = connector.obtener_h1(symbol, fecha_inicio, fecha_fin)
     ohlcv_m5 = connector.obtener_m5(symbol, fecha_inicio, fecha_fin)
+    ohlcv_m5["symbol"] = symbol
 
     server_now = connector.server_now(symbol).tz_localize(None)
     ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < server_now.floor("h")]

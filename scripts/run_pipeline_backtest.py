@@ -193,6 +193,7 @@ def main() -> None:
     fecha_fin = pd.to_datetime(args.end)
     ohlcv_h1 = connector.obtener_h1(args.symbol, fecha_inicio, fecha_fin)
     ohlcv_m5 = connector.obtener_m5(args.symbol, fecha_inicio, fecha_fin)
+    ohlcv_m5["symbol"] = args.symbol
 
     server_now = connector.server_now(args.symbol).tz_localize(None)
     ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < server_now.floor("h")]
