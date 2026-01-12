@@ -170,9 +170,14 @@ def _align_training_data(
     event_features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     labeled = labeled_events.dropna(subset=["label"])
+    if labeled.index.has_duplicates:
+        labeled = labeled[~labeled.index.duplicated(keep="last")]
     if labeled.empty:
         return pd.DataFrame(), pd.Series(dtype=int), pd.Series(dtype=object)
-    features = event_features.reindex(labeled.index)
+    features = event_features
+    if features.index.has_duplicates:
+        features = features[~features.index.duplicated(keep="last")]
+    features = features.reindex(labeled.index)
     combined = pd.concat([features, labeled[["label", "family_id"]]], axis=1)
     combined = combined.dropna()
     if combined.empty:
