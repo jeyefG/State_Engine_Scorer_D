@@ -31,3 +31,14 @@ event_scorer:
         winrate_min: 0.52
         r_mean_min: 0.02
         p10_min: -0.2
+  research:
+    enabled: false
+    features:
+      session_bucket: false
+      hour_bucket: false
+      trend_context_D1: false
+      vol_context: false
+    k_bars_grid: [24]
+    diagnostics:
+      max_family_concentration: 0.6
+      min_temporal_dispersion: 0.3

@@ -125,6 +125,37 @@ def _validate_config(config: dict[str, Any]) -> None:
                 raise ValueError(f"mode '{mode_name}' must be a mapping.")
             _validate_decision_thresholds(mode_cfg.get("decision_thresholds", {}))
 
+    research_cfg = event_cfg.get("research", {})
+    if research_cfg is not None:
+        if not isinstance(research_cfg, dict):
+            raise ValueError("research must be a mapping.")
+        enabled = research_cfg.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("research.enabled must be boolean.")
+        features = research_cfg.get("features", {})
+        if features is not None:
+            if not isinstance(features, dict):
+                raise ValueError("research.features must be a mapping.")
+            _validate_bool(features, "session_bucket")
+            _validate_bool(features, "hour_bucket")
+            _validate_bool(features, "trend_context_D1")
+            _validate_bool(features, "vol_context")
+        k_bars_grid = research_cfg.get("k_bars_grid")
+        if k_bars_grid is not None:
+            if not isinstance(k_bars_grid, list):
+                raise ValueError("research.k_bars_grid must be a list.")
+            for value in k_bars_grid:
+                if not isinstance(value, int) or value <= 0:
+                    raise ValueError("research.k_bars_grid must contain positive integers.")
+        diagnostics = research_cfg.get("diagnostics", {})
+        if diagnostics is not None:
+            if not isinstance(diagnostics, dict):
+                raise ValueError("research.diagnostics must be a mapping.")
+            _validate_float_range(diagnostics, "max_family_concentration", min_value=0.0, max_value=1.0)
+            _validate_float_range(diagnostics, "min_temporal_dispersion", min_value=0.0, max_value=1.0)
+            _validate_float_range(diagnostics, "max_score_tail_slope", min_value=0.0)
+            _validate_positive_int(diagnostics, "min_calib_samples")
+
 
 def _validate_float_range(
     data: dict[str, Any],
@@ -178,3 +209,11 @@ def _validate_decision_thresholds(thresholds: Any) -> None:
     _validate_float_range(thresholds, "r_mean_min")
     if "p10_min" in thresholds and thresholds["p10_min"] is not None:
         _validate_float_range(thresholds, "p10_min")
+
+
+def _validate_bool(data: dict[str, Any], key: str) -> None:
+    if key not in data:
+        return
+    value = data[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be boolean.")
