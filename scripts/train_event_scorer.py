@@ -639,6 +639,66 @@ def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -
     return summary[columns]
 
 
+def _session_bucket_series(
+    events_index: pd.DatetimeIndex,
+    symbol: str,
+    df_m5_ctx: pd.DataFrame | None,
+) -> pd.Series:
+    if df_m5_ctx is not None and "pf_session_bucket" in df_m5_ctx.columns:
+        return df_m5_ctx["pf_session_bucket"].reindex(events_index)
+    return pd.Series(
+        [get_session_bucket(ts, symbol) for ts in events_index],
+        index=events_index,
+        name="pf_session_bucket",
+    )
+
+
+def _session_conditional_edge_table(
+    events_diag: pd.DataFrame,
+    thresholds: argparse.Namespace,
+) -> pd.DataFrame:
+    columns = [
+        "family_id",
+        "state_hat_H1",
+        "margin_bin",
+        "pf_session_bucket",
+        "n",
+        "winrate",
+        "r_mean",
+        "p10",
+        "decision_reason",
+    ]
+    if events_diag.empty or "pf_session_bucket" not in events_diag.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = events_diag.groupby(
+        ["family_id", "state_hat_H1", "margin_bin", "pf_session_bucket"],
+        observed=True,
+    )
+    summary = grouped.agg(
+        n=("win", "size"),
+        winrate=("win", "mean"),
+        r_mean=("r", "mean"),
+        p10=("r", lambda s: s.quantile(0.1)),
+    ).reset_index()
+    decision_reasons = []
+    for _, row in summary.iterrows():
+        reasons = []
+        if row["n"] < thresholds.decision_n_min:
+            reasons.append(f"n<{thresholds.decision_n_min}")
+        if row["r_mean"] < thresholds.decision_r_mean_min:
+            reasons.append(f"r_mean<{thresholds.decision_r_mean_min}")
+        if row["winrate"] < thresholds.decision_winrate_min:
+            reasons.append(f"winrate<{thresholds.decision_winrate_min}")
+        if thresholds.decision_p10_min is not None and row["p10"] < thresholds.decision_p10_min:
+            reasons.append(f"p10<{thresholds.decision_p10_min}")
+        decision_reasons.append("|".join(reasons))
+    summary["decision_reason"] = decision_reasons
+    summary = summary.sort_values(
+        ["family_id", "state_hat_H1", "margin_bin", "pf_session_bucket"],
+    ).reset_index(drop=True)
+    return summary[columns]
+
+
 def _format_table_block(title: str, df_or_dict: pd.DataFrame | dict) -> str:
     if isinstance(df_or_dict, dict):
         df = pd.DataFrame([df_or_dict])
@@ -653,6 +713,56 @@ def _format_table_block(title: str, df_or_dict: pd.DataFrame | dict) -> str:
 
 def _apply_fallback_guardrails(events_total_post_meta: int, fallback_min_samples: int) -> bool:
     return events_total_post_meta < fallback_min_samples
+
+
+def _print_research_summary_block(session_edge: pd.DataFrame) -> None:
+    min_n = 150
+    min_r_mean = 0.05
+    min_winrate = 0.55
+    if session_edge.empty:
+        qualifying = pd.DataFrame()
+    else:
+        qualifying = session_edge[
+            (session_edge["n"] >= min_n)
+            & (session_edge["r_mean"] >= min_r_mean)
+            & (session_edge["winrate"] >= min_winrate)
+        ]
+    qualifying_count = int(len(qualifying))
+    if session_edge.empty:
+        top_rows = pd.DataFrame()
+    else:
+        top_rows = (
+            session_edge.sort_values(
+                ["r_mean", "winrate", "n"],
+                ascending=[False, False, False],
+            )
+            .head(5)
+            .reset_index(drop=True)
+        )
+    print("\n=== SYMBOL SPECIALIZATION RESEARCH SUMMARY ===")
+    print(
+        "qualified_session_buckets={count} (n>={n_min}, r_mean>={r_min}, winrate>={w_min})".format(
+            count=qualifying_count,
+            n_min=min_n,
+            r_min=min_r_mean,
+            w_min=min_winrate,
+        )
+    )
+    print("top_5_candidate_cells_by_r_mean:")
+    if top_rows.empty:
+        print("(no candidates)")
+    else:
+        for _, row in top_rows.iterrows():
+            cell = (
+                f"{row['family_id']} | {row['state_hat_H1']} | {row['margin_bin']} | {row['pf_session_bucket']}"
+            )
+            print(cell)
+    verdict = (
+        "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
+        if qualifying_count > 0
+        else "NO LOCAL EDGE DETECTED"
+    )
+    print(f"verdict={verdict}")
 
 
 def _save_model_if_ready(
@@ -775,13 +885,15 @@ def _build_training_diagnostic_report(
     regime_full, regime_ranked = _regime_edge_table(events_diag)
     stability = _stability_table(events_diag)
     decision = _decision_table(events_diag, thresholds)
-    base_frames = [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision]
+    session_edge = _session_conditional_edge_table(events_diag, thresholds)
+    base_frames = [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision, session_edge]
     report["coverage_global"] = coverage_global
     report["coverage_by_state_margin"] = coverage_by
     report["regime_edge_full"] = regime_full
     report["regime_edge_ranked"] = regime_ranked
     report["stability"] = stability
     report["decision"] = decision
+    report["session_conditional_edge"] = session_edge
     for pseudo_col in PSEUDO_FEATURES.keys():
         redistribution = _redistribution_table(events_diag, pseudo_col)
         conditional = _conditional_edge_table(events_diag, pseudo_col)
@@ -807,6 +919,7 @@ def _build_training_diagnostic_report(
     print(_format_table_block("Regime Edge (top 10 / bottom 10 by r_mean)", regime_ranked))
     print(_format_table_block("Stability temporal (regime edge por split)", stability))
     print(_format_table_block("Decision", decision))
+    print(_format_table_block("Session-Conditional Edge", session_edge))
     for pseudo_col in PSEUDO_FEATURES.keys():
         print(_format_table_block(f"Redistribution (family x {pseudo_col})", report[f"redistribution_{pseudo_col}"]))
         print(_format_table_block(f"Conditional Edge (family x {pseudo_col})", report[f"conditional_edge_{pseudo_col}"]))
@@ -977,7 +1090,9 @@ def main() -> None:
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        if args.mode == "research":
+            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         return
 
     detected_events = events.copy()
@@ -1051,7 +1166,9 @@ def main() -> None:
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        if args.mode == "research":
+            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         return
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
     logger.info("Labeled events by type:\n%s", events["event_type"].value_counts().to_string())
@@ -1212,6 +1329,11 @@ def main() -> None:
             "vwap_zone": events_for_training["vwap_zone"],
             "value_state": events_for_training["value_state"],
             "expansion_state": events_for_training["expansion_state"],
+            "pf_session_bucket": _session_bucket_series(
+                events_for_training.index,
+                args.symbol,
+                df_m5_ctx,
+            ),
         },
         index=events_for_training.index,
     )
@@ -1889,6 +2011,8 @@ def main() -> None:
         json.dump(summary_payload, handle, indent=2, default=str)
     logger.info("summary_out=%s", summary_path)
     logger.info("=" * 96)
+    if args.mode == "research":
+        _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
 
 
 if __name__ == "__main__":
