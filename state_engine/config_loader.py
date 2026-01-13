@@ -21,8 +21,17 @@ def deep_merge(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str,
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    """Load a YAML or JSON config file and validate minimal schema."""
+    """Load a YAML or JSON config file and validate minimal schema.
+    If path is relative, resolve it against project root.
+    """
     config_path = Path(path)
+
+    # --- NEW: resolve relative paths against project root ---
+    if not config_path.is_absolute():
+        # state_engine/config_loader.py -> project root = parents[1]
+        project_root = Path(__file__).resolve().parents[1]
+        config_path = (project_root / config_path).resolve()
+
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
@@ -34,16 +43,19 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
     if suffix in {".yaml", ".yml"}:
         if not has_yaml:
-            raise RuntimeError("PyYAML not installed; use a .json config or install PyYAML.")
+            raise RuntimeError(
+                "PyYAML not installed; use a .json config or install PyYAML."
+            )
         import yaml
-
         data = yaml.safe_load(raw_text) or {}
+
     elif suffix == ".json":
         data = json.loads(raw_text)
+
     else:
+        # fallback: try yaml first, then json
         if has_yaml:
             import yaml
-
             data = yaml.safe_load(raw_text) or {}
         else:
             data = json.loads(raw_text)
@@ -53,7 +65,6 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
     _validate_config(data)
     return data
-
 
 def _validate_config(config: dict[str, Any]) -> None:
     symbol = config.get("symbol")
