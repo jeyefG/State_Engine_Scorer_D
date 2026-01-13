@@ -115,6 +115,7 @@ def _default_symbol_config(args: argparse.Namespace) -> dict:
             },
             "research": {
                 "enabled": False,
+                "d1_anchor_hour": 0,
                 "features": {
                     "session_bucket": False,
                     "hour_bucket": False,
@@ -152,6 +153,7 @@ def _resolve_research_config(config: dict, mode: str) -> dict:
         "features": features,
         "diagnostics": diagnostics,
         "k_bars_grid": k_bars_grid,
+        "d1_anchor_hour": research_cfg.get("d1_anchor_hour", 0),
     }
 
 
@@ -913,6 +915,8 @@ def _session_bucket_distribution(df_m5_ctx: pd.DataFrame) -> pd.DataFrame:
 def _merge_asof_features(m5_index: pd.DatetimeIndex, features: pd.DataFrame) -> pd.DataFrame:
     if features.empty:
         return pd.DataFrame(index=m5_index)
+    if getattr(m5_index, "tz", None) is not None:
+        m5_index = m5_index.tz_localize(None)
     m5_df = pd.DataFrame({"time": m5_index})
     feats = features.copy()
     if getattr(feats.index, "tz", None) is not None:
@@ -926,8 +930,30 @@ def _build_research_context_features(
     df_m5_ctx: pd.DataFrame,
     ohlcv_h1: pd.DataFrame,
     symbol: str,
-    feature_flags: dict,
+    research_cfg: dict,
 ) -> pd.DataFrame:
+    feature_flags = research_cfg.get("features", {}) if isinstance(research_cfg.get("features"), dict) else {}
+    logger = logging.getLogger("event_scorer")
+    raw_anchor_hour = research_cfg.get("d1_anchor_hour", 0)
+    try:
+        parsed_anchor_hour = int(raw_anchor_hour)
+    except (TypeError, ValueError):
+        parsed_anchor_hour = 0
+        logger.warning(
+            "Invalid research.d1_anchor_hour=%r; defaulting to 0 and normalizing to [0, 23].",
+            raw_anchor_hour,
+        )
+    else:
+        if (
+            isinstance(raw_anchor_hour, bool)
+            or not isinstance(raw_anchor_hour, (int, np.integer))
+            or not 0 <= raw_anchor_hour <= 23
+        ):
+            logger.warning(
+                "Invalid research.d1_anchor_hour=%r; normalizing to [0, 23] via modulo.",
+                raw_anchor_hour,
+            )
+    d1_anchor_hour = parsed_anchor_hour % 24
     parts: list[pd.DataFrame] = []
     index = df_m5_ctx.index
 
@@ -958,6 +984,19 @@ def _build_research_context_features(
         h1 = ohlcv_h1.copy()
         if getattr(h1.index, "tz", None) is not None:
             h1.index = h1.index.tz_localize(None)
+        if not h1.index.empty:
+            daily_min = h1.index.to_series().groupby(h1.index.normalize()).min()
+            aligned_ratio = float((daily_min.dt.hour == (d1_anchor_hour % 24)).mean())
+            if aligned_ratio < 0.8:
+                logger.warning(
+                    "Research D1 resample anchor may be misaligned (anchor_hour=%s, aligned_days=%.1f%%). "
+                    "Consider setting research.d1_anchor_hour or verifying server TZ.",
+                    d1_anchor_hour,
+                    aligned_ratio * 100.0,
+                )
+        if d1_anchor_hour:
+            h1 = h1.copy()
+            h1.index = h1.index - pd.Timedelta(hours=d1_anchor_hour)
         h1_atr = _atr(h1["high"], h1["low"], h1["close"], 14).rename("atr_h1")
         h1_features = pd.DataFrame(
             {
@@ -974,6 +1013,9 @@ def _build_research_context_features(
             .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
             .dropna()
         )
+        if d1_anchor_hour:
+            d1 = d1.copy()
+            d1.index = d1.index + pd.Timedelta(hours=d1_anchor_hour)
         d1_ema200 = d1["close"].ewm(span=200, min_periods=200).mean().rename("ema200")
         d1_atr = _atr(d1["high"], d1["low"], d1["close"], 14).rename("atr_d1")
         d1_features = pd.DataFrame(
@@ -1098,6 +1140,10 @@ def _research_guardrails(
     train_lift = train_metrics.get("lift@20") if train_metrics else None
     calib_lift = calib_metrics.get("lift@20") if calib_metrics else None
     rows = []
+
+    def _has_reason(reasons_list: list[str], prefix: str) -> bool:
+        return any(reason.startswith(prefix) for reason in reasons_list)
+
     for _, row in score_shape.iterrows():
         reasons = []
         if calib_samples < min_calib_samples:
@@ -1114,7 +1160,9 @@ def _research_guardrails(
         status = "RESEARCH_OK"
         if any(reason in {"SCORE_TAIL_STEEP", "TRAIN_IMPROVEMENT_ONLY"} for reason in reasons):
             status = "RESEARCH_OVERFIT_SUSPECT"
-        elif any(reason in {"LOW_CALIB_SAMPLES", "FAMILY_CONCENTRATION_HIGH", "TEMPORAL_DISPERSION_LOW"} for reason in reasons):
+        elif _has_reason(reasons, "LOW_CALIB_SAMPLES") or any(
+            reason in {"FAMILY_CONCENTRATION_HIGH", "TEMPORAL_DISPERSION_LOW"} for reason in reasons
+        ):
             status = "RESEARCH_UNSTABLE"
         rows.append({"k": int(row["k"]), "status": status, "reasons": "|".join(reasons)})
     return pd.DataFrame(rows)
@@ -2289,7 +2337,7 @@ def main() -> None:
             df_m5_ctx,
             ohlcv_h1,
             args.symbol,
-            research_cfg.get("features", {}) if isinstance(research_cfg.get("features"), dict) else {},
+            research_cfg,
         )
         if not research_features.empty:
             features_all = pd.concat([features_all, research_features], axis=1)

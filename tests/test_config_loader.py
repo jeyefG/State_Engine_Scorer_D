@@ -88,3 +88,30 @@ def test_load_config_allows_research_block(tmp_path: Path) -> None:
     loaded = load_config(config_path)
 
     assert loaded["event_scorer"]["research"]["enabled"] is True
+
+
+@pytest.mark.parametrize("anchor_hour", [0, 23])
+def test_load_config_accepts_valid_d1_anchor_hour(tmp_path: Path, anchor_hour: int) -> None:
+    config = {
+        "symbol": "XAUUSD",
+        "event_scorer": {"research": {"d1_anchor_hour": anchor_hour}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    loaded = load_config(config_path)
+
+    assert loaded["event_scorer"]["research"]["d1_anchor_hour"] == anchor_hour
+
+
+@pytest.mark.parametrize("anchor_hour", [-1, 24, "3", None])
+def test_load_config_rejects_invalid_d1_anchor_hour(tmp_path: Path, anchor_hour: object) -> None:
+    config = {
+        "symbol": "XAUUSD",
+        "event_scorer": {"research": {"d1_anchor_hour": anchor_hour}},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    with pytest.raises(ValueError, match="research.d1_anchor_hour must be an integer in range \\[0, 23\\]"):
+        load_config(config_path)

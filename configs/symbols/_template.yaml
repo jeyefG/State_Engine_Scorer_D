@@ -33,12 +33,15 @@ event_scorer:
         p10_min: -0.2
   research:
     enabled: false
+    d1_anchor_hour: 0
     features:
       session_bucket: false
       hour_bucket: false
       trend_context_D1: false
       vol_context: false
-    k_bars_grid: [24]
+    k_bars_grid: []
     diagnostics:
       max_family_concentration: 0.6
       min_temporal_dispersion: 0.3
+      max_score_tail_slope: 2.5
+      min_calib_samples: 200

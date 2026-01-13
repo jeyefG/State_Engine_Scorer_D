@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.train_event_scorer import _resolve_vwap_report_mode, _save_model_if_ready
+from scripts.train_event_scorer import _resolve_vwap_report_mode, _save_model_if_ready, _research_guardrails
 from state_engine.events import EventDetectionConfig, EventExtractor
 from state_engine.scoring import EventScorerBundle
 
@@ -40,3 +40,34 @@ def test_vwap_reporting_uses_fallback_metadata_session_mode() -> None:
     report_mode = _resolve_vwap_report_mode(events, df_m5, config)
     assert report_mode == "session"
     assert "daily" not in report_mode
+
+
+def test_guardrails_flags_low_calib_samples() -> None:
+    score_shape = pd.DataFrame(
+        [
+            {
+                "k": 20,
+                "edge_decay": 0.1,
+                "temporal_dispersion": 0.5,
+                "family_concentration": 0.2,
+                "score_tail_slope": 1.0,
+            }
+        ]
+    )
+    diagnostics_cfg = {
+        "max_family_concentration": 0.6,
+        "min_temporal_dispersion": 0.3,
+        "max_score_tail_slope": 2.5,
+        "min_calib_samples": 200,
+    }
+
+    report = _research_guardrails(
+        score_shape=score_shape,
+        train_metrics=None,
+        calib_metrics=None,
+        diagnostics_cfg=diagnostics_cfg,
+        calib_samples=50,
+    )
+
+    assert report.loc[0, "status"] == "RESEARCH_UNSTABLE"
+    assert "LOW_CALIB_SAMPLES<200" in report.loc[0, "reasons"]

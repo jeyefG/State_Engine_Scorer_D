@@ -132,6 +132,14 @@ def _validate_config(config: dict[str, Any]) -> None:
         enabled = research_cfg.get("enabled")
         if enabled is not None and not isinstance(enabled, bool):
             raise ValueError("research.enabled must be boolean.")
+        if "d1_anchor_hour" in research_cfg:
+            d1_anchor_hour = research_cfg.get("d1_anchor_hour")
+            if (
+                not isinstance(d1_anchor_hour, int)
+                or isinstance(d1_anchor_hour, bool)
+                or not 0 <= d1_anchor_hour <= 23
+            ):
+                raise ValueError("research.d1_anchor_hour must be an integer in range [0, 23]")
         features = research_cfg.get("features", {})
         if features is not None:
             if not isinstance(features, dict):
