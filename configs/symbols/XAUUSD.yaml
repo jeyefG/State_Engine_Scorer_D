@@ -32,11 +32,16 @@ event_scorer:
         r_mean_min: 0.02
         p10_min: -0.2
     research:
-      k_bars:
-        - 12
-        - 18
-      decision_thresholds:
-        n_min: 150
-        winrate_min: 0.55
-        r_mean_min: 0.05
-        p10_min: null
+      enabled: true
+      d1_anchor_hour: 22          # prueba 22 primero (coincide con cut_hour=22 del VWAP session)
+      features:
+        session_bucket: true
+        hour_bucket: false        # primero ON/OFF por separado (evitar colinealidad inútil)
+        trend_context_D1: true
+        vol_context: true
+      k_bars_grid: [12, 18, 24, 36]
+      diagnostics:
+        max_family_concentration: 0.6
+        min_temporal_dispersion: 0.3
+        max_score_tail_slope: 2.5
+        min_calib_samples: 200
