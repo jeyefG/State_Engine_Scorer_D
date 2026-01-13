@@ -68,3 +68,23 @@ def test_load_config_allows_null_p10_min(tmp_path: Path) -> None:
     loaded = load_config(config_path)
 
     assert loaded["event_scorer"]["decision_thresholds"]["p10_min"] is None
+
+
+def test_load_config_allows_research_block(tmp_path: Path) -> None:
+    config = {
+        "symbol": "XAUUSD",
+        "event_scorer": {
+            "research": {
+                "enabled": True,
+                "features": {"session_bucket": True, "hour_bucket": True, "trend_context_D1": False},
+                "k_bars_grid": [12, 24],
+                "diagnostics": {"max_family_concentration": 0.6, "min_temporal_dispersion": 0.3},
+            }
+        },
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    loaded = load_config(config_path)
+
+    assert loaded["event_scorer"]["research"]["enabled"] is True
