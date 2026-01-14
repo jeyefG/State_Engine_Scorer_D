@@ -50,6 +50,16 @@ def _grid_values(grid: dict[str, Iterable[float]], key: str, fallback: float | i
     return [fallback]
 
 
+_EXPLORATION_KIND_ALIASES = {
+    "kbars_sweep": "kbars_only",
+    "thresholds_sweep": "thresholds_only",
+}
+
+
+def normalize_exploration_kind(kind: str) -> str:
+    return _EXPLORATION_KIND_ALIASES.get(kind, kind)
+
+
 def generate_research_variants(
     *,
     kind: str,
@@ -60,6 +70,7 @@ def generate_research_variants(
     seed: int,
     max_variants: int | None,
 ) -> list[ResearchVariant]:
+    kind = normalize_exploration_kind(kind)
     if kind not in {"thresholds_only", "kbars_only"}:
         raise ValueError(f"Unsupported research exploration kind: {kind}")
 

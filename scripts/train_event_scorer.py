@@ -38,6 +38,7 @@ from state_engine.research import (
     build_family_variant_report,
     evaluate_research_variants,
     generate_research_variants,
+    normalize_exploration_kind,
 )
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.session import SESSION_BUCKETS, get_session_bucket
@@ -2784,6 +2785,7 @@ def main() -> None:
     exploration_cfg = research_cfg.get("exploration", {}) if research_enabled else {}
     exploration_enabled = bool(exploration_cfg.get("enabled", False)) if isinstance(exploration_cfg, dict) else False
     exploration_kind = exploration_cfg.get("kind", "thresholds_only") if isinstance(exploration_cfg, dict) else "thresholds_only"
+    exploration_kind = normalize_exploration_kind(exploration_kind)
 
     if research_enabled and exploration_enabled and exploration_kind == "kbars_only":
         k_values = k_bars_grid if isinstance(k_bars_grid, list) and k_bars_grid else [args.k_bars]
