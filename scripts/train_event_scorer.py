@@ -34,6 +34,11 @@ from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.labels import StateLabels
+from state_engine.research import (
+    build_family_variant_report,
+    evaluate_research_variants,
+    generate_research_variants,
+)
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.session import SESSION_BUCKETS, get_session_bucket
 from state_engine.config_loader import deep_merge, load_config
@@ -128,9 +133,22 @@ def _default_symbol_config(args: argparse.Namespace) -> dict:
                     "vol_context": False,
                 },
                 "k_bars_grid": [args.k_bars],
+                "exploration": {
+                    "enabled": False,
+                    "kind": "thresholds_only",
+                    "seed": 7,
+                    "max_variants": 25,
+                    "decision_thresholds_grid": {
+                        "n_min": [args.decision_n_min],
+                        "winrate_min": [args.decision_winrate_min],
+                        "r_mean_min": [args.decision_r_mean_min],
+                        "p10_min": [args.decision_p10_min],
+                    },
+                },
                 "diagnostics": {
                     "max_family_concentration": 0.6,
                     "min_temporal_dispersion": 0.3,
+                    "min_calib_samples": 200,
                 },
             },
         },
@@ -153,6 +171,14 @@ def _resolve_research_config(config: dict, mode: str) -> dict:
         legacy_cfg = event_cfg.get("research", {}) if isinstance(event_cfg.get("research"), dict) else {}
         if legacy_cfg:
             research_cfg = legacy_cfg
+    event_cfg = config.get("event_scorer", {}) if isinstance(config.get("event_scorer"), dict) else {}
+    mode_cfg = {}
+    if isinstance(event_cfg.get("modes"), dict):
+        mode_cfg = event_cfg.get("modes", {}).get(mode, {})
+    if isinstance(mode_cfg, dict):
+        for key in ("enabled", "features", "diagnostics", "k_bars_grid", "k_bars_grid_by_tf", "exploration"):
+            if key in mode_cfg:
+                research_cfg[key] = mode_cfg.get(key)
     enabled = bool(research_cfg.get("enabled", False))
     features = research_cfg.get("features", {}) if isinstance(research_cfg.get("features"), dict) else {}
     diagnostics = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
@@ -164,6 +190,7 @@ def _resolve_research_config(config: dict, mode: str) -> dict:
         "k_bars_grid": k_bars_grid,
         "k_bars_grid_by_tf": research_cfg.get("k_bars_grid_by_tf"),
         "d1_anchor_hour": research_cfg.get("d1_anchor_hour", 0),
+        "exploration": research_cfg.get("exploration", {}) if isinstance(research_cfg.get("exploration"), dict) else {},
     }
 
 
@@ -263,13 +290,16 @@ def _attach_output_metadata(
     allow_tf: str,
     score_tf: str,
     config_path: Path | None,
+    mode: str,
 ) -> pd.DataFrame:
     output = df.copy()
     metadata = [
         ("run_id", run_id),
+        ("symbol_effective", symbol),
         ("symbol", symbol),
         ("allow_tf", allow_tf),
         ("score_tf", score_tf),
+        ("mode", mode),
         ("config_path", str(config_path) if config_path is not None else None),
     ]
     for key, value in reversed(metadata):
@@ -799,146 +829,77 @@ def _session_bucket_series(
     )
 
 
-def _month_bucket_series(events_index: pd.DatetimeIndex) -> pd.Series:
-    if events_index.empty:
-        return pd.Series([], index=events_index, name="month_bucket", dtype="object")
-    return events_index.to_period("M").astype(str).rename("month_bucket")
-
-
-def _align_bucket_series(bucket: pd.Series, target_index: pd.Index, label: str) -> pd.Series:
-    if bucket.empty:
-        return pd.Series([], index=target_index, name=label, dtype="object")
-    if len(bucket) == len(target_index):
-        return pd.Series(bucket.to_numpy(), index=target_index, name=label)
-    if bucket.index.is_unique:
-        return bucket.reindex(target_index)
-    deduped = bucket[~bucket.index.duplicated(keep="last")]
-    return deduped.reindex(target_index)
-
-
-def _research_fail_reason(row: pd.Series, thresholds: argparse.Namespace) -> tuple[bool, str]:
-    reasons: list[str] = []
-    for col in ("n", "winrate", "r_mean", "p10"):
-        if pd.isna(row[col]):
-            reasons.append("DIAGNOSTIC_FAIL")
-            break
-    if row["n"] < thresholds.decision_n_min:
-        reasons.append("N_TOO_LOW")
-    if row["winrate"] < thresholds.decision_winrate_min:
-        reasons.append("WINRATE_TOO_LOW")
-    if row["r_mean"] < thresholds.decision_r_mean_min:
-        reasons.append("R_MEAN_TOO_LOW")
-    if thresholds.decision_p10_min is not None and row["p10"] < thresholds.decision_p10_min:
-        reasons.append("P10_TOO_LOW")
-    qualified = len(reasons) == 0
-    return qualified, "|".join(reasons)
-
-
-def _build_research_grid_results(
-    events_df: pd.DataFrame,
-    symbol: str,
-    k_bars: int,
-    thresholds: argparse.Namespace,
-    session_bucket: pd.Series,
-    month_bucket: pd.Series,
-    lift_at_k: float | None,
-    score_tail_slope: float | None,
-) -> pd.DataFrame:
-    columns = [
-        "symbol",
-        "k_bars",
-        "state",
-        "family",
-        "session_bucket",
-        "month_bucket",
-        "n",
-        "winrate",
-        "r_mean",
-        "p10",
-        "lift_at_k",
-        "score_tail_slope",
-        "qualified",
-        "fail_reason",
-    ]
-    if events_df.empty:
-        return pd.DataFrame(columns=columns)
-    events_grid = events_df.copy()
-    events_grid["session_bucket"] = _align_bucket_series(
-        session_bucket,
-        events_grid.index,
-        "session_bucket",
-    ).fillna("UNKNOWN")
-    events_grid["month_bucket"] = _align_bucket_series(
-        month_bucket,
-        events_grid.index,
-        "month_bucket",
-    ).fillna("UNKNOWN")
-    grouped = events_grid.groupby(
-        ["state_label", "family_id", "session_bucket", "month_bucket"],
-        observed=True,
-    )
-    summary = grouped.agg(
-        n=("label", "size"),
-        winrate=("label", "mean"),
-        r_mean=("r_outcome", "mean"),
-        p10=("r_outcome", lambda s: s.quantile(0.1)),
-    ).reset_index()
-    summary = summary.rename(
-        columns={
-            "state_label": "state",
-            "family_id": "family",
-        }
-    )
-    summary["symbol"] = symbol
-    summary["k_bars"] = int(k_bars)
-    summary["lift_at_k"] = lift_at_k if lift_at_k is not None else np.nan
-    summary["score_tail_slope"] = score_tail_slope if score_tail_slope is not None else np.nan
-    qualified_flags = summary.apply(lambda row: _research_fail_reason(row, thresholds), axis=1)
-    summary["qualified"] = [flag for flag, _ in qualified_flags]
-    summary["fail_reason"] = [reason for _, reason in qualified_flags]
-    summary = summary[columns]
-    return summary
-
-
 def _build_research_summary_from_grid(grid_results: pd.DataFrame) -> dict[str, object]:
     if grid_results.empty:
         return {
-            "qualified_session_buckets": 0,
-            "top_5_candidate_cells_by_r_mean": [],
+            "qualified_variants": 0,
+            "top_5_variants_by_r_mean": [],
             "verdict": "NO LOCAL EDGE DETECTED",
         }
-    qualified_count = int(grid_results["qualified"].sum())
+    qualified_count = int(grid_results["qualified"].sum()) if "qualified" in grid_results.columns else 0
     top_rows = (
-        grid_results.sort_values(["r_mean", "winrate", "n"], ascending=[False, False, False])
+        grid_results.sort_values(["r_mean", "winrate", "n_total"], ascending=[False, False, False])
         .head(5)
         .reset_index(drop=True)
     )
-    top_cells = (
-        top_rows[
-            [
-                "k_bars",
-                "state",
-                "family",
-                "session_bucket",
-                "month_bucket",
-                "n",
-                "winrate",
-                "r_mean",
-                "p10",
-            ]
+    top_rows = top_rows[
+        [
+            "variant_id",
+            "variant_type",
+            "k_bars",
+            "n_min",
+            "winrate_min",
+            "r_mean_min",
+            "p10_min",
+            "n_total",
+            "winrate",
+            "r_mean",
+            "p10",
         ]
-        .to_dict(orient="records")
-    )
-    verdict = (
-        "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
-        if qualified_count > 0
-        else "NO LOCAL EDGE DETECTED"
-    )
+    ]
+    verdict = "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION" if qualified_count > 0 else "NO LOCAL EDGE DETECTED"
     return {
-        "qualified_session_buckets": qualified_count,
-        "top_5_candidate_cells_by_r_mean": top_cells,
+        "qualified_variants": qualified_count,
+        "top_5_variants_by_r_mean": top_rows.to_dict(orient="records"),
         "verdict": verdict,
     }
+
+
+def _empty_research_variant_report(
+    variants: list,
+    reason: str,
+) -> pd.DataFrame:
+    rows = []
+    for variant in variants:
+        rows.append(
+            {
+                "variant_id": variant.variant_id,
+                "variant_type": variant.variant_type,
+                "k_bars": int(variant.k_bars),
+                "n_min": int(variant.n_min),
+                "winrate_min": float(variant.winrate_min),
+                "r_mean_min": float(variant.r_mean_min),
+                "p10_min": float(variant.p10_min) if variant.p10_min is not None else None,
+                "n_total": 0,
+                "n_train": 0,
+                "n_test": 0,
+                "allow_rate": None,
+                "winrate": np.nan,
+                "r_mean": np.nan,
+                "p10": np.nan,
+                "lift10": np.nan,
+                "lift20": np.nan,
+                "lift50": np.nan,
+                "spearman": np.nan,
+                "family_concentration_top10": np.nan,
+                "temporal_dispersion": np.nan,
+                "score_tail_slope": None,
+                "qualified": False,
+                "fail_reason": reason,
+                "research_status": "RESEARCH_UNSTABLE",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _persist_research_outputs(
@@ -949,12 +910,16 @@ def _persist_research_outputs(
     run_id: str,
     config_path: Path | None,
     grid_results: pd.DataFrame,
+    family_results: pd.DataFrame | None,
     summary_payload: dict[str, object],
     research_cfg: dict,
     config_hash: str | None,
     prompt_version: str | None,
+    baseline_thresholds: dict[str, float | int | None],
+    baseline_thresholds_source: str,
     mode_suffix: str,
     research_mode: bool,
+    mode: str,
 ) -> None:
     if not research_mode:
         return
@@ -968,8 +933,21 @@ def _persist_research_outputs(
         allow_tf=allow_tf,
         score_tf=score_tf,
         config_path=config_path,
+        mode=mode,
     )
     grid_output.to_csv(grid_path, index=False)
+    if family_results is not None:
+        families_path = model_dir / f"research_grid_families_{output_prefix}{mode_suffix}.csv"
+        families_output = _attach_output_metadata(
+            family_results,
+            run_id=run_id,
+            symbol=symbol,
+            allow_tf=allow_tf,
+            score_tf=score_tf,
+            config_path=config_path,
+            mode=mode,
+        )
+        families_output.to_csv(families_path, index=False)
     summary_path = model_dir / f"research_summary_{output_prefix}{mode_suffix}.json"
     payload = {
         "enabled": bool(research_cfg.get("enabled", False)),
@@ -977,13 +955,17 @@ def _persist_research_outputs(
         "symbol": symbol,
         "allow_tf": allow_tf,
         "score_tf": score_tf,
+        "mode": mode,
         "config_path": str(config_path) if config_path is not None else None,
-        "qualified_session_buckets": summary_payload.get("qualified_session_buckets", 0),
-        "top_5_candidate_cells_by_r_mean": summary_payload.get("top_5_candidate_cells_by_r_mean", []),
+        "qualified_variants": summary_payload.get("qualified_variants", 0),
+        "top_5_variants_by_r_mean": summary_payload.get("top_5_variants_by_r_mean", []),
         "verdict": summary_payload.get("verdict", "NO LOCAL EDGE DETECTED"),
         "d1_anchor_hour": research_cfg.get("d1_anchor_hour", 0),
         "features_enabled": research_cfg.get("features", {}),
         "k_bars_grid": research_cfg.get("k_bars_grid"),
+        "exploration": research_cfg.get("exploration", {}),
+        "baseline_thresholds_source": baseline_thresholds_source,
+        "baseline_thresholds": baseline_thresholds,
         "config_hash": config_hash,
         "prompt_version": prompt_version,
     }
@@ -1550,9 +1532,13 @@ def _run_training_for_k(
     seed: int,
     scorer_out_base: Path,
     mode_suffix: str,
+    mode_effective: str,
     research_mode: bool,
     research_cfg: dict,
-) -> pd.DataFrame | None:
+    research_variants: list,
+    baseline_thresholds: dict[str, float | int | None],
+    baseline_thresholds_source: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None] | None:
     logger = logging.getLogger("event_scorer")
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
     print(
@@ -1599,20 +1585,31 @@ def _run_training_for_k(
                 f"{args.fallback_min_samples} ==="
             )
         diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
-        if args.mode == "research":
-            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         if research_mode:
-            empty_series = pd.Series([], index=events_diag.index, dtype="object")
-            return _build_research_grid_results(
-                events_df=pd.DataFrame(),
-                symbol=args.symbol,
-                k_bars=k_bars,
-                thresholds=args,
-                session_bucket=empty_series,
-                month_bucket=empty_series,
-                lift_at_k=None,
-                score_tail_slope=None,
+            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
+        if research_mode and research_variants:
+            diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
+            report = evaluate_research_variants(
+                variants=research_variants,
+                scores=pd.Series([], dtype=float),
+                labels=pd.Series([], dtype=float),
+                r_outcome=pd.Series([], dtype=float),
+                families=pd.Series([], dtype="object"),
+                timestamps=pd.DatetimeIndex([]),
+                train_count=0,
+                calib_count=0,
+                allow_rate=None,
+                diagnostics_cfg=diagnostics_cfg,
+                baseline_thresholds=baseline_thresholds,
             )
+            family_report = build_family_variant_report(
+                variants=research_variants,
+                scores=pd.Series([], dtype=float),
+                labels=pd.Series([], dtype=float),
+                r_outcome=pd.Series([], dtype=float),
+                families=pd.Series([], dtype="object"),
+            )
+            return report, family_report
         return None
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
     logger.info("Labeled events by type:\n%s", events["event_type"].value_counts().to_string())
@@ -1813,6 +1810,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         labeled_output = _attach_output_metadata(
             _reset_index_for_export(labeled_events),
@@ -1821,6 +1819,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         detected_output.to_csv(detected_path, index=False)
         labeled_output.to_csv(labeled_path, index=False)
@@ -1837,19 +1836,29 @@ def _run_training_for_k(
             }
             print("\n[FALLBACK METRICS]")
             print(pd.DataFrame([summary]).to_string(index=False))
-        if research_mode:
-            session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_score_ctx)
-            month_bucket = _month_bucket_series(events_for_training.index)
-            return _build_research_grid_results(
-                events_df=events_for_training,
-                symbol=args.symbol,
-                k_bars=k_bars,
-                thresholds=args,
-                session_bucket=session_bucket,
-                month_bucket=month_bucket,
-                lift_at_k=None,
-                score_tail_slope=None,
+        if research_mode and research_variants:
+            diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
+            report = evaluate_research_variants(
+                variants=research_variants,
+                scores=pd.Series([], dtype=float),
+                labels=pd.Series([], dtype=float),
+                r_outcome=pd.Series([], dtype=float),
+                families=pd.Series([], dtype="object"),
+                timestamps=pd.DatetimeIndex([]),
+                train_count=0,
+                calib_count=0,
+                allow_rate=None,
+                diagnostics_cfg=diagnostics_cfg,
+                baseline_thresholds=baseline_thresholds,
             )
+            family_report = build_family_variant_report(
+                variants=research_variants,
+                scores=pd.Series([], dtype=float),
+                labels=pd.Series([], dtype=float),
+                r_outcome=pd.Series([], dtype=float),
+                families=pd.Series([], dtype="object"),
+            )
+            return report, family_report
         return None
 
     event_features_all = feature_builder.add_family_features(
@@ -1924,6 +1933,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         labeled_output = _attach_output_metadata(
             _reset_index_for_export(labeled_events),
@@ -1932,6 +1942,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         detected_output.to_csv(detected_path, index=False)
         labeled_output.to_csv(labeled_path, index=False)
@@ -2410,7 +2421,7 @@ def _run_training_for_k(
             "p10_min": args.decision_p10_min,
         },
         "config_path": str(config_path) if config_path is not None else None,
-        "config_mode": args.mode,
+        "config_mode": mode_effective,
         "feature_count": event_features_all.shape[1],
         "train_date": datetime.now(timezone.utc).isoformat(),
         "metrics_summary": metrics_summary,
@@ -2449,6 +2460,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         metrics_output.to_csv(metrics_path, index=False)
         logger.info("metrics_out=%s", metrics_path)
@@ -2464,6 +2476,7 @@ def _run_training_for_k(
         allow_tf=args.allow_tf,
         score_tf=args.score_tf,
         config_path=config_path,
+        mode=mode_effective,
     )
     family_output.to_csv(family_path, index=False)
     logger.info("family_summary_out=%s", family_path)
@@ -2487,6 +2500,7 @@ def _run_training_for_k(
             allow_tf=args.allow_tf,
             score_tf=args.score_tf,
             config_path=config_path,
+            mode=mode_effective,
         )
         sample_output.to_csv(sample_path, index=False)
         logger.info("calib_top_scored_out=%s", sample_path)
@@ -2595,32 +2609,77 @@ def _run_training_for_k(
         json.dump(summary_payload, handle, indent=2, default=str)
     logger.info("summary_out=%s", summary_path)
     logger.info("=" * 96)
-    if args.mode == "research":
-        _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
-
-    lift_at_k = None
-    if metrics_summary and "lift@20" in metrics_summary:
-        lift_at_k = metrics_summary.get("lift@20")
-    score_tail_slope = None
-    if not score_shape.empty:
-        slope_match = score_shape.loc[score_shape["k"] == 20, "score_tail_slope"]
-        if not slope_match.empty:
-            score_tail_slope = float(slope_match.iloc[0])
-
     if research_mode:
-        session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_score_ctx)
-        month_bucket = _month_bucket_series(events_for_training.index)
-        return _build_research_grid_results(
-            events_df=events_for_training,
-            symbol=args.symbol,
-            k_bars=k_bars,
-            thresholds=args,
-            session_bucket=session_bucket,
-            month_bucket=month_bucket,
-            lift_at_k=lift_at_k,
-            score_tail_slope=score_tail_slope,
+        _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
+    if research_mode and research_variants:
+        if preds_meta is None or y_calib.empty or len(y_calib) == 0:
+            variant_report = _empty_research_variant_report(research_variants, "NO_PREDICTIONS")
+            family_report = pd.DataFrame(
+                columns=[
+                    "variant_id",
+                    "family",
+                    "n",
+                    "winrate",
+                    "r_mean",
+                    "p10",
+                    "lift10",
+                    "lift20",
+                    "qualified",
+                    "fail_reason",
+                ]
+            )
+            return variant_report, family_report
+        diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
+        allow_rate = None
+        if allow_cols:
+            allow_rate = float((events_for_training[allow_cols].fillna(0).sum(axis=1) > 0).mean())
+        report = evaluate_research_variants(
+            variants=research_variants,
+            scores=preds_meta,
+            labels=y_calib,
+            r_outcome=r_calib,
+            families=fam_calib,
+            timestamps=y_calib.index,
+            train_count=len(y_train),
+            calib_count=len(y_calib),
+            allow_rate=allow_rate,
+            diagnostics_cfg=diagnostics_cfg,
+            baseline_thresholds=baseline_thresholds,
         )
+        family_report = build_family_variant_report(
+            variants=research_variants,
+            scores=preds_meta,
+            labels=y_calib,
+            r_outcome=r_calib,
+            families=fam_calib,
+        )
+        return report, family_report
     return None
+
+
+def _effective_mode(requested_mode: str, research_cfg: dict) -> str:
+    if requested_mode != "research":
+        return requested_mode
+    return "research" if bool(research_cfg.get("enabled", False)) else "production"
+
+
+def _resolve_baseline_thresholds(
+    config_payload: dict,
+    args: argparse.Namespace,
+) -> tuple[dict[str, float | int | None], str]:
+    production_thresholds = _resolve_decision_thresholds(config_payload, "production")
+    prod_thresholds = _resolve_decision_thresholds(config_payload, "prod")
+    if production_thresholds:
+        return production_thresholds, "production"
+    if prod_thresholds:
+        return prod_thresholds, "prod"
+    baseline_thresholds = {
+        "n_min": args.decision_n_min,
+        "winrate_min": args.decision_winrate_min,
+        "r_mean_min": args.decision_r_mean_min,
+        "p10_min": args.decision_p10_min,
+    }
+    return baseline_thresholds, "cli_fallback"
 
 
 def main() -> None:
@@ -2628,7 +2687,13 @@ def main() -> None:
     logger = setup_logging(args.log_level)
     min_samples_train = 200
     seed = 7
-    research_cfg: dict[str, object] = {"enabled": False, "features": {}, "diagnostics": {}, "k_bars_grid": None}
+    research_cfg: dict[str, object] = {
+        "enabled": False,
+        "features": {},
+        "diagnostics": {},
+        "k_bars_grid": None,
+        "exploration": {},
+    }
     config_hash = None
     prompt_version = None
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
@@ -2671,13 +2736,6 @@ def main() -> None:
             if isinstance(family_cfg, dict):
                 min_samples_train = family_cfg.get("min_samples_train", min_samples_train)
 
-            thresholds = _resolve_decision_thresholds(merged, args.mode)
-            if thresholds:
-                args.decision_n_min = thresholds.get("n_min", args.decision_n_min)
-                args.decision_winrate_min = thresholds.get("winrate_min", args.decision_winrate_min)
-                args.decision_r_mean_min = thresholds.get("r_mean_min", args.decision_r_mean_min)
-                args.decision_p10_min = thresholds.get("p10_min", args.decision_p10_min)
-
             research_cfg = _resolve_research_config(merged, args.mode)
 
         logger.info("Loaded config overrides from %s (mode=%s)", config_path, args.mode)
@@ -2686,6 +2744,20 @@ def main() -> None:
             json.dumps(config_payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         prompt_version = config_payload.get("prompt_version")
+
+    requested_mode = args.mode
+    effective_mode = _effective_mode(requested_mode, research_cfg)
+    if requested_mode == "research" and effective_mode != "research":
+        logger.warning("Research mode requested but disabled in config; falling back to production behavior.")
+
+    baseline_thresholds, baseline_thresholds_source = _resolve_baseline_thresholds(config_payload, args)
+
+    thresholds = _resolve_decision_thresholds(config_payload, effective_mode)
+    if thresholds:
+        args.decision_n_min = thresholds.get("n_min", args.decision_n_min)
+        args.decision_winrate_min = thresholds.get("winrate_min", args.decision_winrate_min)
+        args.decision_r_mean_min = thresholds.get("r_mean_min", args.decision_r_mean_min)
+        args.decision_p10_min = thresholds.get("p10_min", args.decision_p10_min)
 
     args.score_tf = _normalize_timeframe(args.score_tf)
     args.allow_tf = _normalize_timeframe(args.allow_tf)
@@ -2699,18 +2771,22 @@ def main() -> None:
         config_path,
         args.allow_tf,
         args.score_tf,
-        args.mode,
+        effective_mode,
         run_id,
     )
 
-    research_mode = args.mode == "research"
+    research_mode = effective_mode == "research"
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
-    mode_suffix = _mode_suffix(args.mode)
-    k_bars_grid = _resolve_k_bars_grid_by_tf(research_cfg, args.score_tf) if research_mode else None
-    if research_mode:
+    mode_suffix = _mode_suffix(effective_mode)
+    k_bars_grid = _resolve_k_bars_grid_by_tf(research_cfg, args.score_tf) if research_enabled else None
+    if research_enabled:
         research_cfg = {**research_cfg, "k_bars_grid": k_bars_grid}
-    if research_mode and isinstance(k_bars_grid, list) and k_bars_grid:
-        k_values = k_bars_grid
+    exploration_cfg = research_cfg.get("exploration", {}) if research_enabled else {}
+    exploration_enabled = bool(exploration_cfg.get("enabled", False)) if isinstance(exploration_cfg, dict) else False
+    exploration_kind = exploration_cfg.get("kind", "thresholds_only") if isinstance(exploration_cfg, dict) else "thresholds_only"
+
+    if research_enabled and exploration_enabled and exploration_kind == "kbars_only":
+        k_values = k_bars_grid if isinstance(k_bars_grid, list) and k_bars_grid else [args.k_bars]
     else:
         k_values = [args.k_bars]
     multi_k = len(k_values) > 1
@@ -2827,7 +2903,7 @@ def main() -> None:
                 f"{args.fallback_min_samples} ==="
             )
         diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
-        if args.mode == "research":
+        if research_mode:
             _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         return
 
@@ -2873,10 +2949,39 @@ def main() -> None:
             ctx_sample,
         )
 
+    base_thresholds = {
+        "n_min": args.decision_n_min,
+        "winrate_min": args.decision_winrate_min,
+        "r_mean_min": args.decision_r_mean_min,
+        "p10_min": args.decision_p10_min,
+    }
+    research_variants: list = []
+    variants_by_k: dict[int, list] = {}
+    if research_enabled and exploration_enabled:
+        thresholds_grid = (
+            exploration_cfg.get("decision_thresholds_grid", {})
+            if isinstance(exploration_cfg, dict)
+            else {}
+        )
+        exploration_seed = int(exploration_cfg.get("seed", seed)) if isinstance(exploration_cfg, dict) else seed
+        max_variants = exploration_cfg.get("max_variants") if isinstance(exploration_cfg, dict) else None
+        research_variants = generate_research_variants(
+            kind=exploration_kind,
+            base_k_bars=args.k_bars,
+            k_bars_grid=k_bars_grid if isinstance(k_bars_grid, list) else None,
+            base_thresholds=base_thresholds,
+            thresholds_grid=thresholds_grid,
+            seed=exploration_seed,
+            max_variants=max_variants,
+        )
+        for variant in research_variants:
+            variants_by_k.setdefault(int(variant.k_bars), []).append(variant)
+
     research_grid_frames: list[pd.DataFrame] = []
+    research_family_frames: list[pd.DataFrame] = []
     for k_bars in k_values:
         output_suffix = f"_k{k_bars}" if multi_k else ""
-        grid_results = _run_training_for_k(
+        variant_results = _run_training_for_k(
             args=args,
             k_bars=k_bars,
             output_suffix=output_suffix,
@@ -2899,16 +3004,24 @@ def main() -> None:
             seed=seed,
             scorer_out_base=scorer_out_base,
             mode_suffix=mode_suffix,
+            mode_effective=effective_mode,
             research_mode=research_mode,
             research_cfg=research_cfg,
+            research_variants=variants_by_k.get(int(k_bars), []),
+            baseline_thresholds=baseline_thresholds,
+            baseline_thresholds_source=baseline_thresholds_source,
         )
-        if research_mode and grid_results is not None:
-            research_grid_frames.append(grid_results)
-    if research_mode:
+        if research_enabled and exploration_enabled and variant_results is not None:
+            variant_report, family_report = variant_results
+            research_grid_frames.append(variant_report)
+            if family_report is not None:
+                research_family_frames.append(family_report)
+    if research_enabled and exploration_enabled:
         if research_grid_frames:
             combined_grid = pd.concat(research_grid_frames, ignore_index=True)
         else:
             combined_grid = pd.DataFrame()
+        combined_families = pd.concat(research_family_frames, ignore_index=True) if research_family_frames else None
         research_summary = _build_research_summary_from_grid(combined_grid)
         _persist_research_outputs(
             model_dir=args.model_dir,
@@ -2918,12 +3031,16 @@ def main() -> None:
             run_id=run_id,
             config_path=config_path,
             grid_results=combined_grid,
+            family_results=combined_families,
             summary_payload=research_summary,
             research_cfg=research_cfg,
             config_hash=config_hash,
             prompt_version=prompt_version,
+            baseline_thresholds=baseline_thresholds,
+            baseline_thresholds_source=baseline_thresholds_source,
             mode_suffix=mode_suffix,
             research_mode=research_mode,
+            mode=effective_mode,
         )
     return
 
