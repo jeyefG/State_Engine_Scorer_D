@@ -143,9 +143,13 @@ def _resolve_decision_thresholds(config: dict, mode: str) -> dict:
 
 
 def _resolve_research_config(config: dict, mode: str) -> dict:
-    event_cfg = config.get("event_scorer", {}) if isinstance(config.get("event_scorer"), dict) else {}
-    research_cfg = event_cfg.get("research", {}) if isinstance(event_cfg.get("research"), dict) else {}
-    enabled = bool(research_cfg.get("enabled", False)) and mode == "research"
+    research_cfg = config.get("research", {}) if isinstance(config.get("research"), dict) else {}
+    if not research_cfg:
+        event_cfg = config.get("event_scorer", {}) if isinstance(config.get("event_scorer"), dict) else {}
+        legacy_cfg = event_cfg.get("research", {}) if isinstance(event_cfg.get("research"), dict) else {}
+        if legacy_cfg:
+            research_cfg = legacy_cfg
+    enabled = bool(research_cfg.get("enabled", False))
     features = research_cfg.get("features", {}) if isinstance(research_cfg.get("features"), dict) else {}
     diagnostics = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
     k_bars_grid = research_cfg.get("k_bars_grid")
@@ -836,9 +840,9 @@ def _persist_research_outputs(
     config_hash: str | None,
     prompt_version: str | None,
     mode_suffix: str,
-    research_enabled: bool,
+    research_mode: bool,
 ) -> None:
-    if not research_enabled:
+    if not research_mode:
         return
     model_dir.mkdir(parents=True, exist_ok=True)
     safe_symbol = _safe_symbol(symbol)
@@ -846,6 +850,7 @@ def _persist_research_outputs(
     grid_results.to_csv(grid_path, index=False)
     summary_path = model_dir / f"research_summary_{safe_symbol}{mode_suffix}.json"
     payload = {
+        "enabled": bool(research_cfg.get("enabled", False)),
         "qualified_session_buckets": summary_payload.get("qualified_session_buckets", 0),
         "top_5_candidate_cells_by_r_mean": summary_payload.get("top_5_candidate_cells_by_r_mean", []),
         "verdict": summary_payload.get("verdict", "NO LOCAL EDGE DETECTED"),
@@ -1414,7 +1419,7 @@ def _run_training_for_k(
     seed: int,
     scorer_out_base: Path,
     mode_suffix: str,
-    research_enabled: bool,
+    research_mode: bool,
     research_cfg: dict,
 ) -> pd.DataFrame | None:
     logger = logging.getLogger("event_scorer")
@@ -1464,7 +1469,7 @@ def _run_training_for_k(
         diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         if args.mode == "research":
             _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
-        if research_enabled:
+        if research_mode:
             empty_series = pd.Series([], index=events_diag.index, dtype="object")
             return _build_research_grid_results(
                 events_df=pd.DataFrame(),
@@ -1684,7 +1689,7 @@ def _run_training_for_k(
             }
             print("\n[FALLBACK METRICS]")
             print(pd.DataFrame([summary]).to_string(index=False))
-        if research_enabled:
+        if research_mode:
             session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
             month_bucket = _month_bucket_series(events_for_training.index)
             return _build_research_grid_results(
@@ -2405,7 +2410,7 @@ def _run_training_for_k(
         if not slope_match.empty:
             score_tail_slope = float(slope_match.iloc[0])
 
-    if research_enabled:
+    if research_mode:
         session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
         month_bucket = _month_bucket_series(events_for_training.index)
         return _build_research_grid_results(
@@ -2479,10 +2484,11 @@ def main() -> None:
         ).hexdigest()
         prompt_version = config_payload.get("prompt_version")
 
-    research_enabled = bool(research_cfg.get("enabled", False))
+    research_mode = args.mode == "research"
+    research_enabled = research_mode and bool(research_cfg.get("enabled", False))
     mode_suffix = _mode_suffix(args.mode)
-    k_bars_grid = research_cfg.get("k_bars_grid") if research_enabled else None
-    if research_enabled and isinstance(k_bars_grid, list) and k_bars_grid:
+    k_bars_grid = research_cfg.get("k_bars_grid") if research_mode else None
+    if research_mode and isinstance(k_bars_grid, list) and k_bars_grid:
         k_values = k_bars_grid
     else:
         k_values = [args.k_bars]
@@ -2664,12 +2670,12 @@ def main() -> None:
             seed=seed,
             scorer_out_base=scorer_out_base,
             mode_suffix=mode_suffix,
-            research_enabled=research_enabled,
+            research_mode=research_mode,
             research_cfg=research_cfg,
         )
-        if research_enabled and grid_results is not None:
+        if research_mode and grid_results is not None:
             research_grid_frames.append(grid_results)
-    if research_enabled:
+    if research_mode:
         if research_grid_frames:
             combined_grid = pd.concat(research_grid_frames, ignore_index=True)
         else:
@@ -2684,7 +2690,7 @@ def main() -> None:
             config_hash=config_hash,
             prompt_version=prompt_version,
             mode_suffix=mode_suffix,
-            research_enabled=research_enabled,
+            research_mode=research_mode,
         )
     return
 
