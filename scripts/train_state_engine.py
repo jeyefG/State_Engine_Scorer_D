@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -38,12 +39,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start",
         required=True,
-        help="Fecha inicio (YYYY-MM-DD) para descarga H1",
+        help="Fecha inicio (YYYY-MM-DD) para descarga de velas",
     )
     parser.add_argument(
         "--end",
         default = default_end,
-        help="Fecha fin (YYYY-MM-DD) para descarga H1",
+        help="Fecha fin (YYYY-MM-DD) para descarga de velas",
+    )
+    parser.add_argument(
+        "--timeframe",
+        choices=["M30", "H1", "H2", "H4"],
+        default="H1",
+        help="Timeframe de velas para el State Engine (M30, H1, H2, H4).",
+    )
+    parser.add_argument(
+        "--window-hours",
+        type=int,
+        default=24,
+        help="Ventana temporal total (en horas) usada como contexto estructural.",
     )
     parser.add_argument(
         "--model-out",
@@ -174,6 +187,29 @@ def main() -> None:
     if use_rich and rich_modules:
         console = rich_modules["Console"]()
 
+    bars_per_hour = {
+        "M30": 2,
+        "H1": 1,
+        "H2": 0.5,
+        "H4": 0.25,
+    }
+    derived_bars = math.ceil(args.window_hours * bars_per_hour[args.timeframe])
+    if derived_bars < 4:
+        raise ValueError(f"Context window too small: {derived_bars} bars (min=4).")
+    logger.info(
+        "timeframe=%s window_hours=%s derived_bars=%s",
+        args.timeframe,
+        args.window_hours,
+        derived_bars,
+    )
+
+    timeframe_floor = {
+        "M30": "30min",
+        "H1": "h",
+        "H2": "2h",
+        "H4": "4h",
+    }[args.timeframe]
+
     def step(name: str) -> float:
         logger.info("stage=%s", name)
         return datetime.now(tz=timezone.utc).timestamp()
@@ -181,19 +217,19 @@ def main() -> None:
     def step_done(start_ts: float) -> float:
         return datetime.now(tz=timezone.utc).timestamp() - start_ts
 
-    stage_start = step("descarga_h1")
+    stage_start = step("descarga_tf")
     connector = MT5Connector()
     fecha_inicio = pd.to_datetime(args.start)
     fecha_fin = pd.to_datetime(args.end)
 
-    ohlcv = connector.obtener_h1(args.symbol, fecha_inicio, fecha_fin)
+    ohlcv = connector.obtener_ohlcv(args.symbol, args.timeframe, fecha_inicio, fecha_fin)
     
     # 1) Hora servidor MT5 (inferida desde último tick)
     server_now = connector.server_now(args.symbol).tz_localize(None)
     
-    # 2) Guardrail correcto: usar solo velas H1 cerradas según hora servidor
-    #    La vela en formación empieza en server_now.floor("h")
-    cutoff = server_now.floor("h")
+    # 2) Guardrail correcto: usar solo velas cerradas según hora servidor
+    #    La vela en formación empieza en server_now.floor(timeframe)
+    cutoff = server_now.floor(timeframe_floor)
     ohlcv = ohlcv[ohlcv.index < cutoff]
     
     # 3) Timestamp última vela usada
@@ -210,7 +246,7 @@ def main() -> None:
     logger.info("download_rows=%s elapsed=%.2fs", len(ohlcv), elapsed_download)
 
     stage_start = step("build_dataset")
-    feature_config = FeatureConfig()
+    feature_config = FeatureConfig(window=derived_bars)
     builder = DatasetBuilder(feature_config=feature_config)
     artifacts = builder.build(ohlcv)
     full_features = artifacts.full_features
@@ -406,6 +442,9 @@ def main() -> None:
         "symbol": args.symbol,
         "start": args.start,
         "end": args.end,
+        "timeframe": args.timeframe,
+        "window_hours": args.window_hours,
+        "derived_bars": derived_bars,
         "n_samples": len(features),
         "n_train": len(features_train),
         "n_test": len(features_test),
@@ -584,10 +623,11 @@ def main() -> None:
         console.print(f"Baseline: {baseline_label} ({baseline_pct:.2f}%)")
         console.print(f"Accuracy: {acc:.4f} | F1 Macro: {f1:.4f}")
         console.print(f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)")
-        console.print(f"Last H1 bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
+        console.print(f"Last {args.timeframe} bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
         console.print(f"Server now (tick): {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}")
         console.print(f"Last bar decision: ALLOW={last_allow} | state_hat={StateLabels(last_state_hat).name if last_state_hat is not None else 'NA'} | margin={last_margin:.4f}")
         console.print(f"Last bar rules fired: {last_rules if last_rules else '[]'}")
+        console.print(f"Context window: {args.window_hours}h (~{derived_bars} bars @ {args.timeframe})")
         console.print(f"Model saved: {args.model_out}")
     else:
         logger.info("class_distribution=%s", label_dist)
@@ -600,6 +640,12 @@ def main() -> None:
         logger.info("ev_by_state=%s", ev_by_state)
         logger.info("ev_by_hvc=%s", hvc_rows)
         logger.info("ev_hvc_stability=%s", hvc_stability)
+        logger.info(
+            "context_window=%sh (~%s bars @ %s)",
+            args.window_hours,
+            derived_bars,
+            args.timeframe,
+        )
 
     # Optional: JSON report
     report_payload = {
