@@ -288,6 +288,94 @@ def main() -> None:
     gating_policy = GatingPolicy()
     gating = gating_policy.apply(outputs, full_features)
     allow_any = gating.any(axis=1)
+
+    # EV estructural (diagnóstico): ret_struct basado en rango direccional futuro
+    ev_k_bars = 2
+    min_hvc_samples = 100
+    high = ohlcv["high"]
+    low = ohlcv["low"]
+    close = ohlcv["close"]
+    future_high = high.shift(-1).rolling(window=ev_k_bars, min_periods=ev_k_bars).max().shift(-(ev_k_bars - 1))
+    future_low = low.shift(-1).rolling(window=ev_k_bars, min_periods=ev_k_bars).min().shift(-(ev_k_bars - 1))
+    up_move = np.log(future_high / close)
+    down_move = np.log(close / future_low)
+    ret_struct = (up_move - down_move).rename("ret_struct").reindex(outputs.index)
+    ev_frame = pd.DataFrame(
+        {
+            "ret_struct": ret_struct,
+            "state_hat": outputs["state_hat"],
+        },
+        index=outputs.index,
+    ).join(gating, how="left")
+    ev_frame = ev_frame.dropna(subset=["ret_struct"])
+
+    ev_base = float(ev_frame["ret_struct"].mean()) if not ev_frame.empty else 0.0
+    ev_by_state: list[dict[str, Any]] = []
+    for label in label_order:
+        mask_state = ev_frame["state_hat"] == label
+        state_ret = ev_frame.loc[mask_state, "ret_struct"]
+        ev_by_state.append(
+            {
+                "state": label.name,
+                "n_samples": int(mask_state.sum()),
+                "ev": float(state_ret.mean()) if not state_ret.empty else 0.0,
+            }
+        )
+
+    hvc_rows: list[dict[str, Any]] = []
+    for label in label_order:
+        mask_state = ev_frame["state_hat"] == label
+        ev_state = float(ev_frame.loc[mask_state, "ret_struct"].mean()) if mask_state.any() else 0.0
+        for col in gating.columns:
+            mask = mask_state & ev_frame[col].astype(bool)
+            n_samples = int(mask.sum())
+            if n_samples < min_hvc_samples:
+                continue
+            ev_hvc = float(ev_frame.loc[mask, "ret_struct"].mean()) if n_samples else 0.0
+            hvc_rows.append(
+                {
+                    "state": label.name,
+                    "allow_rule": col,
+                    "n_samples": n_samples,
+                    "ev_hvc": ev_hvc,
+                    "uplift": ev_hvc - ev_state,
+                }
+            )
+
+    split_frames = np.array_split(ev_frame.sort_index(), 3) if not ev_frame.empty else []
+    hvc_stability: list[dict[str, Any]] = []
+    for row in hvc_rows:
+        uplifts: list[float] = []
+        for split in split_frames:
+            if split.empty:
+                continue
+            mask_state = split["state_hat"] == StateLabels[row["state"]]
+            ev_state = float(split.loc[mask_state, "ret_struct"].mean()) if mask_state.any() else np.nan
+            mask_hvc = mask_state & split[row["allow_rule"]].astype(bool)
+            ev_hvc = float(split.loc[mask_hvc, "ret_struct"].mean()) if mask_hvc.any() else np.nan
+            if np.isnan(ev_state) or np.isnan(ev_hvc):
+                continue
+            uplifts.append(ev_hvc - ev_state)
+        if not uplifts:
+            uplift_mean = np.nan
+            uplift_std = np.nan
+            pct_positive = 0.0
+            n_splits = 0
+        else:
+            uplift_mean = float(np.mean(uplifts))
+            uplift_std = float(np.std(uplifts))
+            pct_positive = float(np.mean([u > 0 for u in uplifts]) * 100)
+            n_splits = len(uplifts)
+        hvc_stability.append(
+            {
+                "state": row["state"],
+                "allow_rule": row["allow_rule"],
+                "uplift_mean": uplift_mean,
+                "uplift_std": uplift_std,
+                "pct_splits_positive": pct_positive,
+                "n_splits": n_splits,
+            }
+        )
     
     # --- "Última vela" para reporting
     last_idx = outputs.index.max()
@@ -434,6 +522,53 @@ def main() -> None:
         render_table(
             console,
             table_class,
+            "EV estructural (base)",
+            ["EV_BASE", "k_bars", "n_samples"],
+            [[f"{ev_base:.6f}", str(ev_k_bars), str(len(ev_frame))]],
+        )
+        render_table(
+            console,
+            table_class,
+            "EV por estado",
+            ["Estado", "n_samples", "EV_state"],
+            [[row["state"], row["n_samples"], f"{row['ev']:.6f}"] for row in ev_by_state],
+        )
+        render_table(
+            console,
+            table_class,
+            "EV por HVC (state, allow)",
+            ["Estado", "ALLOW_*", "n_samples", "EV_HVC", "uplift"],
+            [
+                [
+                    row["state"],
+                    row["allow_rule"],
+                    row["n_samples"],
+                    f"{row['ev_hvc']:.6f}",
+                    f"{row['uplift']:.6f}",
+                ]
+                for row in hvc_rows
+            ],
+        )
+        render_table(
+            console,
+            table_class,
+            "Estabilidad EV por HVC (splits)",
+            ["Estado", "ALLOW_*", "uplift_mean", "uplift_std", "% splits uplift > 0", "n_splits"],
+            [
+                [
+                    row["state"],
+                    row["allow_rule"],
+                    f"{row['uplift_mean']:.6f}" if not np.isnan(row["uplift_mean"]) else "NA",
+                    f"{row['uplift_std']:.6f}" if not np.isnan(row["uplift_std"]) else "NA",
+                    f"{row['pct_splits_positive']:.2f}%",
+                    row["n_splits"],
+                ]
+                for row in hvc_stability
+            ],
+        )
+        render_table(
+            console,
+            table_class,
             "Detalles transición (guardrails)",
             ["Condición", "Count"],
             [
@@ -461,6 +596,10 @@ def main() -> None:
         logger.info("reentry_percentiles=%s", reentry_p)
         logger.info("confusion_matrix=%s", matrix.tolist())
         logger.info("top_features=%s", importances.to_dict())
+        logger.info("ev_structural_base=%s", {"ev_base": ev_base, "k_bars": ev_k_bars, "n_samples": len(ev_frame)})
+        logger.info("ev_by_state=%s", ev_by_state)
+        logger.info("ev_by_hvc=%s", hvc_rows)
+        logger.info("ev_hvc_stability=%s", hvc_stability)
 
     # Optional: JSON report
     report_payload = {
