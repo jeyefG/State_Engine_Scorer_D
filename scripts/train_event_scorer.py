@@ -43,8 +43,10 @@ def parse_args() -> argparse.Namespace:
     default_start = (datetime.today() - timedelta(days=700)).strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(description="Train Event Scorer model.")
     parser.add_argument("--symbol", default="EURUSD", help="Símbolo MT5 (ej. EURUSD)")
-    parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD) para descarga M5/H1")
-    parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD) para descarga M5/H1")
+    parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD) para descarga score/allow")
+    parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD) para descarga score/allow")
+    parser.add_argument("--score-tf", default="M5", help="Timeframe para scoring (ej. M5, M15)")
+    parser.add_argument("--allow-tf", default="H1", help="Timeframe para contexto allow (default H1)")
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--model-out", type=Path, default=None, help="Ruta de salida para Event Scorer")
     parser.add_argument(
@@ -93,6 +95,8 @@ def _default_symbol_config(args: argparse.Namespace) -> dict:
     return {
         "symbol": args.symbol,
         "event_scorer": {
+            "score_tf": args.score_tf,
+            "allow_tf": args.allow_tf,
             "train_ratio": args.train_ratio,
             "k_bars": args.k_bars,
             "reward_r": args.reward_r,
@@ -158,6 +162,7 @@ def _resolve_research_config(config: dict, mode: str) -> dict:
         "features": features,
         "diagnostics": diagnostics,
         "k_bars_grid": k_bars_grid,
+        "k_bars_grid_by_tf": research_cfg.get("k_bars_grid_by_tf"),
         "d1_anchor_hour": research_cfg.get("d1_anchor_hour", 0),
     }
 
@@ -189,17 +194,17 @@ def build_h1_context(
     return ctx
 
 
-def merge_h1_m5(ctx_h1: pd.DataFrame, ohlcv_m5: pd.DataFrame) -> pd.DataFrame:
+def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame) -> pd.DataFrame:
     logger = logging.getLogger("event_scorer")
     h1 = ctx_h1.copy().sort_index()
-    m5 = ohlcv_m5.copy().sort_index()
+    score = ohlcv_score.copy().sort_index()
     if getattr(h1.index, "tz", None) is not None:
         h1.index = h1.index.tz_localize(None)
-    if getattr(m5.index, "tz", None) is not None:
-        m5.index = m5.index.tz_localize(None)
+    if getattr(score.index, "tz", None) is not None:
+        score.index = score.index.tz_localize(None)
     h1 = h1.reset_index().rename(columns={h1.index.name or "index": "time"})
-    m5 = m5.reset_index().rename(columns={m5.index.name or "index": "time"})
-    merged = pd.merge_asof(m5, h1, on="time", direction="backward")
+    score = score.reset_index().rename(columns={score.index.name or "index": "time"})
+    merged = pd.merge_asof(score, h1, on="time", direction="backward")
     merged = merged.set_index("time")
     merged = merged.rename(columns={"state_hat": "state_hat_H1", "margin": "margin_H1"})
     missing_ctx = merged[["state_hat_H1", "margin_H1"]].isna().mean()
@@ -244,6 +249,63 @@ def _with_suffix(path: Path, suffix: str) -> Path:
 
 def _safe_symbol(sym: str) -> str:
     return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in sym)
+
+
+def _normalize_timeframe(timeframe: str) -> str:
+    return str(timeframe).upper()
+
+
+_TIMEFRAME_FLOOR_MAP = {
+    "M1": "1min",
+    "M2": "2min",
+    "M3": "3min",
+    "M4": "4min",
+    "M5": "5min",
+    "M6": "6min",
+    "M10": "10min",
+    "M12": "12min",
+    "M15": "15min",
+    "M20": "20min",
+    "M30": "30min",
+    "H1": "1h",
+    "H2": "2h",
+    "H3": "3h",
+    "H4": "4h",
+    "H6": "6h",
+    "H8": "8h",
+    "H12": "12h",
+    "D1": "1D",
+    "W1": "1W",
+    "MN1": "MS",
+}
+
+
+def _timeframe_floor_freq(timeframe: str) -> str:
+    tf = _normalize_timeframe(timeframe)
+    if tf not in _TIMEFRAME_FLOOR_MAP:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
+    return _TIMEFRAME_FLOOR_MAP[tf]
+
+
+def _resolve_k_bars_by_tf(event_cfg: dict, score_tf: str, fallback: int) -> int:
+    k_bars_by_tf = event_cfg.get("k_bars_by_tf")
+    if isinstance(k_bars_by_tf, dict):
+        target = _normalize_timeframe(score_tf)
+        for key, value in k_bars_by_tf.items():
+            if _normalize_timeframe(str(key)) == target and isinstance(value, int):
+                return value
+    k_bars = event_cfg.get("k_bars", fallback)
+    return k_bars if isinstance(k_bars, int) else fallback
+
+
+def _resolve_k_bars_grid_by_tf(research_cfg: dict, score_tf: str) -> list[int] | None:
+    k_bars_grid_by_tf = research_cfg.get("k_bars_grid_by_tf")
+    if isinstance(k_bars_grid_by_tf, dict):
+        target = _normalize_timeframe(score_tf)
+        for key, value in k_bars_grid_by_tf.items():
+            if _normalize_timeframe(str(key)) == target and isinstance(value, list):
+                return value
+    return research_cfg.get("k_bars_grid")
 
 
 def _mode_suffix(mode: str) -> str:
@@ -325,7 +387,7 @@ def _vwap_zone(dist_to_vwap_atr: pd.Series) -> pd.Series:
 
 def _resolve_vwap_report_mode(
     events_df: pd.DataFrame,
-    df_m5_ctx: pd.DataFrame,
+    df_score_ctx: pd.DataFrame,
     event_config: EventDetectionConfig,
 ) -> str:
     attrs_mode = events_df.attrs.get("vwap_reset_mode_effective")
@@ -333,12 +395,12 @@ def _resolve_vwap_report_mode(
         attrs_mode = events_df["vwap_reset_mode_effective"].iloc[0]
     if attrs_mode is not None:
         return str(attrs_mode)
-    if "vwap" in df_m5_ctx.columns:
+    if "vwap" in df_score_ctx.columns:
         return "provided (no metadata)"
     config_mode = (
         event_config.vwap_reset_mode
         if event_config.vwap_reset_mode is not None
-        else ("session" if any(col in df_m5_ctx.columns for col in ("session_id", "session")) else "daily")
+        else ("session" if any(col in df_score_ctx.columns for col in ("session_id", "session")) else "daily")
     )
     return f"config_{config_mode} (no metadata)"
 
@@ -508,7 +570,7 @@ def _meta_policy_mask(
     return allow_active & margin_ok
 
 
-def _coverage_table(events_diag: pd.DataFrame, df_m5_ctx: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _coverage_table(events_diag: pd.DataFrame, df_score_ctx: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:
     columns_global = [
         "events_total_post_meta",
         "events_per_day",
@@ -524,7 +586,7 @@ def _coverage_table(events_diag: pd.DataFrame, df_m5_ctx: pd.DataFrame | None) -
     columns_by = ["state_hat_H1", "margin_bin", "events_count", "events_pct"]
     if events_diag.empty:
         empty_global = pd.DataFrame([{col: 0.0 for col in columns_global}])
-        empty_global["events_index_match_pct"] = float("nan") if df_m5_ctx is None else float("nan")
+        empty_global["events_index_match_pct"] = float("nan") if df_score_ctx is None else float("nan")
         empty_by = pd.DataFrame(columns=columns_by)
         return empty_global, empty_by
     total = len(events_diag)
@@ -533,7 +595,7 @@ def _coverage_table(events_diag: pd.DataFrame, df_m5_ctx: pd.DataFrame | None) -
     state_counts = events_diag["state_hat_H1"].value_counts()
     margin_counts = events_diag["margin_bin"].value_counts()
     index_match = (
-        float(events_diag.index.isin(df_m5_ctx.index).mean()) if df_m5_ctx is not None else float("nan")
+        float(events_diag.index.isin(df_score_ctx.index).mean()) if df_score_ctx is not None else float("nan")
     )
     global_row = {
         "events_total_post_meta": total,
@@ -697,10 +759,10 @@ def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -
 def _session_bucket_series(
     events_index: pd.DatetimeIndex,
     symbol: str,
-    df_m5_ctx: pd.DataFrame | None,
+    df_score_ctx: pd.DataFrame | None,
 ) -> pd.Series:
-    if df_m5_ctx is not None and "pf_session_bucket" in df_m5_ctx.columns:
-        return df_m5_ctx["pf_session_bucket"].reindex(events_index)
+    if df_score_ctx is not None and "pf_session_bucket" in df_score_ctx.columns:
+        return df_score_ctx["pf_session_bucket"].reindex(events_index)
     return pd.Series(
         [get_session_bucket(ts, symbol) for ts in events_index],
         index=events_index,
@@ -1085,10 +1147,10 @@ def _pseudo_stability_table(events_diag: pd.DataFrame, feature_col: str) -> pd.D
     return table[columns]
 
 
-def _session_bucket_distribution(df_m5_ctx: pd.DataFrame) -> pd.DataFrame:
-    if df_m5_ctx.empty:
+def _session_bucket_distribution(df_score_ctx: pd.DataFrame) -> pd.DataFrame:
+    if df_score_ctx.empty:
         return pd.DataFrame(columns=["symbol", "pf_session_bucket", "n", "pct"])
-    df = df_m5_ctx.copy()
+    df = df_score_ctx.copy()
     if "pf_session_bucket" not in df.columns:
         symbol_series = df.get("symbol", pd.Series("UNKNOWN", index=df.index))
         df["pf_session_bucket"] = [
@@ -1120,7 +1182,7 @@ def _merge_asof_features(m5_index: pd.DatetimeIndex, features: pd.DataFrame) -> 
 
 
 def _build_research_context_features(
-    df_m5_ctx: pd.DataFrame,
+    df_score_ctx: pd.DataFrame,
     ohlcv_h1: pd.DataFrame,
     symbol: str,
     research_cfg: dict,
@@ -1149,7 +1211,7 @@ def _build_research_context_features(
             )
     d1_anchor_hour = parsed_anchor_hour if is_valid_anchor_hour else parsed_anchor_hour % 24
     parts: list[pd.DataFrame] = []
-    index = df_m5_ctx.index
+    index = df_score_ctx.index
 
     if feature_flags.get("session_bucket"):
         session_series = pd.Series(
@@ -1233,8 +1295,8 @@ def _build_research_context_features(
                 col = f"pf_d1_ema200_side_{side}"
                 if col not in ema_side_one_hot.columns:
                     ema_side_one_hot[col] = 0
-            dist_to_high = (d1_merged["d1_high"] - df_m5_ctx["close"]) / d1_merged["atr_d1"].replace(0, np.nan)
-            dist_to_low = (df_m5_ctx["close"] - d1_merged["d1_low"]) / d1_merged["atr_d1"].replace(0, np.nan)
+            dist_to_high = (d1_merged["d1_high"] - df_score_ctx["close"]) / d1_merged["atr_d1"].replace(0, np.nan)
+            dist_to_low = (df_score_ctx["close"] - d1_merged["d1_low"]) / d1_merged["atr_d1"].replace(0, np.nan)
             trend_features = pd.DataFrame(
                 {
                     "pf_d1_ema200_dist": ema_dist,
@@ -1364,11 +1426,11 @@ def _research_guardrails(
 
 def _build_training_diagnostic_report(
     events_diag: pd.DataFrame,
-    df_m5_ctx: pd.DataFrame | None,
+    df_score_ctx: pd.DataFrame | None,
     thresholds: argparse.Namespace,
 ) -> dict[str, pd.DataFrame]:
     report = {}
-    coverage_global, coverage_by = _coverage_table(events_diag, df_m5_ctx)
+    coverage_global, coverage_by = _coverage_table(events_diag, df_score_ctx)
     regime_full, regime_ranked = _regime_edge_table(events_diag)
     stability = _stability_table(events_diag)
     decision = _decision_table(events_diag, thresholds)
@@ -1412,9 +1474,10 @@ def _build_training_diagnostic_report(
         print(_format_table_block(f"Conditional Edge (family x {pseudo_col})", report[f"conditional_edge_{pseudo_col}"]))
         print(_format_table_block(f"Stability temporal (family x {pseudo_col})", report[f"stability_{pseudo_col}"]))
         print(_format_table_block(f"Conditional Edge REGIME (state x margin x allow x family x {pseudo_col})", report[f"conditional_edge_regime_{pseudo_col}"]))
-    if df_m5_ctx is not None:
-        session_table = _session_bucket_distribution(df_m5_ctx)
-        print(_format_table_block("Session Bucket Distribution (M5)", session_table))
+    if df_score_ctx is not None:
+        session_table = _session_bucket_distribution(df_score_ctx)
+        score_tf_label = getattr(thresholds, "score_tf", "UNKNOWN")
+        print(_format_table_block(f"Session Bucket Distribution ({score_tf_label})", session_table))
     return report
 
 
@@ -1424,16 +1487,16 @@ def _run_training_for_k(
     output_suffix: str,
     detected_events: pd.DataFrame,
     event_config: EventDetectionConfig,
-    df_m5_ctx: pd.DataFrame,
-    ohlcv_m5: pd.DataFrame,
+    df_score_ctx: pd.DataFrame,
+    ohlcv_score: pd.DataFrame,
     features_all: pd.DataFrame,
     atr_ratio: pd.Series,
     feature_builder: FeatureBuilder,
-    m5_total: int,
-    m5_ctx_merged: int,
-    m5_ctx_dropna: int,
+    score_total: int,
+    score_ctx_merged: int,
+    score_ctx_dropna: int,
     h1_cutoff: pd.Timestamp,
-    m5_cutoff: pd.Timestamp,
+    score_cutoff: pd.Timestamp,
     min_samples_train: int,
     seed: int,
     scorer_out_base: Path,
@@ -1460,7 +1523,7 @@ def _run_training_for_k(
 
     events = label_events(
         detected_events.copy(),
-        ohlcv_m5,
+        ohlcv_score,
         k_bars,
         args.reward_r,
         args.sl_mult,
@@ -1486,7 +1549,7 @@ def _run_training_for_k(
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
         if args.mode == "research":
             _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         if research_mode:
@@ -1549,7 +1612,7 @@ def _run_training_for_k(
     for line in _format_state_mix(state_counts_events, ["BALANCE", "TREND", "TRANSITION"]):
         print(line)
 
-    vwap_mode = _resolve_vwap_report_mode(detected_events, df_m5_ctx, event_config)
+    vwap_mode = _resolve_vwap_report_mode(detected_events, df_score_ctx, event_config)
     dist_abs = events_all["dist_to_vwap_atr"].abs()
     vwap_quantiles = dist_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict() if not dist_abs.empty else {}
     print("\n[VWAP SANITY]")
@@ -1637,9 +1700,9 @@ def _run_training_for_k(
     events_for_training = events_meta if meta_policy_on else events_state_filtered
     events = events_for_training
     print("\n[SUPPLY FUNNEL]")
-    print(f"m5_total={m5_total}")
-    print(f"after_merge={m5_ctx_merged}")
-    print(f"after_ctx_dropna={m5_ctx_dropna}")
+    print(f"score_total={score_total}")
+    print(f"after_merge={score_ctx_merged}")
+    print(f"after_ctx_dropna={score_ctx_dropna}")
     print(f"events_detected={len(detected_events)}")
     print(f"events_labeled={labeled_total}")
     print(f"events_post_state_filter={len(events_state_filtered)}")
@@ -1664,7 +1727,7 @@ def _run_training_for_k(
             "pf_session_bucket": _session_bucket_series(
                 events_for_training.index,
                 args.symbol,
-                df_m5_ctx,
+                df_score_ctx,
             ),
         },
         index=events_for_training.index,
@@ -1682,7 +1745,7 @@ def _run_training_for_k(
             "=== FALLBACK DIAGNÓSTICO: events_total_post_meta="
             f"{events_total_post_meta} reasons={','.join(fallback_reasons)} ==="
         )
-    diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+    diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
 
     if is_fallback:
         args.model_dir.mkdir(parents=True, exist_ok=True)
@@ -1710,7 +1773,7 @@ def _run_training_for_k(
             print("\n[FALLBACK METRICS]")
             print(pd.DataFrame([summary]).to_string(index=False))
         if research_mode:
-            session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
+            session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_score_ctx)
             month_bucket = _month_bucket_series(events_for_training.index)
             return _build_research_grid_results(
                 events_df=events_for_training,
@@ -2065,7 +2128,7 @@ def _run_training_for_k(
         "start": args.start,
         "end": args.end,
         "h1_cutoff": h1_cutoff,
-        "m5_cutoff": m5_cutoff,
+        "score_cutoff": score_cutoff,
         "k_bars": k_bars,
         "reward_r": args.reward_r,
         "sl_mult": args.sl_mult,
@@ -2246,6 +2309,8 @@ def _run_training_for_k(
 
     metadata = {
         "symbol": args.symbol,
+        "score_tf": args.score_tf,
+        "allow_tf": args.allow_tf,
         "train_ratio": args.train_ratio,
         "k_bars": k_bars,
         "reward_r": args.reward_r,
@@ -2309,7 +2374,7 @@ def _run_training_for_k(
         sample_cols = ["family_id", "side", "label", "r_outcome"]
         sample_df = events.loc[y_calib.index, sample_cols].copy()
         sample_df["score"] = preds_meta
-        sample_df["margin_H1"] = df_m5_ctx["margin_H1"].reindex(sample_df.index)
+        sample_df["margin_H1"] = df_score_ctx["margin_H1"].reindex(sample_df.index)
         sample_df = sample_df.sort_values("score", ascending=False).head(10)
         sample_df = sample_df.reset_index().rename(columns={sample_df.index.name or "index": "time"})
         sample_path = _with_suffix(
@@ -2361,8 +2426,12 @@ def _run_training_for_k(
         "symbol": args.symbol,
         "start": args.start,
         "end": args.end,
+        "score_tf": args.score_tf,
+        "allow_tf": args.allow_tf,
+        "allow_cutoff": h1_cutoff,
         "h1_cutoff": h1_cutoff,
-        "m5_cutoff": m5_cutoff,
+        "m5_cutoff": score_cutoff,
+        "score_cutoff": score_cutoff,
         "events_total_post_meta": _coverage_metric(coverage_global, "events_total_post_meta"),
         "events_per_day": _coverage_metric(coverage_global, "events_per_day"),
         "unique_days": _coverage_metric(coverage_global, "unique_days"),
@@ -2431,7 +2500,7 @@ def _run_training_for_k(
             score_tail_slope = float(slope_match.iloc[0])
 
     if research_mode:
-        session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
+        session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_score_ctx)
         month_bucket = _month_bucket_series(events_for_training.index)
         return _build_research_grid_results(
             events_df=events_for_training,
@@ -2465,6 +2534,8 @@ def main() -> None:
         args.symbol = merged.get("symbol", args.symbol)
         event_cfg = merged.get("event_scorer", {})
         if isinstance(event_cfg, dict):
+            args.score_tf = event_cfg.get("score_tf", args.score_tf)
+            args.allow_tf = event_cfg.get("allow_tf", args.allow_tf)
             args.train_ratio = event_cfg.get("train_ratio", args.train_ratio)
             args.k_bars = event_cfg.get("k_bars", args.k_bars)
             args.reward_r = event_cfg.get("reward_r", args.reward_r)
@@ -2504,10 +2575,18 @@ def main() -> None:
         ).hexdigest()
         prompt_version = config_payload.get("prompt_version")
 
+    args.score_tf = _normalize_timeframe(args.score_tf)
+    args.allow_tf = _normalize_timeframe(args.allow_tf)
+    event_cfg = config_payload.get("event_scorer", {}) if isinstance(config_payload.get("event_scorer"), dict) else {}
+    if event_cfg:
+        args.k_bars = _resolve_k_bars_by_tf(event_cfg, args.score_tf, args.k_bars)
+
     research_mode = args.mode == "research"
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
     mode_suffix = _mode_suffix(args.mode)
-    k_bars_grid = research_cfg.get("k_bars_grid") if research_mode else None
+    k_bars_grid = _resolve_k_bars_grid_by_tf(research_cfg, args.score_tf) if research_mode else None
+    if research_mode:
+        research_cfg = {**research_cfg, "k_bars_grid": k_bars_grid}
     if research_mode and isinstance(k_bars_grid, list) and k_bars_grid:
         k_values = k_bars_grid
     else:
@@ -2526,25 +2605,29 @@ def main() -> None:
     fecha_inicio = pd.to_datetime(args.start)
     fecha_fin = pd.to_datetime(args.end)
 
-    ohlcv_h1 = connector.obtener_h1(args.symbol, fecha_inicio, fecha_fin)
-    ohlcv_m5 = connector.obtener_m5(args.symbol, fecha_inicio, fecha_fin)
-    ohlcv_m5["symbol"] = args.symbol
+    if args.allow_tf != "H1":
+        logger.warning("allow_tf=%s ignored; using H1 for state context.", args.allow_tf)
+        args.allow_tf = "H1"
+    ohlcv_h1 = connector.obtener_ohlcv(args.symbol, args.allow_tf, fecha_inicio, fecha_fin)
+    ohlcv_score = connector.obtener_ohlcv(args.symbol, args.score_tf, fecha_inicio, fecha_fin)
+    ohlcv_score["symbol"] = args.symbol
     server_now = connector.server_now(args.symbol).tz_localize(None)
 
-    h1_cutoff = server_now.floor("h")
-    m5_cutoff = server_now.floor("5min")
-    ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < h1_cutoff]
-    ohlcv_m5 = ohlcv_m5[ohlcv_m5.index < m5_cutoff]
-    m5_dupes = int(ohlcv_m5.index.duplicated().sum())
+    allow_cutoff = server_now.floor(_timeframe_floor_freq(args.allow_tf))
+    h1_cutoff = allow_cutoff
+    score_cutoff = server_now.floor(_timeframe_floor_freq(args.score_tf))
+    ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < allow_cutoff]
+    ohlcv_score = ohlcv_score[ohlcv_score.index < score_cutoff]
+    score_dupes = int(ohlcv_score.index.duplicated().sum())
     h1_dupes = int(ohlcv_h1.index.duplicated().sum())
     logger.info(
-        "Period: %s -> %s | h1_cutoff=%s m5_cutoff=%s",
+        "Period: %s -> %s | allow_cutoff=%s score_cutoff=%s",
         fecha_inicio,
         fecha_fin,
-        h1_cutoff,
-        m5_cutoff,
+        allow_cutoff,
+        score_cutoff,
     )
-    logger.info("Rows: H1=%s M5=%s", len(ohlcv_h1), len(ohlcv_m5))
+    logger.info("Rows: %s=%s %s=%s", args.allow_tf, len(ohlcv_h1), args.score_tf, len(ohlcv_score))
     print("\n=== EVENT SCORER TRAINING ===")
 
     if not model_path.exists():
@@ -2557,15 +2640,15 @@ def main() -> None:
     gating = GatingPolicy()
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating)
 
-    df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
-    if "atr_14" not in df_m5_ctx.columns:
-        df_m5_ctx["atr_14"] = _ensure_atr_14(df_m5_ctx)
-    logger.info("Rows after merge: M5_ctx=%s", len(df_m5_ctx))
-    m5_ctx_merged = len(df_m5_ctx)
+    df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score)
+    if "atr_14" not in df_score_ctx.columns:
+        df_score_ctx["atr_14"] = _ensure_atr_14(df_score_ctx)
+    logger.info("Rows after merge: %s_ctx=%s", args.score_tf, len(df_score_ctx))
+    score_ctx_merged = len(df_score_ctx)
     ctx_nan_cols = ["state_hat_H1", "margin_H1"]
-    if "atr_short" in df_m5_ctx.columns:
+    if "atr_short" in df_score_ctx.columns:
         ctx_nan_cols.append("atr_short")
-    ctx_nan = df_m5_ctx[ctx_nan_cols].isna().mean().mul(100).round(2)
+    ctx_nan = df_score_ctx[ctx_nan_cols].isna().mean().mul(100).round(2)
     ctx_nan_table = pd.DataFrame(
         {
             "column": ctx_nan.index,
@@ -2573,13 +2656,13 @@ def main() -> None:
         }
     )
     logger.info("Context NaN rates:\n%s", ctx_nan_table.to_string(index=False))
-    df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
-    logger.info("Rows after dropna ctx: M5_ctx=%s", len(df_m5_ctx))
-    m5_ctx_dropna = len(df_m5_ctx)
+    df_score_ctx = df_score_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
+    logger.info("Rows after dropna ctx: %s_ctx=%s", args.score_tf, len(df_score_ctx))
+    score_ctx_dropna = len(df_score_ctx)
     feature_builder = FeatureBuilder()
-    features_all = feature_builder.build(df_m5_ctx)
+    features_all = feature_builder.build(df_score_ctx)
     # --- atr_ratio (diagnostic-only, comparable cross-symbol) ---
-    atr14 = df_m5_ctx["atr_14"].reindex(features_all.index)
+    atr14 = df_score_ctx["atr_14"].reindex(features_all.index)
     
     if "atr_short" in features_all.columns:
         atr_short = pd.to_numeric(features_all["atr_short"], errors="coerce")
@@ -2589,7 +2672,7 @@ def main() -> None:
 
     if research_enabled:
         research_features = _build_research_context_features(
-            df_m5_ctx,
+            df_score_ctx,
             ohlcv_h1,
             args.symbol,
             research_cfg,
@@ -2598,16 +2681,16 @@ def main() -> None:
             features_all = pd.concat([features_all, research_features], axis=1)
             logger.info("Research features enabled: %s", list(research_features.columns))
 
-    state_labels_before = df_m5_ctx["state_hat_H1"].map(_state_label)
+    state_labels_before = df_score_ctx["state_hat_H1"].map(_state_label)
     state_counts_before = state_labels_before.value_counts()
-    print("[STATE MIX | M5_CTX]")
+    print(f"[STATE MIX | {args.score_tf}_CTX]")
     for line in _format_state_mix(state_counts_before, ["BALANCE", "TREND", "TRANSITION"]):
         print(line)
 
-    m5_total = len(ohlcv_m5)
+    score_total = len(ohlcv_score)
 
-    event_config = EventDetectionConfig()
-    detected_events = detect_events(df_m5_ctx, config=event_config)
+    event_config = EventDetectionConfig().for_timeframe(args.score_tf)
+    detected_events = detect_events(df_score_ctx, config=event_config)
     if detected_events.empty:
         logger.warning("No events detected; exiting.")
         events_diag = pd.DataFrame(
@@ -2620,7 +2703,7 @@ def main() -> None:
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
         if args.mode == "research":
             _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
         return
@@ -2629,24 +2712,24 @@ def main() -> None:
     logger.info("Detected events by type:\n%s", detected_events["event_type"].value_counts().to_string())
     logger.info("Detected events by family:\n%s", detected_events["family_id"].value_counts().to_string())
 
-    event_indexer = ohlcv_m5.index.get_indexer(detected_events.index)
+    event_indexer = ohlcv_score.index.get_indexer(detected_events.index)
     missing_index = int((event_indexer == -1).sum())
-    missing_future = int(((event_indexer != -1) & (event_indexer + 1 >= len(ohlcv_m5.index))).sum())
-    events_index_match_pct = float(detected_events.index.isin(df_m5_ctx.index).mean())
+    missing_future = int(((event_indexer != -1) & (event_indexer + 1 >= len(ohlcv_score.index))).sum())
+    events_index_match_pct = float(detected_events.index.isin(df_score_ctx.index).mean())
     missing_atr_pct = float(detected_events["atr_14"].isna().mean() * 100)
-    m5_atr14_nan_pct = float(df_m5_ctx["atr_14"].isna().mean() * 100)
+    score_atr14_nan_pct = float(df_score_ctx["atr_14"].isna().mean() * 100)
     events_atr14_nan_pct = float(detected_events["atr_14"].isna().mean() * 100)
     sanity_table = pd.DataFrame(
         [
             {
-                "m5_dupes_detected": m5_dupes,
+                "score_dupes_detected": score_dupes,
                 "h1_dupes_detected": h1_dupes,
                 "event_dupes_detected": events_dupes,
                 "events_missing_index": missing_index,
                 "events_missing_future_slice": missing_future,
                 "events_missing_atr_pct": round(missing_atr_pct, 2),
                 "events_index_match_pct": round(events_index_match_pct, 4),
-                "m5_atr14_nan_pct": round(m5_atr14_nan_pct, 2),
+                "score_atr14_nan_pct": round(score_atr14_nan_pct, 2),
                 "events_atr14_nan_pct": round(events_atr14_nan_pct, 2),
             }
         ]
@@ -2655,14 +2738,14 @@ def main() -> None:
     if events_index_match_pct < 0.99:
         event_ts = detected_events["ts"] if "ts" in detected_events.columns else detected_events.index
         event_sample = None if detected_events.empty else detected_events.index[0]
-        ctx_sample = None if df_m5_ctx.empty else df_m5_ctx.index[0]
+        ctx_sample = None if df_score_ctx.empty else df_score_ctx.index[0]
         logger.warning(
-            "Index mismatch details: events_ts_dtype=%s m5_ctx_index_dtype=%s events_tz=%s m5_ctx_tz=%s "
-            "events_sample=%r m5_ctx_sample=%r",
+            "Index mismatch details: events_ts_dtype=%s score_ctx_index_dtype=%s events_tz=%s score_ctx_tz=%s "
+            "events_sample=%r score_ctx_sample=%r",
             getattr(event_ts, "dtype", None),
-            getattr(df_m5_ctx.index, "dtype", None),
+            getattr(df_score_ctx.index, "dtype", None),
             getattr(getattr(event_ts, "dt", event_ts), "tz", None),
-            getattr(df_m5_ctx.index, "tz", None),
+            getattr(df_score_ctx.index, "tz", None),
             event_sample,
             ctx_sample,
         )
@@ -2676,16 +2759,16 @@ def main() -> None:
             output_suffix=output_suffix,
             detected_events=detected_events,
             event_config=event_config,
-            df_m5_ctx=df_m5_ctx,
-            ohlcv_m5=ohlcv_m5,
+            df_score_ctx=df_score_ctx,
+            ohlcv_score=ohlcv_score,
             features_all=features_all,
             atr_ratio=atr_ratio,
             feature_builder=feature_builder,
-            m5_total=m5_total,
-            m5_ctx_merged=m5_ctx_merged,
-            m5_ctx_dropna=m5_ctx_dropna,
+            score_total=score_total,
+            score_ctx_merged=score_ctx_merged,
+            score_ctx_dropna=score_ctx_dropna,
             h1_cutoff=h1_cutoff,
-            m5_cutoff=m5_cutoff,
+            score_cutoff=score_cutoff,
             min_samples_train=min_samples_train,
             seed=seed,
             scorer_out_base=scorer_out_base,

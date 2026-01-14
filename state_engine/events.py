@@ -1,8 +1,8 @@
-"""Event detection and feature extraction for the M5 Event Scorer (Layer A)."""
+"""Event detection and feature extraction for the Event Scorer (Layer A)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import logging
 
@@ -10,6 +10,48 @@ import numpy as np
 import pandas as pd
 
 EPS = 1e-9
+BASE_SCORE_TF = "M5"
+_TIMEFRAME_MINUTES = {
+    "M1": 1,
+    "M2": 2,
+    "M3": 3,
+    "M4": 4,
+    "M5": 5,
+    "M6": 6,
+    "M10": 10,
+    "M12": 12,
+    "M15": 15,
+    "M20": 20,
+    "M30": 30,
+    "H1": 60,
+    "H2": 120,
+    "H3": 180,
+    "H4": 240,
+    "H6": 360,
+    "H8": 480,
+    "H12": 720,
+    "D1": 1440,
+    "W1": 10080,
+    "MN1": 43200,
+}
+
+
+def _normalize_timeframe(timeframe: str) -> str:
+    return str(timeframe).upper()
+
+
+def _timeframe_minutes(timeframe: str) -> int:
+    key = _normalize_timeframe(timeframe)
+    if key not in _TIMEFRAME_MINUTES:
+        raise ValueError(f"Unsupported timeframe for event scaling: {timeframe}")
+    return _TIMEFRAME_MINUTES[key]
+
+
+def _scale_window(value: int, score_tf: str, base_tf: str = BASE_SCORE_TF) -> int:
+    base_minutes = _timeframe_minutes(base_tf)
+    score_minutes = _timeframe_minutes(score_tf)
+    scaled = max(1, int(round(value * (base_minutes / score_minutes))))
+    return scaled
 
 
 class EventType(str, Enum):
@@ -30,6 +72,7 @@ class EventFamily(str, Enum):
 
 @dataclass(frozen=True)
 class EventDetectionConfig:
+    score_tf: str = BASE_SCORE_TF
     balance_window: int = 12
     balance_edge: float = 0.20
     balance_min_range_atr: float = 0.8
@@ -48,6 +91,9 @@ class EventDetectionConfig:
     trend_continuation_momentum_window: int = 3
     trend_continuation_comp_mult: float = 1.5
     trend_continuation_break_atr: float = 0.25
+    vwap_slope_window: int = 5
+    volume_rel_window: int = 20
+    vwap_window: int = 50
     near_vwap_atr: float = 0.35
     near_vwap_cooldown_bars: int = 3
     vwap_reset_mode: str | None = None
@@ -55,6 +101,38 @@ class EventDetectionConfig:
     near_vwap_mode: str = "enter"
     touch_mode: str = "on"
     rejection_mode: str = "on"
+
+    def for_timeframe(self, score_tf: str, *, base_tf: str = BASE_SCORE_TF) -> "EventDetectionConfig":
+        score_tf_norm = _normalize_timeframe(score_tf)
+        base_tf_norm = _normalize_timeframe(base_tf)
+        if score_tf_norm == base_tf_norm:
+            return replace(self, score_tf=score_tf_norm)
+        return replace(
+            self,
+            score_tf=score_tf_norm,
+            balance_window=_scale_window(self.balance_window, score_tf_norm, base_tf_norm),
+            transition_window=_scale_window(self.transition_window, score_tf_norm, base_tf_norm),
+            trend_window=_scale_window(self.trend_window, score_tf_norm, base_tf_norm),
+            trend_continuation_comp_window=_scale_window(
+                self.trend_continuation_comp_window,
+                score_tf_norm,
+                base_tf_norm,
+            ),
+            trend_continuation_break_window=_scale_window(
+                self.trend_continuation_break_window,
+                score_tf_norm,
+                base_tf_norm,
+            ),
+            trend_continuation_momentum_window=_scale_window(
+                self.trend_continuation_momentum_window,
+                score_tf_norm,
+                base_tf_norm,
+            ),
+            vwap_slope_window=_scale_window(self.vwap_slope_window, score_tf_norm, base_tf_norm),
+            volume_rel_window=_scale_window(self.volume_rel_window, score_tf_norm, base_tf_norm),
+            vwap_window=_scale_window(self.vwap_window, score_tf_norm, base_tf_norm),
+            near_vwap_cooldown_bars=_scale_window(self.near_vwap_cooldown_bars, score_tf_norm, base_tf_norm),
+        )
 
 
 class EventExtractor:
@@ -96,6 +174,7 @@ class EventExtractor:
                 df_sorted.drop(columns=["_sort_ts", "_sort_order"]),
                 vwap_col=vwap_col,
                 reset_mode=reset_mode,
+                vwap_window=self.config.vwap_window,
             )
             df_sorted[vwap_col] = vwap_sorted
             df[vwap_col] = df_sorted.sort_values("_sort_order")[vwap_col].to_numpy()
@@ -133,7 +212,8 @@ class EventExtractor:
 
         dist_to_vwap = close - vwap
         abs_dist_to_vwap = dist_to_vwap.abs()
-        vwap_slope_5 = (vwap - vwap.shift(5)) / 5.0
+        vwap_slope_window = max(int(self.config.vwap_slope_window), 1)
+        vwap_slope = (vwap - vwap.shift(vwap_slope_window)) / float(vwap_slope_window)
         range_1 = (high - low)
         body_ratio = (close - open_).abs() / (range_1 + self.eps)
         upper_wick = high - np.maximum(open_, close)
@@ -146,7 +226,8 @@ class EventExtractor:
         dist_to_vwap_atr = dist_to_vwap / (atr_14 + self.eps)
 
         if "volume" in df.columns:
-            volume_rel = df["volume"] / df["volume"].rolling(20).mean()
+            volume_window = max(int(self.config.volume_rel_window), 1)
+            volume_rel = df["volume"] / df["volume"].rolling(volume_window).mean()
         else:
             volume_rel = pd.Series(np.nan, index=df.index)
 
@@ -159,7 +240,7 @@ class EventExtractor:
             {
                 "dist_to_vwap": dist_to_vwap,
                 "abs_dist_to_vwap": abs_dist_to_vwap,
-                "vwap_slope_5": vwap_slope_5,
+                "vwap_slope": vwap_slope,
                 "range_1": range_1,
                 "body_ratio": body_ratio,
                 "upper_wick_ratio": upper_wick_ratio,
@@ -269,7 +350,7 @@ class EventExtractor:
         return events_df
 
 
-def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str) -> pd.Series:
+def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str, vwap_window: int) -> pd.Series:
     """
     VWAP fallback usando el método "validado" (pivot_price + HV con tick_volume).
 
@@ -299,8 +380,7 @@ def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str) -> pd.Ser
     if reset_mode not in {"daily", "session", "cumulative"}:
         raise ValueError("vwap_reset_mode must be 'daily', 'session', or 'cumulative'")
 
-    # Parámetros del método "validado"
-    vwap_win = 50  # puedes ajustar; aquí fijo por minimalismo
+    vwap_win = max(int(vwap_window), 1)
 
     def _compute_group(g: pd.DataFrame) -> pd.Series:
         hh = g["high"].rolling(vwap_win, min_periods=1).max()

@@ -1,7 +1,12 @@
 symbol: "XAUUSD.mg"
 event_scorer:
+  score_tf: "M5"
+  allow_tf: "H1"
   train_ratio: 0.8
   k_bars: 24
+  k_bars_by_tf:
+    M5: 24
+    M15: 8
   reward_r: 1.0
   sl_mult: 1.0
   r_thr: 0.0
@@ -40,6 +45,9 @@ event_scorer:
       trend_context_D1: false
       vol_context: false
     k_bars_grid: []
+    k_bars_grid_by_tf:
+      M5: []
+      M15: []
     diagnostics:
       max_family_concentration: 0.6
       min_temporal_dispersion: 0.3
