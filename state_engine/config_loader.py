@@ -79,9 +79,12 @@ def _validate_config(config: dict[str, Any]) -> None:
 
     _validate_float_range(event_cfg, "train_ratio", min_value=0.0, max_value=1.0, strict_min=True)
     _validate_positive_int(event_cfg, "k_bars")
+    _validate_tf_int_map(event_cfg, "k_bars_by_tf")
     _validate_positive_float(event_cfg, "reward_r")
     _validate_positive_float(event_cfg, "sl_mult")
     _validate_float_range(event_cfg, "r_thr", min_value=-10.0, max_value=10.0)
+    _validate_string(event_cfg, "score_tf")
+    _validate_string(event_cfg, "allow_tf")
 
     tie_break = event_cfg.get("tie_break")
     if tie_break is not None and tie_break not in {"distance", "worst"}:
@@ -155,6 +158,7 @@ def _validate_config(config: dict[str, Any]) -> None:
             for value in k_bars_grid:
                 if not isinstance(value, int) or value <= 0:
                     raise ValueError("research.k_bars_grid must contain positive integers.")
+        _validate_tf_int_list_map(research_cfg, "k_bars_grid_by_tf")
         diagnostics = research_cfg.get("diagnostics", {})
         if diagnostics is not None:
             if not isinstance(diagnostics, dict):
@@ -205,6 +209,43 @@ def _validate_positive_int(data: dict[str, Any], key: str) -> None:
         raise ValueError(f"{key} must be an integer.")
     if value <= 0:
         raise ValueError(f"{key} must be > 0.")
+
+
+def _validate_string(data: dict[str, Any], key: str) -> None:
+    if key not in data:
+        return
+    value = data[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string.")
+
+
+def _validate_tf_int_map(data: dict[str, Any], key: str) -> None:
+    if key not in data:
+        return
+    mapping = data[key]
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{key} must be a mapping.")
+    for tf_key, value in mapping.items():
+        if not isinstance(tf_key, str) or not tf_key.strip():
+            raise ValueError(f"{key} keys must be non-empty strings.")
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} values must be positive integers.")
+
+
+def _validate_tf_int_list_map(data: dict[str, Any], key: str) -> None:
+    if key not in data:
+        return
+    mapping = data[key]
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{key} must be a mapping.")
+    for tf_key, values in mapping.items():
+        if not isinstance(tf_key, str) or not tf_key.strip():
+            raise ValueError(f"{key} keys must be non-empty strings.")
+        if not isinstance(values, list):
+            raise ValueError(f"{key} values must be lists of positive integers.")
+        for value in values:
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{key} values must be lists of positive integers.")
 
 
 def _validate_decision_thresholds(thresholds: Any) -> None:

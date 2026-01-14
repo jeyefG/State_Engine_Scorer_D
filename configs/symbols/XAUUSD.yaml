@@ -1,7 +1,12 @@
 symbol: "XAUUSD.mg"
 event_scorer:
+  score_tf: "M5"
+  allow_tf: "H1"
   train_ratio: 0.8
   k_bars: 24
+  k_bars_by_tf:
+    M5: 24
+    M15: 8
   reward_r: 1.0
   sl_mult: 1.0
   r_thr: 0.0
@@ -49,6 +54,9 @@ event_scorer:
       # GRID PARAMÉTRICO BASE
       # -------------------------
       k_bars_grid: [12, 18, 24, 36]
+      k_bars_grid_by_tf:
+        M5: [12, 18, 24, 36]
+        M15: [4, 6, 8, 12]
     
       # -------------------------
       # THRESHOLD SWEEP

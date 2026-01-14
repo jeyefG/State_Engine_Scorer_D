@@ -9,6 +9,44 @@ import MetaTrader5 as mt5
 import pandas as pd
 
 
+_TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1,
+    "M2": mt5.TIMEFRAME_M2,
+    "M3": mt5.TIMEFRAME_M3,
+    "M4": mt5.TIMEFRAME_M4,
+    "M5": mt5.TIMEFRAME_M5,
+    "M6": mt5.TIMEFRAME_M6,
+    "M10": mt5.TIMEFRAME_M10,
+    "M12": mt5.TIMEFRAME_M12,
+    "M15": mt5.TIMEFRAME_M15,
+    "M20": mt5.TIMEFRAME_M20,
+    "M30": mt5.TIMEFRAME_M30,
+    "H1": mt5.TIMEFRAME_H1,
+    "H2": mt5.TIMEFRAME_H2,
+    "H3": mt5.TIMEFRAME_H3,
+    "H4": mt5.TIMEFRAME_H4,
+    "H6": mt5.TIMEFRAME_H6,
+    "H8": mt5.TIMEFRAME_H8,
+    "H12": mt5.TIMEFRAME_H12,
+    "D1": mt5.TIMEFRAME_D1,
+    "W1": mt5.TIMEFRAME_W1,
+    "MN1": mt5.TIMEFRAME_MN1,
+}
+
+
+def _normalize_timeframe(timeframe: str) -> str:
+    return str(timeframe).upper()
+
+
+def _resolve_timeframe(timeframe: str | int) -> tuple[int, str]:
+    if isinstance(timeframe, int):
+        return timeframe, str(timeframe)
+    key = _normalize_timeframe(timeframe)
+    if key not in _TIMEFRAME_MAP:
+        raise ValueError(f"Unsupported MT5 timeframe: {timeframe}")
+    return _TIMEFRAME_MAP[key], key
+
+
 @dataclass
 class MT5Connector:
     """Simple MT5 connector for OHLCV retrieval."""
@@ -20,6 +58,23 @@ class MT5Connector:
     def shutdown(self) -> None:
         mt5.shutdown()
 
+    def obtener_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str | int,
+        fecha_inicio: datetime,
+        fecha_fin: datetime,
+    ) -> pd.DataFrame:
+        """Obtener velas en el timeframe dado."""
+        timeframe_value, timeframe_label = _resolve_timeframe(timeframe)
+        rates = mt5.copy_rates_range(symbol, timeframe_value, fecha_inicio, fecha_fin)
+        if rates is None or len(rates) == 0:
+            raise RuntimeError(f"No se pudieron obtener datos {timeframe_label} desde MT5.")
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df.set_index("time", inplace=True)
+        return df
+
     def obtener_h1(
         self,
         symbol: str,
@@ -27,13 +82,7 @@ class MT5Connector:
         fecha_fin: datetime,
     ) -> pd.DataFrame:
         """Obtener velas H1 en el rango dado."""
-        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_H1, fecha_inicio, fecha_fin)
-        if rates is None or len(rates) == 0:
-            raise RuntimeError("No se pudieron obtener datos H1 desde MT5.")
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df.set_index("time", inplace=True)
-        return df
+        return self.obtener_ohlcv(symbol, "H1", fecha_inicio, fecha_fin)
 
     def obtener_m5(
         self,
@@ -42,13 +91,7 @@ class MT5Connector:
         fecha_fin: datetime,
     ) -> pd.DataFrame:
         """Obtener velas M5 en el rango dado."""
-        rates = mt5.copy_rates_range(symbol, mt5.TIMEFRAME_M5, fecha_inicio, fecha_fin)
-        if rates is None or len(rates) == 0:
-            raise RuntimeError("No se pudieron obtener datos M5 desde MT5.")
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df.set_index("time", inplace=True)
-        return df
+        return self.obtener_ohlcv(symbol, "M5", fecha_inicio, fecha_fin)
     
     def server_now(self, symbol: str) -> pd.Timestamp:
         """

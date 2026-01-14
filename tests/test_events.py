@@ -32,7 +32,7 @@ def test_events_schema_has_required_columns() -> None:
         "event_id",
         "dist_to_vwap",
         "abs_dist_to_vwap",
-        "vwap_slope_5",
+        "vwap_slope",
         "range_1",
         "body_ratio",
         "upper_wick_ratio",
@@ -122,7 +122,7 @@ def test_vwap_daily_reset() -> None:
         },
         index=idx,
     )
-    vwap = _compute_vwap(df_m5, vwap_col="vwap", reset_mode="daily")
+    vwap = _compute_vwap(df_m5, vwap_col="vwap", reset_mode="daily", vwap_window=50)
     assert vwap.iloc[2] == 200
 
 
