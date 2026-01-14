@@ -8,6 +8,8 @@ from scripts.train_event_scorer import (
     _research_guardrails,
     _build_research_summary_from_grid,
     _persist_research_outputs,
+    _effective_mode,
+    _resolve_baseline_thresholds,
 )
 from state_engine.events import EventDetectionConfig, EventExtractor
 from state_engine.scoring import EventScorerBundle
@@ -83,36 +85,54 @@ def test_research_outputs_persisted_only_in_research(tmp_path: Path) -> None:
     grid_results = pd.DataFrame(
         [
             {
-                "symbol": "TEST",
+                "variant_id": "thr_n80_rm0.02_p10-0.2_wr0.5_k24",
+                "variant_type": "thresholds_only",
                 "k_bars": 12,
-                "state": "BALANCE",
-                "family": "FAMILY_A",
-                "session_bucket": "LONDON",
-                "month_bucket": "2024-01",
-                "n": 250,
+                "n_min": 80,
+                "winrate_min": 0.5,
+                "r_mean_min": 0.02,
+                "p10_min": -0.2,
+                "n_total": 250,
+                "n_train": 150,
+                "n_test": 100,
                 "winrate": 0.6,
                 "r_mean": 0.12,
                 "p10": -0.05,
-                "lift_at_k": 1.2,
+                "lift10": 1.2,
+                "lift20": 1.3,
+                "lift50": 1.4,
+                "spearman": 0.1,
+                "family_concentration_top10": 0.4,
+                "temporal_dispersion": 0.5,
                 "score_tail_slope": 1.1,
                 "qualified": True,
                 "fail_reason": "",
+                "research_status": "RESEARCH_OK",
             },
             {
-                "symbol": "TEST",
+                "variant_id": "kbar_n200_rm0.02_p10-0.2_wr0.52_k36",
+                "variant_type": "kbars_only",
                 "k_bars": 24,
-                "state": "TREND",
-                "family": "FAMILY_B",
-                "session_bucket": "NY",
-                "month_bucket": "2024-02",
-                "n": 300,
+                "n_min": 200,
+                "winrate_min": 0.52,
+                "r_mean_min": 0.02,
+                "p10_min": -0.2,
+                "n_total": 300,
+                "n_train": 200,
+                "n_test": 100,
                 "winrate": 0.58,
                 "r_mean": 0.08,
                 "p10": -0.02,
-                "lift_at_k": 1.15,
+                "lift10": 1.15,
+                "lift20": 1.1,
+                "lift50": 1.05,
+                "spearman": 0.12,
+                "family_concentration_top10": 0.5,
+                "temporal_dispersion": 0.6,
                 "score_tail_slope": 1.05,
                 "qualified": True,
                 "fail_reason": "",
+                "research_status": "RESEARCH_OK",
             },
         ]
     )
@@ -122,39 +142,77 @@ def test_research_outputs_persisted_only_in_research(tmp_path: Path) -> None:
         "d1_anchor_hour": 0,
         "features": {"session_bucket": True},
         "k_bars_grid": [12, 24],
+        "exploration": {"enabled": True, "kind": "thresholds_only"},
     }
 
     _persist_research_outputs(
         model_dir=tmp_path,
         symbol="TEST",
+        allow_tf="H1",
+        score_tf="M5",
+        run_id="RID",
+        config_path=None,
         grid_results=grid_results,
+        family_results=None,
         summary_payload=summary,
         research_cfg=research_cfg,
         config_hash="abc123",
         prompt_version="v1",
+        baseline_thresholds={"n_min": 100, "winrate_min": 0.5, "r_mean_min": 0.02, "p10_min": -0.2},
+        baseline_thresholds_source="production",
         mode_suffix="_reas",
-        research_enabled=True,
+        research_mode=True,
+        mode="research",
     )
 
-    grid_path = tmp_path / "research_grid_results_TEST_reas.csv"
+    grid_path = tmp_path / "research_grid_results_TEST_M5_RID_reas.csv"
     assert grid_path.exists()
     assert len(pd.read_csv(grid_path)) > 1
 
-    summary_path = tmp_path / "research_summary_TEST_reas.json"
+    summary_path = tmp_path / "research_summary_TEST_M5_RID_reas.json"
     assert summary_path.exists()
 
     prod_dir = tmp_path / "prod"
     _persist_research_outputs(
         model_dir=prod_dir,
         symbol="TEST",
+        allow_tf="H1",
+        score_tf="M5",
+        run_id="RID",
+        config_path=None,
         grid_results=grid_results,
+        family_results=None,
         summary_payload=summary,
         research_cfg=research_cfg,
         config_hash="abc123",
         prompt_version="v1",
+        baseline_thresholds={"n_min": 100, "winrate_min": 0.5, "r_mean_min": 0.02, "p10_min": -0.2},
+        baseline_thresholds_source="production",
         mode_suffix="_prod",
-        research_enabled=False,
+        research_mode=False,
+        mode="production",
     )
 
-    prod_grid_path = prod_dir / "research_grid_results_TEST_prod.csv"
+    prod_grid_path = prod_dir / "research_grid_results_TEST_M5_RID_prod.csv"
     assert not prod_grid_path.exists()
+
+
+def test_effective_mode_falls_back_to_production() -> None:
+    research_cfg = {"enabled": False}
+
+    assert _effective_mode("research", research_cfg) == "production"
+    assert _effective_mode("production", research_cfg) == "production"
+
+
+def test_baseline_thresholds_cli_fallback() -> None:
+    config_payload = {"event_scorer": {"decision_thresholds": {}}}
+    args = type("Args", (), {})()
+    args.decision_n_min = 150
+    args.decision_winrate_min = 0.55
+    args.decision_r_mean_min = 0.01
+    args.decision_p10_min = -0.1
+
+    thresholds, source = _resolve_baseline_thresholds(config_payload, args)
+
+    assert source == "cli_fallback"
+    assert thresholds["n_min"] == 150
