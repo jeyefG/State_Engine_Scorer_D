@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.train_event_scorer import _resolve_vwap_report_mode, _save_model_if_ready, _research_guardrails
+from scripts.train_event_scorer import (
+    _resolve_vwap_report_mode,
+    _save_model_if_ready,
+    _research_guardrails,
+    _build_research_summary_from_grid,
+    _persist_research_outputs,
+)
 from state_engine.events import EventDetectionConfig, EventExtractor
 from state_engine.scoring import EventScorerBundle
 
@@ -71,3 +77,84 @@ def test_guardrails_flags_low_calib_samples() -> None:
 
     assert report.loc[0, "status"] == "RESEARCH_UNSTABLE"
     assert "LOW_CALIB_SAMPLES<200" in report.loc[0, "reasons"]
+
+
+def test_research_outputs_persisted_only_in_research(tmp_path: Path) -> None:
+    grid_results = pd.DataFrame(
+        [
+            {
+                "symbol": "TEST",
+                "k_bars": 12,
+                "state": "BALANCE",
+                "family": "FAMILY_A",
+                "session_bucket": "LONDON",
+                "month_bucket": "2024-01",
+                "n": 250,
+                "winrate": 0.6,
+                "r_mean": 0.12,
+                "p10": -0.05,
+                "lift_at_k": 1.2,
+                "score_tail_slope": 1.1,
+                "qualified": True,
+                "fail_reason": "",
+            },
+            {
+                "symbol": "TEST",
+                "k_bars": 24,
+                "state": "TREND",
+                "family": "FAMILY_B",
+                "session_bucket": "NY",
+                "month_bucket": "2024-02",
+                "n": 300,
+                "winrate": 0.58,
+                "r_mean": 0.08,
+                "p10": -0.02,
+                "lift_at_k": 1.15,
+                "score_tail_slope": 1.05,
+                "qualified": True,
+                "fail_reason": "",
+            },
+        ]
+    )
+    summary = _build_research_summary_from_grid(grid_results)
+    research_cfg = {
+        "enabled": True,
+        "d1_anchor_hour": 0,
+        "features": {"session_bucket": True},
+        "k_bars_grid": [12, 24],
+    }
+
+    _persist_research_outputs(
+        model_dir=tmp_path,
+        symbol="TEST",
+        grid_results=grid_results,
+        summary_payload=summary,
+        research_cfg=research_cfg,
+        config_hash="abc123",
+        prompt_version="v1",
+        mode_suffix="_reas",
+        research_enabled=True,
+    )
+
+    grid_path = tmp_path / "research_grid_results_TEST_reas.csv"
+    assert grid_path.exists()
+    assert len(pd.read_csv(grid_path)) > 1
+
+    summary_path = tmp_path / "research_summary_TEST_reas.json"
+    assert summary_path.exists()
+
+    prod_dir = tmp_path / "prod"
+    _persist_research_outputs(
+        model_dir=prod_dir,
+        symbol="TEST",
+        grid_results=grid_results,
+        summary_payload=summary,
+        research_cfg=research_cfg,
+        config_hash="abc123",
+        prompt_version="v1",
+        mode_suffix="_prod",
+        research_enabled=False,
+    )
+
+    prod_grid_path = prod_dir / "research_grid_results_TEST_prod.csv"
+    assert not prod_grid_path.exists()

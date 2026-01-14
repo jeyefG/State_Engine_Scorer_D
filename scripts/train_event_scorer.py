@@ -8,6 +8,7 @@ base rate. lift@K = precision@K / base_rate.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from contextlib import redirect_stderr, redirect_stdout
@@ -80,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=None, help="Ruta config YAML/JSON con overrides por símbolo")
     parser.add_argument(
         "--mode",
-        default="production",
-        choices=["research", "production"],
+        default="baseline",
+        choices=["baseline", "research", "production"],
         help="Modo de thresholds para reportes diagnósticos",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
@@ -235,6 +236,19 @@ def _with_suffix(path: Path, suffix: str) -> Path:
     if not suffix:
         return path
     return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
+
+def _safe_symbol(sym: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in sym)
+
+
+def _mode_suffix(mode: str) -> str:
+    mapping = {
+        "baseline": "_baseline",
+        "production": "_prod",
+        "research": "_reas",
+    }
+    return mapping.get(mode, "_baseline")
 
 
 def _format_interval(interval: pd.Interval | str) -> str:
@@ -688,6 +702,161 @@ def _session_bucket_series(
         index=events_index,
         name="pf_session_bucket",
     )
+
+
+def _month_bucket_series(events_index: pd.DatetimeIndex) -> pd.Series:
+    if events_index.empty:
+        return pd.Series([], index=events_index, name="month_bucket", dtype="object")
+    return events_index.to_period("M").astype(str).rename("month_bucket")
+
+
+def _research_fail_reason(row: pd.Series, thresholds: argparse.Namespace) -> tuple[bool, str]:
+    reasons: list[str] = []
+    for col in ("n", "winrate", "r_mean", "p10"):
+        if pd.isna(row[col]):
+            reasons.append("DIAGNOSTIC_FAIL")
+            break
+    if row["n"] < thresholds.decision_n_min:
+        reasons.append("N_TOO_LOW")
+    if row["winrate"] < thresholds.decision_winrate_min:
+        reasons.append("WINRATE_TOO_LOW")
+    if row["r_mean"] < thresholds.decision_r_mean_min:
+        reasons.append("R_MEAN_TOO_LOW")
+    if thresholds.decision_p10_min is not None and row["p10"] < thresholds.decision_p10_min:
+        reasons.append("P10_TOO_LOW")
+    qualified = len(reasons) == 0
+    return qualified, "|".join(reasons)
+
+
+def _build_research_grid_results(
+    events_df: pd.DataFrame,
+    symbol: str,
+    k_bars: int,
+    thresholds: argparse.Namespace,
+    session_bucket: pd.Series,
+    month_bucket: pd.Series,
+    lift_at_k: float | None,
+    score_tail_slope: float | None,
+) -> pd.DataFrame:
+    columns = [
+        "symbol",
+        "k_bars",
+        "state",
+        "family",
+        "session_bucket",
+        "month_bucket",
+        "n",
+        "winrate",
+        "r_mean",
+        "p10",
+        "lift_at_k",
+        "score_tail_slope",
+        "qualified",
+        "fail_reason",
+    ]
+    if events_df.empty:
+        return pd.DataFrame(columns=columns)
+    events_grid = events_df.copy()
+    events_grid["session_bucket"] = session_bucket.reindex(events_grid.index).fillna("UNKNOWN")
+    events_grid["month_bucket"] = month_bucket.reindex(events_grid.index).fillna("UNKNOWN")
+    grouped = events_grid.groupby(
+        ["state_label", "family_id", "session_bucket", "month_bucket"],
+        observed=True,
+    )
+    summary = grouped.agg(
+        n=("label", "size"),
+        winrate=("label", "mean"),
+        r_mean=("r_outcome", "mean"),
+        p10=("r_outcome", lambda s: s.quantile(0.1)),
+    ).reset_index()
+    summary = summary.rename(
+        columns={
+            "state_label": "state",
+            "family_id": "family",
+        }
+    )
+    summary["symbol"] = symbol
+    summary["k_bars"] = int(k_bars)
+    summary["lift_at_k"] = lift_at_k if lift_at_k is not None else np.nan
+    summary["score_tail_slope"] = score_tail_slope if score_tail_slope is not None else np.nan
+    qualified_flags = summary.apply(lambda row: _research_fail_reason(row, thresholds), axis=1)
+    summary["qualified"] = [flag for flag, _ in qualified_flags]
+    summary["fail_reason"] = [reason for _, reason in qualified_flags]
+    summary = summary[columns]
+    return summary
+
+
+def _build_research_summary_from_grid(grid_results: pd.DataFrame) -> dict[str, object]:
+    if grid_results.empty:
+        return {
+            "qualified_session_buckets": 0,
+            "top_5_candidate_cells_by_r_mean": [],
+            "verdict": "NO LOCAL EDGE DETECTED",
+        }
+    qualified_count = int(grid_results["qualified"].sum())
+    top_rows = (
+        grid_results.sort_values(["r_mean", "winrate", "n"], ascending=[False, False, False])
+        .head(5)
+        .reset_index(drop=True)
+    )
+    top_cells = (
+        top_rows[
+            [
+                "k_bars",
+                "state",
+                "family",
+                "session_bucket",
+                "month_bucket",
+                "n",
+                "winrate",
+                "r_mean",
+                "p10",
+            ]
+        ]
+        .to_dict(orient="records")
+    )
+    verdict = (
+        "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
+        if qualified_count > 0
+        else "NO LOCAL EDGE DETECTED"
+    )
+    return {
+        "qualified_session_buckets": qualified_count,
+        "top_5_candidate_cells_by_r_mean": top_cells,
+        "verdict": verdict,
+    }
+
+
+def _persist_research_outputs(
+    model_dir: Path,
+    symbol: str,
+    grid_results: pd.DataFrame,
+    summary_payload: dict[str, object],
+    research_cfg: dict,
+    config_hash: str | None,
+    prompt_version: str | None,
+    mode_suffix: str,
+    research_enabled: bool,
+) -> None:
+    if not research_enabled:
+        return
+    model_dir.mkdir(parents=True, exist_ok=True)
+    safe_symbol = _safe_symbol(symbol)
+    grid_path = model_dir / f"research_grid_results_{safe_symbol}{mode_suffix}.csv"
+    grid_results.to_csv(grid_path, index=False)
+    summary_path = model_dir / f"research_summary_{safe_symbol}{mode_suffix}.json"
+    payload = {
+        "qualified_session_buckets": summary_payload.get("qualified_session_buckets", 0),
+        "top_5_candidate_cells_by_r_mean": summary_payload.get("top_5_candidate_cells_by_r_mean", []),
+        "verdict": summary_payload.get("verdict", "NO LOCAL EDGE DETECTED"),
+        "d1_anchor_hour": research_cfg.get("d1_anchor_hour", 0),
+        "features_enabled": research_cfg.get("features", {}),
+        "k_bars_grid": research_cfg.get("k_bars_grid"),
+        "config_hash": config_hash,
+        "prompt_version": prompt_version,
+    }
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
 
 
 def _session_conditional_edge_table(
@@ -1244,9 +1413,10 @@ def _run_training_for_k(
     min_samples_train: int,
     seed: int,
     scorer_out_base: Path,
+    mode_suffix: str,
     research_enabled: bool,
     research_cfg: dict,
-) -> None:
+) -> pd.DataFrame | None:
     logger = logging.getLogger("event_scorer")
     print(
         "symbol={symbol} start={start} end={end} k_bars={k} reward_r={reward} sl_mult={sl} r_thr={thr} "
@@ -1294,7 +1464,19 @@ def _run_training_for_k(
         diagnostic_report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=args)
         if args.mode == "research":
             _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
-        return
+        if research_enabled:
+            empty_series = pd.Series([], index=events_diag.index, dtype="object")
+            return _build_research_grid_results(
+                events_df=pd.DataFrame(),
+                symbol=args.symbol,
+                k_bars=k_bars,
+                thresholds=args,
+                session_bucket=empty_series,
+                month_bucket=empty_series,
+                lift_at_k=None,
+                score_tail_slope=None,
+            )
+        return None
     logger.info("Labeled events by family:\n%s", events["family_id"].value_counts().to_string())
     logger.info("Labeled events by type:\n%s", events["event_type"].value_counts().to_string())
 
@@ -1502,7 +1684,20 @@ def _run_training_for_k(
             }
             print("\n[FALLBACK METRICS]")
             print(pd.DataFrame([summary]).to_string(index=False))
-        return
+        if research_enabled:
+            session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
+            month_bucket = _month_bucket_series(events_for_training.index)
+            return _build_research_grid_results(
+                events_df=events_for_training,
+                symbol=args.symbol,
+                k_bars=k_bars,
+                thresholds=args,
+                session_bucket=session_bucket,
+                month_bucket=month_bucket,
+                lift_at_k=None,
+                score_tail_slope=None,
+            )
+        return None
 
     event_features_all = feature_builder.add_family_features(
         event_features_all,
@@ -2071,13 +2266,15 @@ def _run_training_for_k(
     args.model_dir.mkdir(parents=True, exist_ok=True)
     if not metrics_df.empty:
         metrics_path = _with_suffix(
-            args.model_dir / f"metrics_{''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in args.symbol)}_event_scorer.csv",
+            args.model_dir
+            / f"metrics_{_safe_symbol(args.symbol)}_event_scorer{mode_suffix}.csv",
             output_suffix,
         )
         metrics_df.to_csv(metrics_path, index=False)
         logger.info("metrics_out=%s", metrics_path)
     family_path = _with_suffix(
-        args.model_dir / f"family_summary_{''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in args.symbol)}_event_scorer.csv",
+        args.model_dir
+        / f"family_summary_{_safe_symbol(args.symbol)}_event_scorer{mode_suffix}.csv",
         output_suffix,
     )
     family_summary.to_csv(family_path, index=False)
@@ -2092,7 +2289,7 @@ def _run_training_for_k(
         sample_df = sample_df.reset_index().rename(columns={sample_df.index.name or "index": "time"})
         sample_path = _with_suffix(
             args.model_dir
-            / f"calib_top_scored_{''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in args.symbol)}_event_scorer.csv",
+            / f"calib_top_scored_{_safe_symbol(args.symbol)}_event_scorer{mode_suffix}.csv",
             output_suffix,
         )
         sample_df.to_csv(sample_path, index=False)
@@ -2163,6 +2360,7 @@ def _run_training_for_k(
     }
 
     research_summary_payload = None
+    score_shape = pd.DataFrame()
     if research_enabled and preds_meta is not None and not y_calib.empty:
         diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
         score_shape = _score_shape_diagnostics(preds_meta, fam_calib, y_calib.index, [10, 20, 50])
@@ -2198,6 +2396,30 @@ def _run_training_for_k(
     if args.mode == "research":
         _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
 
+    lift_at_k = None
+    if metrics_summary and "lift@20" in metrics_summary:
+        lift_at_k = metrics_summary.get("lift@20")
+    score_tail_slope = None
+    if not score_shape.empty:
+        slope_match = score_shape.loc[score_shape["k"] == 20, "score_tail_slope"]
+        if not slope_match.empty:
+            score_tail_slope = float(slope_match.iloc[0])
+
+    if research_enabled:
+        session_bucket = _session_bucket_series(events_for_training.index, args.symbol, df_m5_ctx)
+        month_bucket = _month_bucket_series(events_for_training.index)
+        return _build_research_grid_results(
+            events_df=events_for_training,
+            symbol=args.symbol,
+            k_bars=k_bars,
+            thresholds=args,
+            session_bucket=session_bucket,
+            month_bucket=month_bucket,
+            lift_at_k=lift_at_k,
+            score_tail_slope=score_tail_slope,
+        )
+    return None
+
 
 def main() -> None:
     args = parse_args()
@@ -2205,12 +2427,15 @@ def main() -> None:
     min_samples_train = 200
     seed = 7
     research_cfg: dict[str, object] = {"enabled": False, "features": {}, "diagnostics": {}, "k_bars_grid": None}
+    config_hash = None
+    prompt_version = None
 
     config_path = args.config
+    config_payload = _default_symbol_config(args)
     if config_path is not None:
-        defaults = _default_symbol_config(args)
         overrides = load_config(config_path)
-        merged = deep_merge(defaults, overrides)
+        merged = deep_merge(config_payload, overrides)
+        config_payload = merged
 
         args.symbol = merged.get("symbol", args.symbol)
         event_cfg = merged.get("event_scorer", {})
@@ -2248,17 +2473,20 @@ def main() -> None:
             research_cfg = _resolve_research_config(merged, args.mode)
 
         logger.info("Loaded config overrides from %s (mode=%s)", config_path, args.mode)
+    if config_payload:
+        config_hash = hashlib.sha256(
+            json.dumps(config_payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        prompt_version = config_payload.get("prompt_version")
 
     research_enabled = bool(research_cfg.get("enabled", False))
+    mode_suffix = _mode_suffix(args.mode)
     k_bars_grid = research_cfg.get("k_bars_grid") if research_enabled else None
     if research_enabled and isinstance(k_bars_grid, list) and k_bars_grid:
         k_values = k_bars_grid
     else:
         k_values = [args.k_bars]
     multi_k = len(k_values) > 1
-
-    def _safe_symbol(sym: str) -> str:
-        return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in sym)
 
     model_path = args.state_model
     if model_path is None:
@@ -2413,9 +2641,10 @@ def main() -> None:
             ctx_sample,
         )
 
+    research_grid_frames: list[pd.DataFrame] = []
     for k_bars in k_values:
         output_suffix = f"_k{k_bars}" if multi_k else ""
-        _run_training_for_k(
+        grid_results = _run_training_for_k(
             args=args,
             k_bars=k_bars,
             output_suffix=output_suffix,
@@ -2434,8 +2663,28 @@ def main() -> None:
             min_samples_train=min_samples_train,
             seed=seed,
             scorer_out_base=scorer_out_base,
+            mode_suffix=mode_suffix,
             research_enabled=research_enabled,
             research_cfg=research_cfg,
+        )
+        if research_enabled and grid_results is not None:
+            research_grid_frames.append(grid_results)
+    if research_enabled:
+        if research_grid_frames:
+            combined_grid = pd.concat(research_grid_frames, ignore_index=True)
+        else:
+            combined_grid = pd.DataFrame()
+        research_summary = _build_research_summary_from_grid(combined_grid)
+        _persist_research_outputs(
+            model_dir=args.model_dir,
+            symbol=args.symbol,
+            grid_results=combined_grid,
+            summary_payload=research_summary,
+            research_cfg=research_cfg,
+            config_hash=config_hash,
+            prompt_version=prompt_version,
+            mode_suffix=mode_suffix,
+            research_enabled=research_enabled,
         )
     return
 
