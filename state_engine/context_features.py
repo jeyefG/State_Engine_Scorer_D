@@ -109,7 +109,7 @@ def _resolve_vwap_series(
     _LOGGER.warning(
         "VWAP not provided in ohlcv; computing proxy VWAP (mode=daily, window=50)."
     )
-    _LOGGER.warning("ohlcv.columns=%s", list(ohlcv.columns))
+    _LOGGER.debug("ohlcv.columns=%s", list(ohlcv.columns))
     try:
         vwap = _compute_vwap(
             ohlcv,
@@ -128,6 +128,88 @@ def _resolve_atr_series(ohlcv: pd.DataFrame, *, window: int) -> pd.Series:
         if col.lower() == "atr_h2":
             return pd.to_numeric(ohlcv[col], errors="coerce")
     return _atr(ohlcv["high"], ohlcv["low"], ohlcv["close"], window)
+
+
+def log_vwap_validation(
+    df: pd.DataFrame,
+    vwap: pd.Series | None,
+    atr: pd.Series | None,
+    group_key: pd.Series | None,
+    source: str,
+    reset_mode: str | None,
+    window: int,
+) -> None:
+    """Log sanity checks for VWAP-derived distances."""
+    if vwap is None:
+        _LOGGER.info(
+            "VWAP_VALIDATION source=%s reset_mode=%s window=%s vwap_nan_pct=100.00 atr_missing",
+            source,
+            reset_mode,
+            window,
+        )
+        return
+
+    vwap_nan_pct = vwap.isna().mean() * 100.0
+    if atr is None or atr.isna().all():
+        _LOGGER.info(
+            "VWAP_VALIDATION source=%s reset_mode=%s window=%s vwap_nan_pct=%.2f atr_missing",
+            source,
+            reset_mode,
+            window,
+            vwap_nan_pct,
+        )
+        return
+
+    close = pd.to_numeric(df["close"], errors="coerce")
+    denom = np.maximum(atr.to_numpy(), np.finfo(float).eps)
+    dist = (close - vwap).abs() / denom
+    dist_nan_pct = pd.Series(dist, index=close.index).isna().mean() * 100.0
+    dist_p50, dist_p90, dist_p99, dist_max = np.nanquantile(
+        dist, [0.5, 0.9, 0.99, 1.0]
+    )
+    _LOGGER.info(
+        "VWAP_VALIDATION source=%s reset_mode=%s window=%s vwap_nan_pct=%.2f "
+        "dist_nan_pct=%.2f dist_p50=%.4f dist_p90=%.4f dist_p99=%.4f dist_max=%.4f",
+        source,
+        reset_mode,
+        window,
+        vwap_nan_pct,
+        dist_nan_pct,
+        dist_p50,
+        dist_p90,
+        dist_p99,
+        dist_max,
+    )
+
+    if group_key is None:
+        return
+
+    dist_series = pd.Series(dist, index=close.index)
+    summary_rows = []
+    for bucket, values in dist_series.groupby(group_key):
+        values = values.dropna()
+        if values.empty:
+            continue
+        summary_rows.append(
+            {
+                "bucket": bucket,
+                "count": int(values.shape[0]),
+                "p50": float(values.quantile(0.5)),
+                "p90": float(values.quantile(0.9)),
+            }
+        )
+    if not summary_rows:
+        return
+
+    summary = pd.DataFrame(summary_rows).sort_values("count", ascending=False).head(4)
+    for _, row in summary.iterrows():
+        _LOGGER.info(
+            "VWAP_BUCKET_VALIDATION bucket=%s count=%d dist_p50=%.4f dist_p90=%.4f",
+            row["bucket"],
+            row["count"],
+            row["p50"],
+            row["p90"],
+        )
 
 
 def compute_dist_vwap_atr(
@@ -168,16 +250,31 @@ def build_context_features(
 
     session_bucket = compute_session_bucket(outputs.index)
     state_age = compute_state_age(outputs["state_hat"], max_age=cfg.max_state_age)
-    dist_vwap_atr = compute_dist_vwap_atr(
+    vwap = _resolve_vwap_series(
         ohlcv,
-        atr_window=cfg.atr_window,
         vwap_window=cfg.vwap_window,
-        vwap_reset_mode=cfg.vwap_reset_mode,
-        eps=cfg.eps,
+        reset_mode=cfg.vwap_reset_mode,
     )
+    atr = _resolve_atr_series(ohlcv, window=cfg.atr_window)
+    if vwap is None:
+        dist_vwap_atr = pd.Series(np.nan, index=ohlcv.index, name="ctx_dist_vwap_atr")
+    else:
+        close = pd.to_numeric(ohlcv["close"], errors="coerce")
+        denom = np.maximum(atr.to_numpy(), cfg.eps)
+        dist = (close - vwap).abs() / denom
+        dist_vwap_atr = pd.Series(dist, index=ohlcv.index, name="ctx_dist_vwap_atr")
     dist_vwap_atr = dist_vwap_atr.reindex(outputs.index)
     vwap_source = "provided" if _resolve_vwap_column(ohlcv) else "proxy_daily_50"
     vwap_source = pd.Series(vwap_source, index=outputs.index, name="ctx_vwap_source")
+    log_vwap_validation(
+        ohlcv,
+        vwap,
+        atr,
+        session_bucket.reindex(ohlcv.index),
+        vwap_source.iloc[0],
+        cfg.vwap_reset_mode,
+        cfg.vwap_window,
+    )
 
     return pd.concat([session_bucket, state_age, dist_vwap_atr, vwap_source], axis=1)
 
