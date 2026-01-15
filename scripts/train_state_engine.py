@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib
 import logging
 import math
 from dataclasses import asdict
@@ -359,6 +360,13 @@ def main() -> None:
         ctx_features = pd.DataFrame(index=outputs.index)
     else:
         ctx_features = ctx_features.reindex(outputs.index)
+    logger.info("ctx_features_cols=%s", list(ctx_features.columns))
+    logger.info("ctx_features_nonnull_tail=\n%s", ctx_features.tail(5).to_string())
+    ctx_cols = [col for col in ctx_features.columns if col.startswith("ctx_")]
+    if ctx_features.empty or not ctx_cols:
+        logger.warning(
+            "ctx_features empty or missing ctx_* columns; context gating filters will be inactive."
+        )
 
     # Extra reporting helpers
     state_hat_dist = class_distribution(outputs["state_hat"].to_numpy(), label_order)
@@ -367,6 +375,12 @@ def main() -> None:
     reentry_p = percentiles(full_features["ReentryCount"], q_list) if "ReentryCount" in full_features.columns else {str(q): None for q in q_list}
 
     stage_start = step("gating")
+    logger.info("gating_module=%s", GatingPolicy.__module__)
+    gating_mod = importlib.import_module(GatingPolicy.__module__)
+    logger.info("gating_file=%s", getattr(gating_mod, "__file__", None))
+    logger.info("context_features_module=%s", build_context_features.__module__)
+    context_mod = importlib.import_module(build_context_features.__module__)
+    logger.info("context_features_file=%s", getattr(context_mod, "__file__", None))
     gating_policy = GatingPolicy()
     features_for_gating = full_features.join(ctx_features, how="left")
     gating = gating_policy.apply(outputs, features_for_gating)
@@ -477,11 +491,22 @@ def main() -> None:
     gating_block_rate = 1.0 - gating_allow_rate
     elapsed_gating = step_done(stage_start)
     logger.info("gating_allow_rate=%.2f%% elapsed=%.2fs", gating_allow_rate * 100, elapsed_gating)
-    logger.info("gating_thresholds=%s", asdict(gating_policy.thresholds))
+    gating_thresholds = asdict(gating_policy.thresholds)
+    logger.info("gating_thresholds=%s", gating_thresholds)
+    required_threshold_fields = {
+        "allowed_sessions",
+        "state_age_min",
+        "state_age_max",
+        "dist_vwap_atr_min",
+        "dist_vwap_atr_max",
+    }
+    if not required_threshold_fields.issubset(gating_thresholds.keys()):
+        logger.error(
+            "Loaded gating.py does not include context thresholds fields. Check PYTHONPATH / repo root."
+        )
 
-    if not ctx_features.empty:
+    if ctx_cols:
         allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
-        ctx_cols = [col for col in ctx_features.columns if col.startswith("ctx_")]
         debug_frame = (
             outputs[["state_hat", "margin"]]
             .join(ctx_features[ctx_cols], how="left")
@@ -489,6 +514,8 @@ def main() -> None:
             .join(gating[allow_cols], how="left")
         )
         logger.info("[CTX DIAGNOSTIC TABLE] last_rows=10\n%s", debug_frame.tail(10).to_string())
+    else:
+        logger.warning("ctx_features missing ctx_* columns; skipping ctx diagnostic table.")
 
     stage_start = step("save_model")
     metadata = {
