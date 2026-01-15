@@ -1,33 +1,62 @@
-# AGENTS.md — State Engine (PA-first) + Event Scorer (telemetry-first)
+# AGENTS.md — State Engine + Quality Layer (descriptivo-first)
 
-## Propósito
-Este repositorio implementa un **State Engine** para trading discrecional / semisistemático basado en **Price Action (PA)**.  
-Su objetivo es **clasificar el estado estructural del mercado en H1** y **habilitar/prohibir familias de setups** mediante reglas explícitas (`ALLOW_*`), reduciendo errores estructurales, ruido cognitivo y sobre–operación.
+## Propósito (actualizado – Fase C)
 
-El sistema **NO predice dirección next-bar**.  
-Gobierna **cuándo existen condiciones estructurales válidas** para que un trade direccional sea considerado.
+Este repositorio implementa un **State Engine** cuyo rol es
+**clasificar el estado estructural del mercado** de forma robusta, causal y generalizable.
 
-## Decisiones de diseño (NO negociables)
+El sistema se organiza en **capas conceptualmente separadas**:
 
-### Separación estricta de capas
-- **ML = percepción** (clasificar estado / medir edge).
-- **Reglas = decisión** (gating / habilitación).
-- **Ejecución = determinista**, externa al ML.
-- El ML **no toma decisiones operativas**.
+### 1. State Layer (existente, estable)
+- Clasifica el mercado en:
+  - `BALANCE`
+  - `TRANSITION`
+  - `TREND`
+- No predice dirección, retorno ni timing.
+- No se redefine ni se optimiza en Fase C.
 
-### Métrica principal
-- **Expectancy y drawdown** condicionados por **estado** y **familia**.
-- Accuracy / F1 / AUC son **diagnósticos**, no objetivos.
+### 2. Quality Layer (nueva – Fase C)
+- Capa **estrictamente descriptiva**, condicionada al estado base.
+- Caracteriza la **calidad interna del régimen**:
+  - estabilidad
+  - coherencia
+  - fricción
+  - degradación
+- **NO genera señales**
+- **NO habilita ni prohíbe trades**
+- **NO se valida con métricas económicas**
+- Su objetivo es **reducir incertidumbre contextual**, no crear edge.
 
-### TRANSICIÓN es crítica
-- `TRANSITION` **prohíbe swing direccional por defecto**.
-- Solo habilita tácticos de tipo **failure / reclaim**.
-- Operar direccionalmente en `TRANSITION` sin evidencia explícita es **error estructural**.
+### 3. Capas operativas (fuera de scope de Fase C)
+- Gating (`ALLOW_*`)
+- Event Scorer (M5)
+- Ejecución, SL/TP, backtesting, performance
 
-### Complejidad controlada
-- H1: máx. ~10–12 features **PA-first**.
-- Si se requieren más, la definición del problema está mal.
-- M5 puede ser más rico, pero **siempre condicionado por H1**.
+**Fase C se enfoca exclusivamente en la Quality Layer.**
+
+---
+
+## Principios epistemológicos — Fase C (NO negociables)
+
+- Las Quality Labels son:
+  - descriptivas, no predictivas
+  - humanas y visualizables
+  - condicionadas al estado base
+- Ninguna Quality Label se valida usando:
+  - EV
+  - PnL
+  - winrate
+  - payoff
+  - drawdown
+- Se prefiere:
+  - falsos negativos > falsos positivos
+  - no clasificar > clasificar mal
+- “No clasificado” es un output válido.
+- Si no hay evidencia estructural clara, se declara explícitamente.
+- La estabilidad temporal y la coherencia lógica
+  son más importantes que la cobertura.
+- La Quality Layer **no rescata estados malos**
+  ni fuerza interpretaciones.
 
 ---
 
@@ -42,233 +71,158 @@ scripts/
 train_state_engine.py
 train_event_scorer.py
 run_pipeline_backtest.py
-run_walkforward_backtest.py
-run_batch_walkforward.py
-run_som_backtest_batch.py
-summarize_event_scorers.py
 watchdog_state_engine.py
-watchdog_state_engine_whatsapp.py
+...
 
 state_engine/
-backtest.py
-config_loader.py
-events.py
+pipeline.py
 features.py
-gating.py
 labels.py
 model.py
-mt5_connector.py
-pipeline.py
+gating.py
 scoring.py
 session.py
-sweep.py
-transition_shadow.py
-walkforward.py
+mt5_connector.py
+...
 
 tests/
-test_config_loader.py
-test_diagnostic_report.py
-test_events.py
 test_features.py
-test_session_bucket.py
-test_train_event_scorer.py
-test_walkforward.py
+test_events.py
+test_config_loader.py
+...
+
+**Nota**  
+La infraestructura se reutiliza.  
+La lógica conceptual previa no se asume válida para Fase C.
 
 ---
 
-## Scope reutilizable del repo previo
-Se recicla **infraestructura**, no lógica:
-- `MT5Connector` (OHLCV).
-- Utilidades de calendario / sesión / timezone.
-- Infra mínima de dataset (resampling, NaN, persistencia).
-- Persistencia de modelos.
+## State Engine (State Layer)
 
-Todo lo demás es **legado conceptual**.
+### Definición general
+- **Timeframe:** H1 (o H2 según símbolo, ya validado en Fases A/B)
+- **Ventanas fijas (ejemplo):**
+  - `W`: contexto
+  - `N`: reciente
+- El estado se define por **comportamiento agregado**, no por patrones aislados.
 
----
-
-## State Engine (H1)
-
-### Definición de estado
-**Timeframe:** H1
-
-**Ventanas fijas**
-- `W = 24` velas (contexto)
-- `N = 8` velas (reciente)
-
-**Estados**
-- **BALANCE**: rotación, aceptación bilateral.
-- **TRANSITION**: intento de salida con aceptación incompleta o fallo.
-- **TREND**: migración sostenida con aceptación.
-
-**Regla maestra**  
-El estado se define por **comportamiento agregado**, no por patrones aislados.
-
-### Normalización por volatilidad
-- `ATR_W = ATR(t-W .. t)`
-- `ATR_N = ATR(t-N .. t)`
-
-Contexto → `ATR_W`  
-Ruptura / reciente → `ATR_N`
+### Estados
+- `BALANCE`: rotación y aceptación bilateral.
+- `TRANSITION`: intento de cambio con aceptación incompleta o fallo.
+- `TREND`: migración sostenida con aceptación.
 
 ### Variables PA-first (≤ t)
 - NetMove (diagnóstico)
 - Path
 - Efficiency Ratio (ER)
-- Range_W
-- CloseLocation
-- BreakMag
-- ReentryCount
-- InsideBarsRatio
-- SwingCount
-- Pendientes opcionales (ER, Range)
+- Range
+- Close Location
+- Break Magnitude
+- Reentry Count
+- Inside Bars Ratio
+- Swing Count
+
+**Importante**
+- El State Engine NO se especializa por símbolo en Fase C.
+- Su semántica se mantiene universal.
 
 ---
 
-## Modelo State Engine
-- **Modelo:** LightGBM multiclass
-- **Outputs:** `state_hat`, `margin = P1 − P2`, probas (solo reporting)
-
-Notas:
-- No se asume calibración perfecta.
-- Gating usa `state_hat + margin`, no probas crudas.
-
----
-
-## Gating determinista (ALLOW_*)
-- Lógica explícita, auditable.
-- No entrenable.
-
-Ejemplos:
-- `ALLOW_trend_pullback`: TREND & margin ≥ umbral
-- `ALLOW_balance_fade`: BALANCE & margin ≥ umbral
-- `ALLOW_transition_failure`: TRANSITION + condiciones explícitas
-
-**Regla crítica**  
-`TRANSITION` prohíbe swing direccional por defecto.
-
----
-
-## Event Scorer (M5) — Edge, no señal
+## Quality Layer (Fase C)
 
 ### Rol
-Medir **edge relativo** de eventos M5 condicionado por contexto H1.
+Describir la **calidad interna del estado**, sin inferir outcome.
 
-### Input
-- Eventos M5 (proposal engine).
-- Contexto H1: `state_hat_H1`, `margin_H1`, `ALLOW_*`.
+Ejemplos de intención (no exhaustivos):
+- Fortaleza vs debilidad
+- Expansión vs compresión
+- Continuidad vs fricción
+- Aceptación vs rechazo
 
-### Output
-- `edge_score ∈ [0,1]` (ranking / telemetría).
+### Propiedades requeridas de una Quality Label
+Una Quality Label es válida solo si cumple:
+- coherencia lógica con el estado base
+- distribución no degenerada
+- persistencia temporal razonable
+- estabilidad por splits temporales
+- independencia total del resultado económico
 
-**Prohibiciones**
-- NO señales.
-- NO trading.
-- NO SL/TP.
-- NO decisiones operativas.
-
----
-
-## Filosofía de eventos M5
-
-### detect_events (proposal engine)
-- Prioriza recall.
-- Genera eventos solo si `ALLOW_*` activo.
-- Adjunta features de fuerza/contexto.
-
-### label_events
-- Triple-barrier proxy → `r_outcome` continuo.
-- Label binario derivado con umbral configurable.
-- Conservador en empates TP/SL.
+Si una label es “bonita” pero inestable → se descarta.  
+Si es rara pero clara → se conserva.
 
 ---
 
-## Puente H1 → M5 (causal)
-- Solo último H1 **cerrado**.
-- Implementación: `shift(1)` + `merge_asof(backward)`.
-- Prohibido usar H1 en formación (leakage grave).
+## Configuración por símbolo — alcance real
+
+La configuración por símbolo en Fase C existe para:
+- ajustar parámetros descriptivos
+- definir umbrales estructurales
+- adaptar normalizaciones o escalas
+
+La configuración por símbolo **NO existe** para:
+- optimizar performance
+- redefinir estados
+- forzar cobertura de labels
+- introducir lógica operativa
+
+La especialización por símbolo:
+- es **paramétrica**
+- es **descriptiva**
+- **no reentrena** el State Engine
 
 ---
 
-## Entrenamiento Event Scorer
+## ALLOWs (estado actual — legado)
 
-- Modelos LightGBM binarios por familia.
-- Fallback a modelo global si muestras insuficientes.
+Los `ALLOW_*` existentes pertenecen a una fase previa del proyecto.
 
-**Métricas diagnósticas**
-- `lift@K`, `r_mean@K`, `precision@K`.
-- Breakdown por familia, estado, bins de margin.
+- Son reglas genéricas cross-símbolo.
+- No forman parte del foco de Fase C.
+- No deben:
+  - extenderse
+  - especializarse
+  - optimizarse
+durante esta fase.
 
----
-
-## Configuración por símbolo y modos
-
-Ubicación:
-configs/symbols/
-_template.yaml
-XAUUSD.yaml
-
----
-
-Modos soportados:
-- **default/original** (sin config)
-- **production**
-- **research**
-
-### Regla de oro
-Si `research.enabled == false`:
-- comportamiento
-- métricas
-- artefactos  
-deben ser **equivalentes al modo original**.
+En Fase C:
+- Los ALLOWs se consideran **artefactos heredados**.
+- Pueden ser ignorados o desactivados conceptualmente.
+- Su rediseño (si ocurre) es posterior
+  a la validación completa de la Quality Layer.
 
 ---
 
-## Research mode (opt-in, diagnóstico)
+## Event Scorer (fuera de scope de Fase C)
 
-Research **NO mejora producción automáticamente**.  
-Sirve para **explorar edge y score-shape**.
+- Opera en M5.
+- Mide edge relativo condicionado por contexto H1.
+- Produce `edge_score` como telemetría.
+- No genera señales ni decisiones.
 
-### Capacidades (solo research)
-- Features exógenas:
-  - session_bucket
-  - hour_bucket
-  - trend_context_D1
-  - vol_context
-- Exploración multi-k:
-  - `k_bars_grid: [12,24,36]`
-  - artefactos con sufijo `_k{K}`
-
-### Guardrails diagnósticos
-- `RESEARCH_OK`
-- `RESEARCH_UNSTABLE`
-- `RESEARCH_OVERFIT_SUSPECT`
-
-No afectan decisiones ni entrenamiento productivo.
-
-**Nota D1**
-- D1 basado en día calendario puede ser inestable según timezone.
-- Research debe advertir si aplica.
+Cualquier modificación al Event Scorer
+queda explícitamente fuera de Fase C.
 
 ---
 
-## Backtesting
-- Determinista (M5).
-- Entry: next_open.
-- SL/TP con OHLC (SL primero).
-- Fees/slippage configurables.
-- Walk-forward mensual.
-- `allow_overlap = False`.
+## Fuera de scope — Fase C
+
+- Optimización por performance.
+- Nuevos ALLOWs.
+- Reglas de entrada/salida.
+- Ajustes al Event Scorer.
+- Cambios en ejecución o SL/TP.
+- Automatización de decisiones de trading.
+
+Cualquier propuesta que cruce estos límites
+debe considerarse **inválida** en esta fase.
 
 ---
 
-## Resultado esperado
+## Resultado esperado de Fase C
+
 Un sistema que:
-- Clasifica estado con robustez.
-- Habilita/prohíbe familias explícitamente.
-- Genera abundancia controlada de oportunidades.
-- Prioriza edge, supervivencia y disciplina.
-- Reduce errores estructurales.
-
-**Regla final:**  
-Convertir `edge_score` en señal directa **rompe el diseño del sistema**.
+- Clasifica estados de forma robusta (ya logrado).
+- Describe la **calidad** de esos estados sin sesgo económico.
+- Reduce incertidumbre contextual.
+- Tolera explícitamente el “no sé”.
+- Protege la integridad epistemológica del sistema.
