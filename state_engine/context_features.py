@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,7 @@ import pandas as pd
 
 _SESSION_BUCKETS = ("ASIA", "LONDON", "NY", "NY_PM")
 _XAU_SYMBOLS = {"XAUUSD"}
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,8 @@ class ContextFeatureConfig:
 
     max_state_age: int = 12
     atr_window: int = 14
+    vwap_window: int = 50
+    vwap_reset_mode: str | None = None
     eps: float = 1e-9
 
 
@@ -82,11 +86,42 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.S
     return tr.rolling(window).mean()
 
 
-def _resolve_vwap_column(ohlcv: pd.DataFrame) -> str:
+def _resolve_vwap_column(ohlcv: pd.DataFrame) -> str | None:
     for col in ("vwap", "VWAP"):
         if col in ohlcv.columns:
             return col
-    raise ValueError("Missing VWAP column required for ctx_dist_vwap_atr.")
+    return None
+
+
+def _resolve_vwap_series(
+    ohlcv: pd.DataFrame,
+    *,
+    vwap_window: int,
+    reset_mode: str | None,
+) -> pd.Series | None:
+    from .events import _compute_vwap, _resolve_vwap_reset_mode
+
+    vwap_col = _resolve_vwap_column(ohlcv)
+    if vwap_col is not None:
+        return pd.to_numeric(ohlcv[vwap_col], errors="coerce")
+
+    effective_mode = _resolve_vwap_reset_mode(ohlcv, reset_mode)
+    try:
+        vwap = _compute_vwap(
+            ohlcv,
+            vwap_col="vwap",
+            reset_mode=effective_mode,
+            vwap_window=vwap_window,
+        )
+    except ValueError as exc:
+        _LOGGER.warning("VWAP missing for ctx_dist_vwap_atr; skipping (%s).", exc)
+        return None
+    _LOGGER.warning(
+        "VWAP missing for ctx_dist_vwap_atr; computed fallback (mode=%s, window=%s).",
+        effective_mode,
+        vwap_window,
+    )
+    return pd.to_numeric(vwap, errors="coerce")
 
 
 def _resolve_atr_series(ohlcv: pd.DataFrame, *, window: int) -> pd.Series:
@@ -100,11 +135,18 @@ def compute_dist_vwap_atr(
     ohlcv: pd.DataFrame,
     *,
     atr_window: int,
+    vwap_window: int,
+    vwap_reset_mode: str | None,
     eps: float,
 ) -> pd.Series:
     """Compute absolute distance to VWAP normalized by ATR."""
-    vwap_col = _resolve_vwap_column(ohlcv)
-    vwap = pd.to_numeric(ohlcv[vwap_col], errors="coerce")
+    vwap = _resolve_vwap_series(
+        ohlcv,
+        vwap_window=vwap_window,
+        reset_mode=vwap_reset_mode,
+    )
+    if vwap is None:
+        return pd.Series(np.nan, index=ohlcv.index, name="ctx_dist_vwap_atr")
     atr = _resolve_atr_series(ohlcv, window=atr_window)
     close = pd.to_numeric(ohlcv["close"], errors="coerce")
     denom = np.maximum(atr.to_numpy(), eps)
@@ -127,7 +169,13 @@ def build_context_features(
 
     session_bucket = compute_session_bucket(outputs.index)
     state_age = compute_state_age(outputs["state_hat"], max_age=cfg.max_state_age)
-    dist_vwap_atr = compute_dist_vwap_atr(ohlcv, atr_window=cfg.atr_window, eps=cfg.eps)
+    dist_vwap_atr = compute_dist_vwap_atr(
+        ohlcv,
+        atr_window=cfg.atr_window,
+        vwap_window=cfg.vwap_window,
+        vwap_reset_mode=cfg.vwap_reset_mode,
+        eps=cfg.eps,
+    )
     dist_vwap_atr = dist_vwap_atr.reindex(outputs.index)
 
     return pd.concat([session_bucket, state_age, dist_vwap_atr], axis=1)
