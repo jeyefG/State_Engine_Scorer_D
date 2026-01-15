@@ -27,6 +27,12 @@ from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel, StateEngineModelConfig
 from state_engine.mt5_connector import MT5Connector
 from state_engine.pipeline import DatasetBuilder
+from state_engine.quality import (
+    assign_quality_labels,
+    build_quality_diagnostics,
+    format_quality_diagnostics,
+    load_quality_config,
+)
 
 
 
@@ -76,6 +82,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-rich", action="store_true", help="Disable rich console output")
     parser.add_argument("--report-out", type=Path, help="Optional report output path (.json)")
     parser.add_argument("--class-weight-balanced", action="store_true", help="Use class_weight='balanced' in LightGBM")
+    parser.add_argument("--quality", action="store_true", help="Enable Quality Layer labeling (Phase C)")
+    parser.add_argument(
+        "--quality-config",
+        type=Path,
+        default=None,
+        help="Optional Quality Layer config path (YAML/JSON)",
+    )
     return parser.parse_args()
 
 
@@ -313,6 +326,27 @@ def main() -> None:
     outputs = model.predict_outputs(features)
     elapsed_outputs = step_done(stage_start)
     logger.info("outputs_rows=%s elapsed=%.2fs", len(outputs), elapsed_outputs)
+
+    if args.quality:
+        quality_config, quality_sources, quality_warnings = load_quality_config(
+            args.symbol,
+            args.quality_config,
+        )
+        quality_features = full_features.reindex(outputs.index)
+        quality_labels, quality_warnings_assign = assign_quality_labels(
+            outputs["state_hat"],
+            quality_features,
+            quality_config,
+        )
+        outputs["quality_label"] = quality_labels
+        diagnostics = build_quality_diagnostics(
+            outputs["state_hat"],
+            quality_labels,
+            quality_sources,
+            [*quality_warnings, *quality_warnings_assign],
+        )
+        for line in format_quality_diagnostics(diagnostics):
+            logger.info(line)
 
     # Extra reporting helpers
     state_hat_dist = class_distribution(outputs["state_hat"].to_numpy(), label_order)
