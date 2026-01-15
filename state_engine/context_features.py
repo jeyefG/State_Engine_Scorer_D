@@ -122,13 +122,19 @@ def _resolve_vwap_series(
         vwap_window,
     )
     _LOGGER.debug("ohlcv.columns=%s", list(ohlcv.columns))
-    vwap = _compute_standard_vwap(ohlcv, day_anchor=vwap_day_anchor)
+    vwap = _compute_standard_vwap(
+        ohlcv,
+        day_anchor=vwap_day_anchor,
+        vwap_window=vwap_window,
+    )
     if vwap is None:
         return None
     return pd.to_numeric(vwap, errors="coerce")
 
 
-def _resolve_volume_series(ohlcv: pd.DataFrame) -> pd.Series | None:
+def _resolve_volume_series(
+    ohlcv: pd.DataFrame,
+) -> tuple[pd.Series | None, str, float, float]:
     real_volume = None
     if "real_volume" in ohlcv.columns:
         real_volume = pd.to_numeric(ohlcv["real_volume"], errors="coerce")
@@ -136,15 +142,29 @@ def _resolve_volume_series(ohlcv: pd.DataFrame) -> pd.Series | None:
     if "tick_volume" in ohlcv.columns:
         tick_volume = pd.to_numeric(ohlcv["tick_volume"], errors="coerce")
     if tick_volume is None and real_volume is None:
-        return None
+        return None, "missing", 100.0, 100.0
     if real_volume is None:
-        return tick_volume
-    if tick_volume is None:
-        return real_volume
-    return pd.Series(
-        np.where(real_volume > 0, real_volume, tick_volume),
-        index=ohlcv.index,
-    )
+        vol_raw = tick_volume
+        source = "tick_volume"
+    elif tick_volume is None:
+        vol_raw = real_volume
+        source = "real_volume"
+    else:
+        real_mask = real_volume > 0
+        vol_raw = pd.Series(
+            np.where(real_mask, real_volume, tick_volume),
+            index=ohlcv.index,
+        )
+        if real_mask.any() and (~real_mask).any():
+            source = "mixed"
+        elif real_mask.any():
+            source = "real_volume"
+        else:
+            source = "tick_volume"
+    pre_zero_pct = float((vol_raw.fillna(0).eq(0)).mean() * 100.0)
+    vol = vol_raw.astype(float).clip(lower=1.0)
+    post_zero_pct = float(vol.eq(0).mean() * 100.0)
+    return vol, source, pre_zero_pct, post_zero_pct
 
 
 def _day_id(index: pd.DatetimeIndex, anchor: str) -> pd.Series:
@@ -169,20 +189,42 @@ def _day_id(index: pd.DatetimeIndex, anchor: str) -> pd.Series:
     raise ValueError(f"Unknown vwap_day_anchor: {anchor}")
 
 
-def _compute_standard_vwap(ohlcv: pd.DataFrame, *, day_anchor: str) -> pd.Series | None:
-    vol = _resolve_volume_series(ohlcv)
+def _compute_standard_vwap(
+    ohlcv: pd.DataFrame,
+    *,
+    day_anchor: str,
+    vwap_window: int,
+) -> pd.Series | None:
+    vol, _, _, _ = _resolve_volume_series(ohlcv)
     if vol is None:
         _LOGGER.warning("VWAP missing for ctx_dist_vwap_atr; skipping (no volume column).")
         return None
-    high = pd.to_numeric(ohlcv["high"], errors="coerce")
-    low = pd.to_numeric(ohlcv["low"], errors="coerce")
-    close = pd.to_numeric(ohlcv["close"], errors="coerce")
-    tp = (high + low + close) / 3.0
+
+    vwap_win = max(int(vwap_window), 1)
     day_id = _day_id(ohlcv.index, day_anchor)
-    pv = tp * vol
-    cum_pv = pv.groupby(day_id).cumsum()
-    cum_vol = vol.groupby(day_id).cumsum().replace(0, np.nan)
-    return (cum_pv / cum_vol).rename("vwap")
+
+    df = pd.DataFrame(
+        {
+            "high": pd.to_numeric(ohlcv["high"], errors="coerce"),
+            "low": pd.to_numeric(ohlcv["low"], errors="coerce"),
+            "close": pd.to_numeric(ohlcv["close"], errors="coerce"),
+            "_vol": vol,
+        },
+        index=ohlcv.index,
+    )
+
+    def _compute_group(group: pd.DataFrame) -> pd.Series:
+        hh = group["high"].rolling(vwap_win, min_periods=1).max()
+        ll = group["low"].rolling(vwap_win, min_periods=1).min()
+        hv = group["_vol"].rolling(vwap_win, min_periods=1).max().clip(lower=1.0)
+        pivot_price = (hh + ll + group["close"]) / 3.0
+        cum_vol = hv.cumsum()
+        cum_pv = (pivot_price * hv).cumsum()
+        return cum_pv / cum_vol
+
+    return df.groupby(day_id, sort=False, group_keys=False).apply(_compute_group).rename(
+        "vwap"
+    )
 
 
 def _resolve_atr_series(ohlcv: pd.DataFrame, *, window: int) -> pd.Series:
@@ -203,22 +245,33 @@ def log_vwap_validation(
     window: int,
 ) -> None:
     """Log sanity checks for VWAP-derived distances."""
+    _, vol_source, vol_zero_pct_pre, vol_zero_pct_post = _resolve_volume_series(df)
     if vwap is None:
         _LOGGER.info(
-            "VWAP_VALIDATION source=%s anchor=%s window=%s vwap_nan_pct=100.00 atr_missing",
+            "VWAP_VALIDATION source=%s anchor=%s window=%s vol_source=%s "
+            "vol_zero_pct_pre_clip=%.2f vol_zero_pct_post_clip=%.2f "
+            "vwap_nan_pct=100.00 atr_missing",
             source,
             anchor,
             window,
+            vol_source,
+            vol_zero_pct_pre,
+            vol_zero_pct_post,
         )
         return
 
     vwap_nan_pct = vwap.isna().mean() * 100.0
     if atr is None or atr.isna().all():
         _LOGGER.info(
-            "VWAP_VALIDATION source=%s anchor=%s window=%s vwap_nan_pct=%.2f atr_missing",
+            "VWAP_VALIDATION source=%s anchor=%s window=%s vol_source=%s "
+            "vol_zero_pct_pre_clip=%.2f vol_zero_pct_post_clip=%.2f "
+            "vwap_nan_pct=%.2f atr_missing",
             source,
             anchor,
             window,
+            vol_source,
+            vol_zero_pct_pre,
+            vol_zero_pct_post,
             vwap_nan_pct,
         )
         return
@@ -231,11 +284,16 @@ def log_vwap_validation(
         dist, [0.5, 0.9, 0.99, 1.0]
     )
     _LOGGER.info(
-        "VWAP_VALIDATION source=%s anchor=%s window=%s vwap_nan_pct=%.2f "
-        "dist_nan_pct=%.2f dist_p50=%.4f dist_p90=%.4f dist_p99=%.4f dist_max=%.4f",
+        "VWAP_VALIDATION source=%s anchor=%s window=%s vol_source=%s "
+        "vol_zero_pct_pre_clip=%.2f vol_zero_pct_post_clip=%.2f "
+        "vwap_nan_pct=%.2f dist_nan_pct=%.2f dist_p50=%.4f dist_p90=%.4f "
+        "dist_p99=%.4f dist_max=%.4f",
         source,
         anchor,
         window,
+        vol_source,
+        vol_zero_pct_pre,
+        vol_zero_pct_post,
         vwap_nan_pct,
         dist_nan_pct,
         dist_p50,
@@ -243,6 +301,23 @@ def log_vwap_validation(
         dist_p99,
         dist_max,
     )
+    if vwap_nan_pct > 5.0 or dist_nan_pct > 5.0:
+        if vol_zero_pct_pre > 0.0:
+            cause = "volume_zero_pre_clip"
+        elif vol_source == "missing":
+            cause = "missing_volume"
+        else:
+            cause = "vwap_nan_regression"
+        _LOGGER.warning(
+            "VWAP_INVALID source=%s anchor=%s window=%s vwap_nan_pct=%.2f "
+            "dist_nan_pct=%.2f cause=%s",
+            source,
+            anchor,
+            window,
+            vwap_nan_pct,
+            dist_nan_pct,
+            cause,
+        )
 
     if day_id is not None:
         high = pd.to_numeric(df["high"], errors="coerce")
