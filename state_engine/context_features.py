@@ -106,6 +106,10 @@ def _resolve_vwap_series(
         return pd.to_numeric(ohlcv[vwap_col], errors="coerce")
 
     effective_mode = _resolve_vwap_reset_mode(ohlcv, reset_mode)
+    _LOGGER.warning(
+        "VWAP not provided in ohlcv; computing proxy VWAP (mode=daily, window=50)."
+    )
+    _LOGGER.warning("ohlcv.columns=%s", list(ohlcv.columns))
     try:
         vwap = _compute_vwap(
             ohlcv,
@@ -116,11 +120,6 @@ def _resolve_vwap_series(
     except ValueError as exc:
         _LOGGER.warning("VWAP missing for ctx_dist_vwap_atr; skipping (%s).", exc)
         return None
-    _LOGGER.warning(
-        "VWAP missing for ctx_dist_vwap_atr; computed fallback (mode=%s, window=%s).",
-        effective_mode,
-        vwap_window,
-    )
     return pd.to_numeric(vwap, errors="coerce")
 
 
@@ -177,8 +176,10 @@ def build_context_features(
         eps=cfg.eps,
     )
     dist_vwap_atr = dist_vwap_atr.reindex(outputs.index)
+    vwap_source = "provided" if _resolve_vwap_column(ohlcv) else "proxy_daily_50"
+    vwap_source = pd.Series(vwap_source, index=outputs.index, name="ctx_vwap_source")
 
-    return pd.concat([session_bucket, state_age, dist_vwap_atr], axis=1)
+    return pd.concat([session_bucket, state_age, dist_vwap_atr, vwap_source], axis=1)
 
 
 __all__ = [
