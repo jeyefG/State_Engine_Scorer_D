@@ -106,7 +106,7 @@ def validate_quality_config_dict(config: dict[str, Any]) -> None:
         if forbidden in config:
             raise ValueError(f"Quality config must not include '{forbidden}'.")
 
-    allowed_sections = {"thresholds", "windows", "scoring"}
+    allowed_sections = {"thresholds", "windows", "scoring", "diagnostic_tables"}
     unknown_sections = set(config.keys()) - allowed_sections
     if unknown_sections:
         raise ValueError(f"Unknown quality config sections: {sorted(unknown_sections)}")
@@ -116,9 +116,44 @@ def validate_quality_config_dict(config: dict[str, Any]) -> None:
             continue
         if not isinstance(values, dict):
             raise ValueError(f"Quality config section '{section}' must be a mapping.")
+        if section == "diagnostic_tables":
+            _validate_diagnostic_tables(values)
+            continue
         for key, value in values.items():
             if not isinstance(value, (int, float)):
                 raise ValueError(f"Quality config '{section}.{key}' must be numeric.")
+
+
+def _validate_diagnostic_tables(diagnostic_cfg: dict[str, Any]) -> None:
+    allowed = {"n_min", "delta_max", "top_k", "bins"}
+    unknown_keys = set(diagnostic_cfg.keys()) - allowed
+    if unknown_keys:
+        raise ValueError(
+            "Quality config 'diagnostic_tables' unknown keys: "
+            f"{sorted(unknown_keys)}"
+        )
+    for key in ("n_min", "top_k", "delta_max"):
+        if key in diagnostic_cfg and diagnostic_cfg[key] is not None:
+            if not isinstance(diagnostic_cfg[key], (int, float)):
+                raise ValueError(f"Quality config 'diagnostic_tables.{key}' must be numeric.")
+    bins = diagnostic_cfg.get("bins")
+    if bins is None:
+        return
+    if not isinstance(bins, dict):
+        raise ValueError("Quality config 'diagnostic_tables.bins' must be a mapping.")
+    for bin_key, values in bins.items():
+        if values is None:
+            continue
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(
+                "Quality config 'diagnostic_tables.bins.%s' must be a list." % bin_key
+            )
+        for value in values:
+            if not isinstance(value, (int, float, str)):
+                raise ValueError(
+                    "Quality config 'diagnostic_tables.bins.%s' values must be numeric."
+                    % bin_key
+                )
 
 
 def _flatten_config(config: dict[str, Any]) -> dict[str, Any]:
