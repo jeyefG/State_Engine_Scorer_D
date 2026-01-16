@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import logging
 
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -11,9 +10,6 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 from .labels import StateLabels
-
-
-_CTX_DIAG_LOGGED = False
 
 
 @dataclass(frozen=True)
@@ -171,7 +167,10 @@ class GatingPolicy:
             if logger is not None:
                 logger.info(
                     "GATING_ALIGN_DONE symbol=%s outputs_len=%s features_len_after=%s idx_equal_after=%s",
-                    symbol, len(outputs.index), len(features.index), features.index.equals(outputs.index)
+                    symbol,
+                    len(outputs.index),
+                    len(features.index),
+                    features.index.equals(outputs.index),
                 )
         # ---------------------------------------------------------------------------
         allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
@@ -181,11 +180,6 @@ class GatingPolicy:
         transition_candidates = (state_hat == StateLabels.TRANSITION)
         guardrails_breakmag_min = th.transition_breakmag_min
         guardrails_reentry_min = th.transition_reentry_min
-        if isinstance(config_meta, dict):
-            if config_meta.get("breakmag_min") is not None:
-                guardrails_breakmag_min = float(config_meta["breakmag_min"])
-            if config_meta.get("reentry_min") is not None:
-                guardrails_reentry_min = float(config_meta["reentry_min"])
         guardrails_ok = transition_candidates & (margin >= th.transition_margin_min)
         if features is not None:
             required_features = {"BreakMag", "ReentryCount"}
@@ -196,92 +190,41 @@ class GatingPolicy:
                 (features["BreakMag"] >= guardrails_breakmag_min)
                 & (features["ReentryCount"] >= guardrails_reentry_min)
             )
+        allow_transition_failure = guardrails_ok
 
-        ctx_filters_pass, ctx_counts, ctx_fail_samples = self._apply_context_filters(
-            transition_candidates,
-            guardrails_ok,
-            outputs,
-            features,
-        )
-        allow_transition_failure = guardrails_ok & ctx_filters_pass
-
-        if logger is not None:
-            config_path = "unknown"
-            source = "missing"
-            selected_path = "missing"
-            keys_present: list[str] = []
-            enabled = th.transition_ctx_enabled
-            require_all = th.transition_ctx_require_all
-            sessions_in = th.allowed_sessions
-            state_age_max = th.state_age_max
-            dist_vwap_atr_max = th.dist_vwap_atr_max
-            breakmag_min = th.transition_breakmag_min
-            reentry_min = th.transition_reentry_min
+        # Fase D: context filters are semantic filters, not signals.
+        allow_names = [
+            "ALLOW_trend_pullback",
+            "ALLOW_trend_continuation",
+            "ALLOW_balance_fade",
+            "ALLOW_transition_failure",
+        ]
+        allow_map = {
+            "ALLOW_trend_pullback": allow_trend_pullback,
+            "ALLOW_trend_continuation": allow_trend_continuation,
+            "ALLOW_balance_fade": allow_balance_fade,
+            "ALLOW_transition_failure": allow_transition_failure,
+        }
+        for allow_name in allow_names:
+            ctx_meta = None
             if isinstance(config_meta, dict):
-                config_path = config_meta.get("config_path", config_path)
-                source = config_meta.get("source", source)
-                selected_path = config_meta.get("selected_path", selected_path)
-                keys_present = config_meta.get("keys_present", keys_present)
-                enabled = config_meta.get("enabled", enabled)
-                require_all = config_meta.get("require_all", require_all)
-                sessions_in = config_meta.get("sessions_in", sessions_in)
-                state_age_max = config_meta.get("state_age_max", state_age_max)
-                dist_vwap_atr_max = config_meta.get("dist_vwap_atr_max", dist_vwap_atr_max)
-                breakmag_min = config_meta.get("breakmag_min", breakmag_min)
-                reentry_min = config_meta.get("reentry_min", reentry_min)
-            logger.info(
-                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s selected_path=%s "
-                "keys_present=%s enabled=%s require_all=%s sessions_in=%s state_age_max=%s dist_vwap_atr_max=%s "
-                "breakmag_min=%s reentry_min=%s",
+                ctx_all = config_meta.get("allow_context_filters")
+                if isinstance(ctx_all, dict):
+                    ctx_meta = ctx_all.get(allow_name)
+            filtered_mask, _, _ = self._apply_allow_context_filter(
+                allow_name,
+                allow_map[allow_name],
+                outputs,
+                features,
+                ctx_meta,
+                logger,
                 symbol,
-                "ALLOW_transition_failure",
-                config_path,
-                source,
-                selected_path,
-                keys_present,
-                enabled,
-                require_all,
-                sessions_in,
-                state_age_max,
-                dist_vwap_atr_max,
-                breakmag_min,
-                reentry_min,
             )
-            if not th.transition_ctx_enabled:
-                logger.info(
-                    "TRANSITION_CTX_FILTER_DISABLED symbol=%s allow_name=%s",
-                    symbol,
-                    "ALLOW_transition_failure",
-                )
-            logger.info(
-                "TRANSITION_CTX_FILTER_COUNTS symbol=%s n_transition_candidates=%s n_after_guardrails=%s "
-                "n_ctx_pass=%s n_ctx_fail=%s pass_session=%s pass_state_age=%s pass_dist=%s",
-                symbol,
-                ctx_counts.get("n_transition_candidates"),
-                ctx_counts.get("n_after_guardrails"),
-                ctx_counts.get("n_ctx_pass"),
-                ctx_counts.get("n_ctx_fail"),
-                ctx_counts.get("pass_session"),
-                ctx_counts.get("pass_state_age"),
-                ctx_counts.get("pass_dist"),
-            )
-            if logger is not None:
-                total_rows = max(int(len(outputs.index)), 1)
-                n_after = int(ctx_counts.get("n_after_guardrails", 0) or 0)
-                n_pass  = int(ctx_counts.get("n_ctx_pass", 0) or 0)
-                before_pct = 100.0 * n_after / total_rows
-                after_pct  = 100.0 * n_pass  / total_rows
-                logger.info(
-                    "ALLOW_transition_failure_RATE symbol=%s after_guardrails=%s ctx_pass=%s total=%s "
-                    "before=%.2f%% after=%.2f%% delta=%.2f%%",
-                    symbol, n_after, n_pass, total_rows,
-                    before_pct, after_pct, (after_pct - before_pct)
-                )
-            if ctx_fail_samples is not None and not ctx_fail_samples.empty:
-                logger.info(
-                    "TRANSITION_CTX_FILTER_FAIL_SAMPLES\n%s",
-                    ctx_fail_samples.to_string(index=False),
-                )
+            allow_map[allow_name] = filtered_mask
+        allow_trend_pullback = allow_map["ALLOW_trend_pullback"]
+        allow_trend_continuation = allow_map["ALLOW_trend_continuation"]
+        allow_balance_fade = allow_map["ALLOW_balance_fade"]
+        allow_transition_failure = allow_map["ALLOW_transition_failure"]
 
         return pd.DataFrame(
             {
@@ -293,13 +236,16 @@ class GatingPolicy:
             index=outputs.index,
         )
 
-    def _apply_context_filters(
+    def _apply_allow_context_filter(
         self,
-        transition_candidates: pd.Series,
-        allow_transition_failure: pd.Series,
+        allow_name: str,
+        base_mask: pd.Series,
         outputs: pd.DataFrame,
         features: pd.DataFrame | None,
-    ) -> tuple[pd.Series, dict[str, int], pd.DataFrame | None]:
+        ctx_meta: dict[str, Any] | None,
+        logger,
+        symbol: str | None,
+    ) -> tuple[pd.Series, dict[str, Any], pd.DataFrame | None]:
         def _get_col(column: str) -> pd.Series | None:
             if features is not None and column in features.columns:
                 return features[column]
@@ -307,141 +253,237 @@ class GatingPolicy:
                 return outputs[column]
             return None
 
-        th = self.thresholds
         idx = outputs.index
-        transition_candidates = transition_candidates.reindex(idx).fillna(False)
-        allow_transition_failure = allow_transition_failure.reindex(idx).fillna(False)
+        base_mask = base_mask.reindex(idx).fillna(False).astype(bool)
+        if features is not None and not features.index.equals(idx):
+            features = features.reindex(idx)
+
+        ctx_meta = ctx_meta if isinstance(ctx_meta, dict) else None
+        enabled = bool(ctx_meta.get("enabled", False)) if ctx_meta else False
+        require_all = bool(ctx_meta.get("require_all", True)) if ctx_meta else True
+
         session_series = _get_col("ctx_session_bucket")
         state_age_series = _get_col("ctx_state_age")
         dist_series = _get_col("ctx_dist_vwap_atr")
-        has_session = session_series is not None
-        has_state_age = state_age_series is not None
-        has_dist = dist_series is not None
-        if not has_session:
-            session_series = pd.Series([None] * len(idx), index=idx)
+        breakmag_series = _get_col("BreakMag")
+        reentry_series = _get_col("ReentryCount")
+
+        masks: list[pd.Series] = []
+        mask_map: dict[str, pd.Series] = {}
+        applied: set[str] = set()
+
+        sessions_in = ctx_meta.get("sessions_in") if ctx_meta else None
+        if sessions_in is not None and session_series is not None:
+            allowed = {str(val) for val in sessions_in}
+            mask = session_series.astype(str).isin(allowed)
+            masks.append(mask)
+            mask_map["session"] = mask
+            applied.add("session")
+
+        state_age_min = ctx_meta.get("state_age_min") if ctx_meta else None
+        state_age_max = ctx_meta.get("state_age_max") if ctx_meta else None
+        if (state_age_min is not None or state_age_max is not None) and state_age_series is not None:
+            series = pd.to_numeric(state_age_series, errors="coerce")
+            mask = pd.Series(True, index=idx)
+            if state_age_min is not None:
+                mask &= series >= float(state_age_min)
+            if state_age_max is not None:
+                mask &= series <= float(state_age_max)
+            masks.append(mask)
+            mask_map["state_age"] = mask
+            applied.add("state_age")
+
+        dist_min = ctx_meta.get("dist_vwap_atr_min") if ctx_meta else None
+        dist_max = ctx_meta.get("dist_vwap_atr_max") if ctx_meta else None
+        if (dist_min is not None or dist_max is not None) and dist_series is not None:
+            series = pd.to_numeric(dist_series, errors="coerce")
+            mask = pd.Series(True, index=idx)
+            if dist_min is not None:
+                mask &= series >= float(dist_min)
+            if dist_max is not None:
+                mask &= series <= float(dist_max)
+            masks.append(mask)
+            mask_map["dist_vwap_atr"] = mask
+            applied.add("dist_vwap_atr")
+
+        breakmag_min = ctx_meta.get("breakmag_min") if ctx_meta else None
+        breakmag_max = ctx_meta.get("breakmag_max") if ctx_meta else None
+        if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is not None:
+            series = pd.to_numeric(breakmag_series, errors="coerce")
+            mask = pd.Series(True, index=idx)
+            if breakmag_min is not None:
+                mask &= series >= float(breakmag_min)
+            if breakmag_max is not None:
+                mask &= series <= float(breakmag_max)
+            masks.append(mask)
+            mask_map["breakmag"] = mask
+            applied.add("breakmag")
+
+        reentry_min = ctx_meta.get("reentry_min") if ctx_meta else None
+        reentry_max = ctx_meta.get("reentry_max") if ctx_meta else None
+        if (reentry_min is not None or reentry_max is not None) and reentry_series is not None:
+            series = pd.to_numeric(reentry_series, errors="coerce")
+            mask = pd.Series(True, index=idx)
+            if reentry_min is not None:
+                mask &= series >= float(reentry_min)
+            if reentry_max is not None:
+                mask &= series <= float(reentry_max)
+            masks.append(mask)
+            mask_map["reentry"] = mask
+            applied.add("reentry")
+
+        if not enabled:
+            counts = {
+                "total_rows": int(len(idx)),
+                "n_base": int(base_mask.sum()),
+                "n_pass": int(base_mask.sum()),
+                "n_fail": 0,
+                "status": "disabled",
+            }
+            return base_mask, counts, None
+
+        if logger is not None:
+            logger.info(
+                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s selected_path=%s "
+                "keys_present=%s enabled=%s require_all=%s sessions_in=%s state_age_min=%s state_age_max=%s "
+                "dist_vwap_atr_min=%s dist_vwap_atr_max=%s breakmag_min=%s breakmag_max=%s reentry_min=%s "
+                "reentry_max=%s",
+                symbol,
+                allow_name,
+                ctx_meta.get("config_path") if ctx_meta else None,
+                ctx_meta.get("source") if ctx_meta else None,
+                ctx_meta.get("selected_path") if ctx_meta else None,
+                ctx_meta.get("keys_present") if ctx_meta else None,
+                enabled,
+                require_all,
+                sessions_in,
+                state_age_min,
+                state_age_max,
+                dist_min,
+                dist_max,
+                breakmag_min,
+                breakmag_max,
+                reentry_min,
+                reentry_max,
+            )
+
+        if not masks:
+            if logger is not None:
+                logger.info(
+                    "NO_EFFECTIVE_CONDITIONS symbol=%s allow_name=%s",
+                    symbol,
+                    allow_name,
+                )
+            counts = {
+                "total_rows": int(len(idx)),
+                "n_base": int(base_mask.sum()),
+                "n_pass": int(base_mask.sum()),
+                "n_fail": 0,
+                "status": "no_effective_conditions",
+            }
+            return base_mask, counts, None
+
+        if require_all:
+            combined_mask = masks[0]
+            for mask in masks[1:]:
+                combined_mask = combined_mask & mask
         else:
-            session_series = session_series.reindex(idx)
-        if not has_state_age:
-            state_age_series = pd.Series([None] * len(idx), index=idx)
-        else:
-            state_age_series = state_age_series.reindex(idx)
-        if not has_dist:
-            dist_series = pd.Series([None] * len(idx), index=idx)
-        else:
-            dist_series = dist_series.reindex(idx)
+            combined_mask = masks[0]
+            for mask in masks[1:]:
+                combined_mask = combined_mask | mask
+        combined_mask = combined_mask.reindex(idx).fillna(False)
 
-        session_mask = pd.Series(True, index=idx)
-        state_age_mask = pd.Series(True, index=idx)
-        dist_mask = pd.Series(True, index=idx)
-        active_masks: list[pd.Series] = []
+        filtered_mask = base_mask & combined_mask
+        total_rows = int(len(idx))
+        n_base = int(base_mask.sum())
+        n_pass = int(filtered_mask.sum())
+        n_fail = n_base - n_pass
 
-        if th.allowed_sessions is not None and has_session:
-            allowed = {str(val) for val in th.allowed_sessions}
-            session_mask = session_series.astype(str).isin(allowed)
-            active_masks.append(session_mask)
-        if has_state_age:
-            applied_state_age = False
-            if th.state_age_min is not None:
-                state_age_mask &= state_age_series >= th.state_age_min
-                applied_state_age = True
-            if th.state_age_max is not None:
-                state_age_mask &= state_age_series <= th.state_age_max
-                applied_state_age = True
-            if applied_state_age:
-                active_masks.append(state_age_mask)
-        if has_dist:
-            applied_dist = False
-            if th.dist_vwap_atr_min is not None:
-                dist_mask &= dist_series >= th.dist_vwap_atr_min
-                applied_dist = True
-            if th.dist_vwap_atr_max is not None:
-                dist_mask &= dist_series <= th.dist_vwap_atr_max
-                applied_dist = True
-            if applied_dist:
-                active_masks.append(dist_mask)
-
-        if not th.transition_ctx_enabled:
-            ctx_pass = pd.Series(True, index=outputs.index)
-        elif not active_masks:
-            ctx_pass = pd.Series(True, index=outputs.index)
-        else:
-            if th.transition_ctx_require_all:
-                ctx_pass = active_masks[0]
-                for mask in active_masks[1:]:
-                    ctx_pass = ctx_pass & mask
-            else:
-                ctx_pass = active_masks[0]
-                for mask in active_masks[1:]:
-                    ctx_pass = ctx_pass | mask
-        after_guardrails = allow_transition_failure.reindex(idx).fillna(False)
-        ctx_pass = ctx_pass.reindex(idx).fillna(False)
-        session_mask = session_mask.reindex(idx).fillna(False)
-        state_age_mask = state_age_mask.reindex(idx).fillna(False)
-        dist_mask = dist_mask.reindex(idx).fillna(False)
-
-        n_transition_candidates = int(transition_candidates.sum())
-        n_after_guardrails = int(after_guardrails.sum())
-        n_ctx_pass = int((after_guardrails & ctx_pass).sum())
-        n_ctx_fail = n_after_guardrails - n_ctx_pass
-
-        fail_mask = after_guardrails & ~ctx_pass
-
-        pass_session = int((after_guardrails & session_mask).sum())
-        pass_state_age = int((after_guardrails & state_age_mask).sum())
-        pass_dist = int((after_guardrails & dist_mask).sum())
+        def _pass_count(key: str) -> int | None:
+            if key not in applied:
+                return None
+            return int((base_mask & mask_map[key].reindex(idx).fillna(False)).sum())
 
         counts = {
-            "n_transition_candidates": n_transition_candidates,
-            "n_after_guardrails": n_after_guardrails,
-            "n_ctx_pass": n_ctx_pass,
-            "n_ctx_fail": n_ctx_fail,
-            "pass_session": pass_session,
-            "pass_state_age": pass_state_age,
-            "pass_dist": pass_dist,
+            "total_rows": total_rows,
+            "n_base": n_base,
+            "n_pass": n_pass,
+            "n_fail": n_fail,
+            "pass_session": _pass_count("session"),
+            "pass_state_age": _pass_count("state_age"),
+            "pass_dist": _pass_count("dist_vwap_atr"),
+            "pass_breakmag": _pass_count("breakmag"),
+            "pass_reentry": _pass_count("reentry"),
         }
 
-        logger = logging.getLogger(__name__)
-        global _CTX_DIAG_LOGGED
-        if not _CTX_DIAG_LOGGED:
-            features_len = len(features.index) if features is not None else None
-            idx_equal = outputs.index.equals(features.index) if features is not None else None
+        if logger is not None:
             logger.info(
-                "CTX_FILTER_DIAG OUTPUTS_LEN=%s FEATURES_LEN=%s IDX_EQUAL=%s "
-                "MASK_LENS after_guardrails=%s ctx_pass=%s fail_mask=%s",
-                len(outputs.index),
-                features_len,
-                idx_equal,
-                len(after_guardrails),
-                len(ctx_pass),
-                len(fail_mask),
+                "ALLOW_CTX_FILTER_COUNTS symbol=%s allow_name=%s n_base=%s n_pass=%s n_fail=%s "
+                "pass_session=%s pass_state_age=%s pass_dist=%s pass_breakmag=%s pass_reentry=%s",
+                symbol,
+                allow_name,
+                counts["n_base"],
+                counts["n_pass"],
+                counts["n_fail"],
+                counts.get("pass_session"),
+                counts.get("pass_state_age"),
+                counts.get("pass_dist"),
+                counts.get("pass_breakmag"),
+                counts.get("pass_reentry"),
             )
-            _CTX_DIAG_LOGGED = True
+            total_rows = max(total_rows, 1)
+            before_pct = 100.0 * n_base / total_rows
+            after_pct = 100.0 * n_pass / total_rows
+            logger.info(
+                "ALLOW_RATE symbol=%s allow_name=%s total=%s before=%.2f%% after=%.2f%% delta=%.2f%%",
+                symbol,
+                allow_name,
+                total_rows,
+                before_pct,
+                after_pct,
+                after_pct - before_pct,
+            )
 
         fail_samples = None
-        if n_ctx_fail > 0:
-            # --- build aligned diagnostic df (never trust incoming series lengths) ---
+        if n_fail > 0:
+            fail_mask = base_mask & ~combined_mask
             failure_rows = pd.DataFrame(index=idx)
             failure_rows["index"] = idx.astype(str)
-            failure_rows["ctx_session_bucket"] = session_series.reindex(idx).values
-            failure_rows["ctx_state_age"] = state_age_series.reindex(idx).values
-            failure_rows["ctx_dist_vwap_atr"] = dist_series.reindex(idx).values
-        
+            failure_rows["ctx_session_bucket"] = (
+                session_series.reindex(idx).values if session_series is not None else [None] * len(idx)
+            )
+            failure_rows["ctx_state_age"] = (
+                state_age_series.reindex(idx).values if state_age_series is not None else [None] * len(idx)
+            )
+            failure_rows["ctx_dist_vwap_atr"] = (
+                dist_series.reindex(idx).values if dist_series is not None else [None] * len(idx)
+            )
             failure_rows = failure_rows.loc[fail_mask]
             failure_rows = failure_rows.head(5).copy()
             reasons: list[str] = []
-            for idx in failure_rows.index:
+            for row_idx in failure_rows.index:
                 parts: list[str] = []
-                if not bool(session_mask.loc[idx]):
-                    parts.append("session")
-                if not bool(state_age_mask.loc[idx]):
-                    parts.append("state_age")
-                if not bool(dist_mask.loc[idx]):
-                    parts.append("dist_vwap_atr")
+                for key, label in [
+                    ("session", "session"),
+                    ("state_age", "state_age"),
+                    ("dist_vwap_atr", "dist_vwap_atr"),
+                    ("breakmag", "breakmag"),
+                    ("reentry", "reentry"),
+                ]:
+                    if key in applied and not bool(mask_map[key].reindex(idx).fillna(False).loc[row_idx]):
+                        parts.append(label)
                 reasons.append("|".join(parts) if parts else "unknown")
             failure_rows.insert(1, "reason", reasons)
             fail_samples = failure_rows
+            if logger is not None:
+                logger.info(
+                    "ALLOW_CTX_FILTER_FAIL_SAMPLES symbol=%s allow_name=%s\n%s",
+                    symbol,
+                    allow_name,
+                    fail_samples.to_string(index=False),
+                )
 
-        return ctx_pass, counts, fail_samples
+        return filtered_mask, counts, fail_samples
 
 
 def apply_allow_context_filters(
@@ -645,4 +687,3 @@ __all__ = [
     "apply_allow_context_filters",
     "build_transition_gating_thresholds",
 ]
-

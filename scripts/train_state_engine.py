@@ -1230,11 +1230,33 @@ def main() -> None:
         )
 
     symbol_config = _load_symbol_config(args.symbol, logger)
-    gating_thresholds, gating_config_meta = build_transition_gating_thresholds(
+    gating_thresholds, _ = build_transition_gating_thresholds(
         args.symbol,
         symbol_config,
         logger=logger,
     )
+    gating_config_meta: dict[str, Any] = {}
+    if isinstance(symbol_config, dict):
+        allow_cfg = symbol_config.get("allow_context_filters")
+        if isinstance(allow_cfg, dict) and allow_cfg:
+            config_path = Path("configs") / "symbols" / f"{args.symbol}.yaml"
+            config_path_str = str(config_path) if config_path.exists() else "unknown"
+            allow_meta: dict[str, dict[str, Any]] = {}
+            for allow_name, rule_cfg in allow_cfg.items():
+                if not isinstance(rule_cfg, dict):
+                    continue
+                rule_meta = dict(rule_cfg)
+                rule_meta.update(
+                    {
+                        "source": "symbol",
+                        "selected_path": f"allow_context_filters.{allow_name}",
+                        "keys_present": sorted(rule_cfg.keys()),
+                        "config_path": config_path_str,
+                    }
+                )
+                allow_meta[allow_name] = rule_meta
+            if allow_meta:
+                gating_config_meta["allow_context_filters"] = allow_meta
 
     # Extra reporting helpers
     state_hat_dist = class_distribution(outputs["state_hat"].to_numpy(), label_order)
@@ -1250,7 +1272,7 @@ def main() -> None:
     context_mod = importlib.import_module(build_context_features.__module__)
     logger.info("context_features_file=%s", getattr(context_mod, "__file__", None))
     gating_policy = GatingPolicy(gating_thresholds)
-    features_for_gating = full_features.join(ctx_features, how="left")
+    features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
     gating = gating_policy.apply(
         outputs,
         features_for_gating,
@@ -1258,25 +1280,29 @@ def main() -> None:
         symbol=args.symbol,
         config_meta=gating_config_meta,
     )
-    allow_context_frame = gating.copy()
-    context_cols = {}
-    if "ctx_session_bucket" in ctx_features.columns:
-        context_cols["session_bucket"] = ctx_features["ctx_session_bucket"]
-    if "ctx_state_age" in ctx_features.columns:
-        context_cols["state_age"] = ctx_features["ctx_state_age"]
-    if "ctx_dist_vwap_atr" in ctx_features.columns:
-        context_cols["dist_vwap_atr"] = ctx_features["ctx_dist_vwap_atr"]
-    if context_cols:
-        allow_context_frame = allow_context_frame.join(
-            pd.DataFrame(context_cols, index=allow_context_frame.index)
-        )
-    feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
-    if feature_cols:
-        allow_context_frame = allow_context_frame.join(
-            full_features[feature_cols].reindex(allow_context_frame.index)
-        )
     allow_cols = list(gating.columns)
-    gating = apply_allow_context_filters(allow_context_frame, symbol_config, logger)[allow_cols]
+    # Fase D: context filters are semantic filters, not signals.
+    if gating_config_meta.get("allow_context_filters"):
+        gating = gating[allow_cols]
+    else:
+        allow_context_frame = gating.copy()
+        context_cols = {}
+        if "ctx_session_bucket" in ctx_features.columns:
+            context_cols["session_bucket"] = ctx_features["ctx_session_bucket"]
+        if "ctx_state_age" in ctx_features.columns:
+            context_cols["state_age"] = ctx_features["ctx_state_age"]
+        if "ctx_dist_vwap_atr" in ctx_features.columns:
+            context_cols["dist_vwap_atr"] = ctx_features["ctx_dist_vwap_atr"]
+        if context_cols:
+            allow_context_frame = allow_context_frame.join(
+                pd.DataFrame(context_cols, index=allow_context_frame.index)
+            )
+        feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
+        if feature_cols:
+            allow_context_frame = allow_context_frame.join(
+                full_features[feature_cols].reindex(allow_context_frame.index)
+            )
+        gating = apply_allow_context_filters(allow_context_frame, symbol_config, logger)[allow_cols]
     allow_any = gating.any(axis=1)
 
     # EV estructural (diagnóstico): ret_struct basado en rango direccional futuro
