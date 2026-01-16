@@ -170,8 +170,8 @@ class GatingPolicy:
             features = features.reindex(outputs.index)
             if logger is not None:
                 logger.info(
-                    "GATING_ALIGN_DONE symbol=%s features_len_after=%s idx_equal_after=%s",
-                    symbol, len(outputs), len(features), features.index.equals(outputs.index)
+                    "GATING_ALIGN_DONE symbol=%s outputs_len=%s features_len_after=%s idx_equal_after=%s",
+                    symbol, len(outputs.index), len(features.index), features.index.equals(outputs.index)
                 )
         # ---------------------------------------------------------------------------
         allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
@@ -469,6 +469,11 @@ def apply_allow_context_filters(
             continue
         if not rule_cfg.get("enabled", False):
             continue
+        # Transition is handled inside GatingPolicy.apply() (Fase D). Avoid double-apply and misleading logs.
+        if allow_rule == "ALLOW_transition_failure":
+            logger.info("allow_context_filters.%s handled in gating.py; skipping second pass.", allow_rule)
+            continue
+        
         if allow_rule not in filtered.columns:
             logger.warning("allow_context_filters.%s missing in gating_df; skipping.", allow_rule)
             continue
