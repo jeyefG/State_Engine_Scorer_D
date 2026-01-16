@@ -332,7 +332,8 @@ def _load_diagnostic_table_config(symbol: str, logger: logging.Logger) -> dict[s
 
 
 def _load_symbol_config(symbol: str, logger: logging.Logger) -> dict[str, Any]:
-    config_path = Path("configs") / "symbols" / f"{symbol}.yaml"
+    config_path = PROJECT_ROOT / "configs" / "symbols" / f"{symbol}.yaml"
+    logger.info("SYMBOL_CONFIG_PATH symbol=%s path=%s exists=%s", symbol, config_path, config_path.exists())
     if not config_path.exists():
         return {}
     try:
