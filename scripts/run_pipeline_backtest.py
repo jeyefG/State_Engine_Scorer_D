@@ -238,7 +238,11 @@ def main() -> None:
 
     feature_engineer = FeatureEngineer(FeatureConfig())
     symbol_cfg = load_symbol_config(args.symbol, logger)
-    gating_thresholds, _ = build_transition_gating_thresholds(args.symbol, symbol_cfg)
+    gating_thresholds, _ = build_transition_gating_thresholds(
+        args.symbol,
+        symbol_cfg,
+        logger=logger,
+    )
     gating = GatingPolicy(gating_thresholds)
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, symbol_cfg, logger)
 

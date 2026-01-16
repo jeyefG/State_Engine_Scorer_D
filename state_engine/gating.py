@@ -28,23 +28,69 @@ class GatingThresholds:
     transition_ctx_require_all: bool = True
 
 
+def get_transition_ctx_cfg(
+    cfg: dict[str, Any] | None,
+    allow_name: str,
+) -> tuple[dict[str, Any], str, list[str], list[str]]:
+    tried_paths = [
+        f"allow_context_filters.{allow_name}",
+        f"gating.allow_context_filters.{allow_name}",
+        f"gating.allows.{allow_name}",
+    ]
+    if not isinstance(cfg, dict):
+        return {}, "missing", [], tried_paths
+
+    candidates = [
+        cfg.get("allow_context_filters", {}).get(allow_name),
+        cfg.get("gating", {}).get("allow_context_filters", {}).get(allow_name),
+        cfg.get("gating", {}).get("allows", {}).get(allow_name),
+    ]
+    selected_path = "missing"
+    rule_cfg: dict[str, Any] = {}
+    for path, candidate in zip(tried_paths, candidates):
+        if isinstance(candidate, dict):
+            rule_cfg = dict(candidate)
+            selected_path = path
+            break
+    keys_present = sorted(rule_cfg.keys()) if rule_cfg else []
+    return rule_cfg, selected_path, keys_present, tried_paths
+
+
 def build_transition_gating_thresholds(
     symbol: str | None,
     symbol_config: dict[str, Any] | None,
     *,
     allow_name: str = "ALLOW_transition_failure",
+    logger=None,
 ) -> tuple[GatingThresholds, dict[str, Any]]:
-    rule_cfg: dict[str, Any] = {}
-    selected_path = "missing"
-    if isinstance(symbol_config, dict):
-        allow_cfg = symbol_config.get("allow_context_filters")
-        if isinstance(allow_cfg, dict):
-            candidate = allow_cfg.get(allow_name, {})
-            if isinstance(candidate, dict):
-                rule_cfg = dict(candidate)
-                selected_path = f"allow_context_filters.{allow_name}"
+    if logger is not None:
+        top_keys = list(symbol_config.keys()) if isinstance(symbol_config, dict) else []
+        allow_keys = []
+        if isinstance(symbol_config, dict):
+            allow_ctx = symbol_config.get("allow_context_filters", {})
+            if isinstance(allow_ctx, dict):
+                allow_keys = list(allow_ctx.keys())
+        logger.info("GATING_CFG_TOP_KEYS symbol=%s top_keys=%s", symbol, top_keys)
+        logger.info(
+            "GATING_CFG_ALLOWCTX_KEYS symbol=%s allow_context_filters_keys=%s",
+            symbol,
+            allow_keys,
+        )
 
-    keys_present = sorted(rule_cfg.keys()) if rule_cfg else []
+    rule_cfg, selected_path, keys_present, tried_paths = get_transition_ctx_cfg(
+        symbol_config,
+        allow_name,
+    )
+    if logger is not None:
+        logger.info(
+            "GATING_CFG_LOOKUP symbol=%s allow_name=%s tried_paths=%s selected_path=%s keys_present=%s",
+            symbol,
+            allow_name,
+            tried_paths,
+            selected_path,
+            keys_present,
+        )
+
     enabled = bool(rule_cfg.get("enabled", False)) if rule_cfg else False
     require_all = bool(rule_cfg.get("require_all", True)) if rule_cfg else True
 
@@ -75,6 +121,7 @@ def build_transition_gating_thresholds(
         "source": "symbol" if rule_cfg else "missing",
         "config_path": str(config_path) if config_path and config_path.exists() else "unknown",
         "selected_path": selected_path,
+        "tried_paths": tried_paths,
         "enabled": enabled,
         "require_all": require_all,
         "sessions_in": rule_cfg.get("sessions_in") if rule_cfg else None,
@@ -114,6 +161,13 @@ class GatingPolicy:
         allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
 
         transition_candidates = (state_hat == StateLabels.TRANSITION)
+        guardrails_breakmag_min = th.transition_breakmag_min
+        guardrails_reentry_min = th.transition_reentry_min
+        if isinstance(config_meta, dict):
+            if config_meta.get("breakmag_min") is not None:
+                guardrails_breakmag_min = float(config_meta["breakmag_min"])
+            if config_meta.get("reentry_min") is not None:
+                guardrails_reentry_min = float(config_meta["reentry_min"])
         guardrails_ok = transition_candidates & (margin >= th.transition_margin_min)
         if features is not None:
             required_features = {"BreakMag", "ReentryCount"}
@@ -121,8 +175,8 @@ class GatingPolicy:
             if missing_features:
                 raise ValueError(f"Missing required features for gating: {sorted(missing_features)}")
             guardrails_ok &= (
-                (features["BreakMag"] >= th.transition_breakmag_min)
-                & (features["ReentryCount"] >= th.transition_reentry_min)
+                (features["BreakMag"] >= guardrails_breakmag_min)
+                & (features["ReentryCount"] >= guardrails_reentry_min)
             )
 
         ctx_filters_pass, ctx_counts, ctx_fail_samples = self._apply_context_filters(

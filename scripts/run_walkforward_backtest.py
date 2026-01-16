@@ -336,7 +336,11 @@ def run_walkforward(symbol: str, args: argparse.Namespace, logger: logging.Logge
 
     feature_engineer = FeatureEngineer(FeatureConfig())
     symbol_cfg = load_symbol_config(symbol, logger)
-    gating_thresholds, _ = build_transition_gating_thresholds(symbol, symbol_cfg)
+    gating_thresholds, _ = build_transition_gating_thresholds(
+        symbol,
+        symbol_cfg,
+        logger=logger,
+    )
     gating = GatingPolicy(gating_thresholds)
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, symbol_cfg, logger)
     df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
