@@ -341,6 +341,113 @@ def _load_symbol_config(symbol: str, logger: logging.Logger) -> dict[str, Any]:
     return config
 
 
+def _allow_filter_config_rows(symbol_config: dict[str, Any], allow_rule: str) -> list[dict[str, str]]:
+    allow_cfg = symbol_config.get("allow_context_filters", {})
+    if not isinstance(allow_cfg, dict):
+        return []
+    rule_cfg = allow_cfg.get(allow_rule, {})
+    if not isinstance(rule_cfg, dict):
+        return []
+    return [{"key": f"{allow_rule}.{key}", "source": "symbol"} for key in sorted(rule_cfg.keys())]
+
+
+def _allow_context_filter_counts(
+    allow_context_frame: pd.DataFrame,
+    allow_rule: str,
+    rule_cfg: dict[str, Any],
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    if allow_rule not in allow_context_frame.columns:
+        logger.warning("allow_context_filters.%s missing in gating_df; skipping counts.", allow_rule)
+        return pd.DataFrame()
+
+    base_allow = allow_context_frame[allow_rule].astype(bool)
+    total_base = int(base_allow.sum())
+    if total_base == 0:
+        return pd.DataFrame(
+            [
+                {
+                    "filter": "base_allow",
+                    "total_base": total_base,
+                    "pass": 0,
+                    "fail": 0,
+                    "pass_pct": 0.0,
+                    "fail_pct": 0.0,
+                    "notes": "no base allow rows",
+                }
+            ]
+        )
+
+    def _mask_from_col(col_name: str, mask_fn, label: str) -> dict[str, Any]:
+        if col_name not in allow_context_frame.columns:
+            return {
+                "filter": label,
+                "total_base": total_base,
+                "pass": 0,
+                "fail": total_base,
+                "pass_pct": 0.0,
+                "fail_pct": 100.0,
+                "notes": f"missing {col_name}",
+            }
+        series = allow_context_frame[col_name]
+        mask = mask_fn(series)
+        pass_count = int((base_allow & mask).sum())
+        fail_count = total_base - pass_count
+        pass_pct = (pass_count / total_base) * 100.0 if total_base else 0.0
+        fail_pct = (fail_count / total_base) * 100.0 if total_base else 0.0
+        return {
+            "filter": label,
+            "total_base": total_base,
+            "pass": pass_count,
+            "fail": fail_count,
+            "pass_pct": pass_pct,
+            "fail_pct": fail_pct,
+            "notes": "",
+        }
+
+    rows: list[dict[str, Any]] = []
+    sessions_in = rule_cfg.get("sessions_in")
+    if sessions_in is not None:
+        allowed = {str(val) for val in sessions_in}
+        rows.append(
+            _mask_from_col(
+                "session_bucket",
+                lambda s: s.astype(str).isin(allowed),
+                f"sessions_in={sorted(allowed)}",
+            )
+        )
+    state_age_min = rule_cfg.get("state_age_min")
+    state_age_max = rule_cfg.get("state_age_max")
+    if state_age_min is not None or state_age_max is not None:
+        def _state_age_mask(series: pd.Series) -> pd.Series:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = pd.Series(True, index=series.index)
+            if state_age_min is not None:
+                mask &= numeric >= float(state_age_min)
+            if state_age_max is not None:
+                mask &= numeric <= float(state_age_max)
+            return mask
+
+        label = f"state_age[{state_age_min},{state_age_max}]"
+        rows.append(_mask_from_col("state_age", _state_age_mask, label))
+
+    dist_vwap_atr_min = rule_cfg.get("dist_vwap_atr_min")
+    dist_vwap_atr_max = rule_cfg.get("dist_vwap_atr_max")
+    if dist_vwap_atr_min is not None or dist_vwap_atr_max is not None:
+        def _dist_mask(series: pd.Series) -> pd.Series:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = pd.Series(True, index=series.index)
+            if dist_vwap_atr_min is not None:
+                mask &= numeric >= float(dist_vwap_atr_min)
+            if dist_vwap_atr_max is not None:
+                mask &= numeric <= float(dist_vwap_atr_max)
+            return mask
+
+        label = f"dist_vwap_atr[{dist_vwap_atr_min},{dist_vwap_atr_max}]"
+        rows.append(_mask_from_col("dist_vwap_atr", _dist_mask, label))
+
+    return pd.DataFrame(rows)
+
 def _print_block(
     title: str,
     df: pd.DataFrame,
@@ -1247,6 +1354,22 @@ def main() -> None:
             logger.info("[CTX DIAGNOSTIC TABLE] last_rows=10\n%s", debug_frame.tail(10).to_string())
         else:
             logger.warning("ctx_features missing ctx_* columns; skipping ctx diagnostic table.")
+
+        allow_cfg = symbol_config.get("allow_context_filters", {}) if isinstance(symbol_config, dict) else {}
+        transition_cfg = allow_cfg.get("ALLOW_transition_failure", {}) if isinstance(allow_cfg, dict) else {}
+        allow_config_rows = _allow_filter_config_rows(symbol_config, "ALLOW_transition_failure")
+        if allow_config_rows:
+            allow_config_df = pd.DataFrame(allow_config_rows)
+            _emit_table("GATING_CONFIG_EFFECTIVE", allow_config_df)
+        if isinstance(transition_cfg, dict) and transition_cfg:
+            allow_filter_counts = _allow_context_filter_counts(
+                allow_context_frame,
+                "ALLOW_transition_failure",
+                transition_cfg,
+                logger,
+            )
+            if not allow_filter_counts.empty:
+                _emit_table("ALLOW_transition_context_counts", allow_filter_counts)
 
     stage_start = step("save_model")
     metadata = {
