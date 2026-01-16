@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
@@ -23,6 +24,65 @@ class GatingThresholds:
     state_age_max: int | None = None
     dist_vwap_atr_min: float | None = None
     dist_vwap_atr_max: float | None = None
+    transition_ctx_enabled: bool = True
+    transition_ctx_require_all: bool = True
+
+
+def build_transition_gating_thresholds(
+    symbol: str | None,
+    symbol_config: dict[str, Any] | None,
+    *,
+    allow_name: str = "ALLOW_transition_failure",
+) -> tuple[GatingThresholds, dict[str, Any]]:
+    rule_cfg: dict[str, Any] = {}
+    selected_path = "missing"
+    if isinstance(symbol_config, dict):
+        allow_cfg = symbol_config.get("allow_context_filters")
+        if isinstance(allow_cfg, dict):
+            candidate = allow_cfg.get(allow_name, {})
+            if isinstance(candidate, dict):
+                rule_cfg = dict(candidate)
+                selected_path = f"allow_context_filters.{allow_name}"
+
+    keys_present = sorted(rule_cfg.keys()) if rule_cfg else []
+    enabled = bool(rule_cfg.get("enabled", False)) if rule_cfg else False
+    require_all = bool(rule_cfg.get("require_all", True)) if rule_cfg else True
+
+    active_cfg = rule_cfg if enabled else {}
+    overrides: dict[str, Any] = {
+        "transition_ctx_enabled": enabled,
+        "transition_ctx_require_all": require_all,
+    }
+    if active_cfg.get("sessions_in") is not None:
+        overrides["allowed_sessions"] = active_cfg.get("sessions_in")
+    if active_cfg.get("state_age_min") is not None:
+        overrides["state_age_min"] = int(active_cfg["state_age_min"])
+    if active_cfg.get("state_age_max") is not None:
+        overrides["state_age_max"] = int(active_cfg["state_age_max"])
+    if active_cfg.get("dist_vwap_atr_min") is not None:
+        overrides["dist_vwap_atr_min"] = float(active_cfg["dist_vwap_atr_min"])
+    if active_cfg.get("dist_vwap_atr_max") is not None:
+        overrides["dist_vwap_atr_max"] = float(active_cfg["dist_vwap_atr_max"])
+    if active_cfg.get("breakmag_min") is not None:
+        overrides["transition_breakmag_min"] = float(active_cfg["breakmag_min"])
+    if active_cfg.get("reentry_min") is not None:
+        overrides["transition_reentry_min"] = float(active_cfg["reentry_min"])
+
+    thresholds = GatingThresholds(**{**asdict(GatingThresholds()), **overrides})
+    config_path = Path("configs") / "symbols" / f"{symbol}.yaml" if symbol else None
+    return thresholds, {
+        "keys_present": keys_present,
+        "source": "symbol" if rule_cfg else "missing",
+        "config_path": str(config_path) if config_path and config_path.exists() else "unknown",
+        "selected_path": selected_path,
+        "enabled": enabled,
+        "require_all": require_all,
+        "sessions_in": rule_cfg.get("sessions_in") if rule_cfg else None,
+        "state_age_max": rule_cfg.get("state_age_max") if rule_cfg else None,
+        "dist_vwap_atr_max": rule_cfg.get("dist_vwap_atr_max") if rule_cfg else None,
+        "breakmag_min": rule_cfg.get("breakmag_min") if rule_cfg else None,
+        "reentry_min": rule_cfg.get("reentry_min") if rule_cfg else None,
+    }
 
 
 class GatingPolicy:
@@ -53,48 +113,74 @@ class GatingPolicy:
         allow_trend_continuation = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
 
-        allow_transition_failure = (state_hat == StateLabels.TRANSITION) & (margin >= th.transition_margin_min)
+        transition_candidates = (state_hat == StateLabels.TRANSITION)
+        guardrails_ok = transition_candidates & (margin >= th.transition_margin_min)
         if features is not None:
             required_features = {"BreakMag", "ReentryCount"}
             missing_features = required_features - set(features.columns)
             if missing_features:
                 raise ValueError(f"Missing required features for gating: {sorted(missing_features)}")
-            allow_transition_failure &= (
+            guardrails_ok &= (
                 (features["BreakMag"] >= th.transition_breakmag_min)
                 & (features["ReentryCount"] >= th.transition_reentry_min)
             )
 
-        transition_candidates = (state_hat == StateLabels.TRANSITION)
         ctx_filters_pass, ctx_counts, ctx_fail_samples = self._apply_context_filters(
             transition_candidates,
-            allow_transition_failure,
+            guardrails_ok,
             outputs,
             features,
         )
-        allow_transition_failure &= ctx_filters_pass
+        allow_transition_failure = guardrails_ok & ctx_filters_pass
 
         if logger is not None:
             config_path = "unknown"
             source = "missing"
+            selected_path = "missing"
             keys_present: list[str] = []
+            enabled = th.transition_ctx_enabled
+            require_all = th.transition_ctx_require_all
+            sessions_in = th.allowed_sessions
+            state_age_max = th.state_age_max
+            dist_vwap_atr_max = th.dist_vwap_atr_max
+            breakmag_min = th.transition_breakmag_min
+            reentry_min = th.transition_reentry_min
             if isinstance(config_meta, dict):
                 config_path = config_meta.get("config_path", config_path)
                 source = config_meta.get("source", source)
+                selected_path = config_meta.get("selected_path", selected_path)
                 keys_present = config_meta.get("keys_present", keys_present)
+                enabled = config_meta.get("enabled", enabled)
+                require_all = config_meta.get("require_all", require_all)
+                sessions_in = config_meta.get("sessions_in", sessions_in)
+                state_age_max = config_meta.get("state_age_max", state_age_max)
+                dist_vwap_atr_max = config_meta.get("dist_vwap_atr_max", dist_vwap_atr_max)
+                breakmag_min = config_meta.get("breakmag_min", breakmag_min)
+                reentry_min = config_meta.get("reentry_min", reentry_min)
             logger.info(
-                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s keys_present=%s "
-                "allowed_sessions=%s state_age_min=%s state_age_max=%s dist_vwap_atr_min=%s dist_vwap_atr_max=%s",
+                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s selected_path=%s "
+                "keys_present=%s enabled=%s require_all=%s sessions_in=%s state_age_max=%s dist_vwap_atr_max=%s "
+                "breakmag_min=%s reentry_min=%s",
                 symbol,
                 "ALLOW_transition_failure",
                 config_path,
                 source,
+                selected_path,
                 keys_present,
-                th.allowed_sessions,
-                th.state_age_min,
-                th.state_age_max,
-                th.dist_vwap_atr_min,
-                th.dist_vwap_atr_max,
+                enabled,
+                require_all,
+                sessions_in,
+                state_age_max,
+                dist_vwap_atr_max,
+                breakmag_min,
+                reentry_min,
             )
+            if not th.transition_ctx_enabled:
+                logger.info(
+                    "TRANSITION_CTX_FILTER_DISABLED symbol=%s allow_name=%s",
+                    symbol,
+                    "ALLOW_transition_failure",
+                )
             logger.info(
                 "TRANSITION_CTX_FILTER_COUNTS symbol=%s n_transition_candidates=%s n_after_guardrails=%s "
                 "n_ctx_pass=%s n_ctx_fail=%s pass_session=%s pass_state_age=%s pass_dist=%s",
@@ -154,22 +240,46 @@ class GatingPolicy:
         session_mask = pd.Series(True, index=outputs.index)
         state_age_mask = pd.Series(True, index=outputs.index)
         dist_mask = pd.Series(True, index=outputs.index)
+        active_masks: list[pd.Series] = []
 
         if th.allowed_sessions is not None and has_session:
             allowed = {str(val) for val in th.allowed_sessions}
             session_mask = session_series.astype(str).isin(allowed)
+            active_masks.append(session_mask)
         if has_state_age:
+            applied_state_age = False
             if th.state_age_min is not None:
                 state_age_mask &= state_age_series >= th.state_age_min
+                applied_state_age = True
             if th.state_age_max is not None:
                 state_age_mask &= state_age_series <= th.state_age_max
+                applied_state_age = True
+            if applied_state_age:
+                active_masks.append(state_age_mask)
         if has_dist:
+            applied_dist = False
             if th.dist_vwap_atr_min is not None:
                 dist_mask &= dist_series >= th.dist_vwap_atr_min
+                applied_dist = True
             if th.dist_vwap_atr_max is not None:
                 dist_mask &= dist_series <= th.dist_vwap_atr_max
+                applied_dist = True
+            if applied_dist:
+                active_masks.append(dist_mask)
 
-        ctx_pass = session_mask & state_age_mask & dist_mask
+        if not th.transition_ctx_enabled:
+            ctx_pass = pd.Series(True, index=outputs.index)
+        elif not active_masks:
+            ctx_pass = pd.Series(True, index=outputs.index)
+        else:
+            if th.transition_ctx_require_all:
+                ctx_pass = active_masks[0]
+                for mask in active_masks[1:]:
+                    ctx_pass = ctx_pass & mask
+            else:
+                ctx_pass = active_masks[0]
+                for mask in active_masks[1:]:
+                    ctx_pass = ctx_pass | mask
         after_guardrails = allow_transition_failure
 
         n_transition_candidates = int(transition_candidates.sum())
@@ -409,4 +519,9 @@ def apply_allow_context_filters(
     return filtered
 
 
-__all__ = ["GatingThresholds", "GatingPolicy", "apply_allow_context_filters"]
+__all__ = [
+    "GatingThresholds",
+    "GatingPolicy",
+    "apply_allow_context_filters",
+    "build_transition_gating_thresholds",
+]
