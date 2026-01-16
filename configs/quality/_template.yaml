@@ -26,13 +26,3 @@ windows:
 scoring:
   score_min: 0.7
   score_margin: 0.15
-diagnostic_tables:
-  n_min: 30
-  delta_max: 0.15
-  top_k: 12
-  bins:
-    state_age: [-.inf, 2, 5, 10, .inf]
-    dist_vwap_atr: [-.inf, 0.5, 1.0, 2.0, .inf]
-    breakmag: [-.inf, 0.5, 1.0, 1.5, 2.5, .inf]
-    reentry: [-.inf, 0.5, 1.5, 2.5, 4.5, .inf]
-    sessions: []
