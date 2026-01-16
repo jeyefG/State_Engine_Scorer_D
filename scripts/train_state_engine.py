@@ -1232,6 +1232,7 @@ def main() -> None:
     gating_thresholds, gating_config_meta = build_transition_gating_thresholds(
         args.symbol,
         symbol_config,
+        logger=logger,
     )
 
     # Extra reporting helpers

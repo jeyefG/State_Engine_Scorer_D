@@ -2853,7 +2853,11 @@ def main() -> None:
     state_model.load(model_path)
 
     feature_engineer = FeatureEngineer(FeatureConfig())
-    gating_thresholds, _ = build_transition_gating_thresholds(args.symbol, config_payload)
+    gating_thresholds, _ = build_transition_gating_thresholds(
+        args.symbol,
+        config_payload,
+        logger=logger,
+    )
     gating = GatingPolicy(gating_thresholds)
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, config_payload, logger)
 
