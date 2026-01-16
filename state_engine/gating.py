@@ -31,7 +31,15 @@ class GatingPolicy:
     def __init__(self, thresholds: GatingThresholds | None = None) -> None:
         self.thresholds = thresholds or GatingThresholds()
 
-    def apply(self, outputs: pd.DataFrame, features: pd.DataFrame | None = None) -> pd.DataFrame:
+    def apply(
+        self,
+        outputs: pd.DataFrame,
+        features: pd.DataFrame | None = None,
+        *,
+        logger=None,
+        symbol: str | None = None,
+        config_meta: dict | None = None,
+    ) -> pd.DataFrame:
         """Return DataFrame with ALLOW_* columns."""
         required = {"state_hat", "margin"}
         missing = required - set(outputs.columns)
@@ -41,8 +49,6 @@ class GatingPolicy:
         th = self.thresholds
         state_hat = outputs["state_hat"]
         margin = outputs["margin"]
-        ctx_filters_pass = pd.Series(True, index=outputs.index)
-        ctx_filters_pass = self._apply_context_filters(ctx_filters_pass, outputs, features)
         allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_trend_continuation = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
@@ -58,22 +64,72 @@ class GatingPolicy:
                 & (features["ReentryCount"] >= th.transition_reentry_min)
             )
 
+        transition_candidates = (state_hat == StateLabels.TRANSITION)
+        ctx_filters_pass, ctx_counts, ctx_fail_samples = self._apply_context_filters(
+            transition_candidates,
+            allow_transition_failure,
+            outputs,
+            features,
+        )
+        allow_transition_failure &= ctx_filters_pass
+
+        if logger is not None:
+            config_path = "unknown"
+            source = "missing"
+            keys_present: list[str] = []
+            if isinstance(config_meta, dict):
+                config_path = config_meta.get("config_path", config_path)
+                source = config_meta.get("source", source)
+                keys_present = config_meta.get("keys_present", keys_present)
+            logger.info(
+                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s keys_present=%s "
+                "allowed_sessions=%s state_age_min=%s state_age_max=%s dist_vwap_atr_min=%s dist_vwap_atr_max=%s",
+                symbol,
+                "ALLOW_transition_failure",
+                config_path,
+                source,
+                keys_present,
+                th.allowed_sessions,
+                th.state_age_min,
+                th.state_age_max,
+                th.dist_vwap_atr_min,
+                th.dist_vwap_atr_max,
+            )
+            logger.info(
+                "TRANSITION_CTX_FILTER_COUNTS symbol=%s n_transition_candidates=%s n_after_guardrails=%s "
+                "n_ctx_pass=%s n_ctx_fail=%s pass_session=%s pass_state_age=%s pass_dist=%s",
+                symbol,
+                ctx_counts.get("n_transition_candidates"),
+                ctx_counts.get("n_after_guardrails"),
+                ctx_counts.get("n_ctx_pass"),
+                ctx_counts.get("n_ctx_fail"),
+                ctx_counts.get("pass_session"),
+                ctx_counts.get("pass_state_age"),
+                ctx_counts.get("pass_dist"),
+            )
+            if ctx_fail_samples is not None and not ctx_fail_samples.empty:
+                logger.info(
+                    "TRANSITION_CTX_FILTER_FAIL_SAMPLES\n%s",
+                    ctx_fail_samples.to_string(index=False),
+                )
+
         return pd.DataFrame(
             {
-                "ALLOW_trend_pullback": (allow_trend_pullback & ctx_filters_pass).astype(int),
-                "ALLOW_trend_continuation": (allow_trend_continuation & ctx_filters_pass).astype(int),
-                "ALLOW_balance_fade": (allow_balance_fade & ctx_filters_pass).astype(int),
-                "ALLOW_transition_failure": (allow_transition_failure & ctx_filters_pass).astype(int),
+                "ALLOW_trend_pullback": allow_trend_pullback.astype(int),
+                "ALLOW_trend_continuation": allow_trend_continuation.astype(int),
+                "ALLOW_balance_fade": allow_balance_fade.astype(int),
+                "ALLOW_transition_failure": allow_transition_failure.astype(int),
             },
             index=outputs.index,
         )
 
     def _apply_context_filters(
         self,
-        ctx_pass: pd.Series,
+        transition_candidates: pd.Series,
+        allow_transition_failure: pd.Series,
         outputs: pd.DataFrame,
         features: pd.DataFrame | None,
-    ) -> pd.Series:
+    ) -> tuple[pd.Series, dict[str, int], pd.DataFrame | None]:
         def _get_col(column: str) -> pd.Series | None:
             if features is not None and column in features.columns:
                 return features[column]
@@ -82,28 +138,85 @@ class GatingPolicy:
             return None
 
         th = self.thresholds
-        if th.allowed_sessions is not None:
-            series = _get_col("ctx_session_bucket")
-            if series is not None:
-                allowed = {str(val) for val in th.allowed_sessions}
-                ctx_pass &= series.astype(str).isin(allowed)
-        if th.state_age_min is not None:
-            series = _get_col("ctx_state_age")
-            if series is not None:
-                ctx_pass &= series >= th.state_age_min
-        if th.state_age_max is not None:
-            series = _get_col("ctx_state_age")
-            if series is not None:
-                ctx_pass &= series <= th.state_age_max
-        if th.dist_vwap_atr_min is not None:
-            series = _get_col("ctx_dist_vwap_atr")
-            if series is not None:
-                ctx_pass &= series >= th.dist_vwap_atr_min
-        if th.dist_vwap_atr_max is not None:
-            series = _get_col("ctx_dist_vwap_atr")
-            if series is not None:
-                ctx_pass &= series <= th.dist_vwap_atr_max
-        return ctx_pass
+        session_series = _get_col("ctx_session_bucket")
+        state_age_series = _get_col("ctx_state_age")
+        dist_series = _get_col("ctx_dist_vwap_atr")
+        has_session = session_series is not None
+        has_state_age = state_age_series is not None
+        has_dist = dist_series is not None
+        if not has_session:
+            session_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+        if not has_state_age:
+            state_age_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+        if not has_dist:
+            dist_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+
+        session_mask = pd.Series(True, index=outputs.index)
+        state_age_mask = pd.Series(True, index=outputs.index)
+        dist_mask = pd.Series(True, index=outputs.index)
+
+        if th.allowed_sessions is not None and has_session:
+            allowed = {str(val) for val in th.allowed_sessions}
+            session_mask = session_series.astype(str).isin(allowed)
+        if has_state_age:
+            if th.state_age_min is not None:
+                state_age_mask &= state_age_series >= th.state_age_min
+            if th.state_age_max is not None:
+                state_age_mask &= state_age_series <= th.state_age_max
+        if has_dist:
+            if th.dist_vwap_atr_min is not None:
+                dist_mask &= dist_series >= th.dist_vwap_atr_min
+            if th.dist_vwap_atr_max is not None:
+                dist_mask &= dist_series <= th.dist_vwap_atr_max
+
+        ctx_pass = session_mask & state_age_mask & dist_mask
+        after_guardrails = allow_transition_failure
+
+        n_transition_candidates = int(transition_candidates.sum())
+        n_after_guardrails = int(after_guardrails.sum())
+        n_ctx_pass = int((after_guardrails & ctx_pass).sum())
+        n_ctx_fail = n_after_guardrails - n_ctx_pass
+
+        pass_session = int((after_guardrails & session_mask).sum())
+        pass_state_age = int((after_guardrails & state_age_mask).sum())
+        pass_dist = int((after_guardrails & dist_mask).sum())
+
+        counts = {
+            "n_transition_candidates": n_transition_candidates,
+            "n_after_guardrails": n_after_guardrails,
+            "n_ctx_pass": n_ctx_pass,
+            "n_ctx_fail": n_ctx_fail,
+            "pass_session": pass_session,
+            "pass_state_age": pass_state_age,
+            "pass_dist": pass_dist,
+        }
+
+        fail_samples = None
+        if n_ctx_fail > 0:
+            fail_mask = after_guardrails & ~ctx_pass
+            failure_rows = pd.DataFrame(
+                {
+                    "index": outputs.index.astype(str),
+                    "ctx_session_bucket": session_series,
+                    "ctx_state_age": state_age_series,
+                    "ctx_dist_vwap_atr": dist_series,
+                }
+            ).loc[fail_mask]
+            failure_rows = failure_rows.head(5).copy()
+            reasons: list[str] = []
+            for idx in failure_rows.index:
+                parts: list[str] = []
+                if not bool(session_mask.loc[idx]):
+                    parts.append("session")
+                if not bool(state_age_mask.loc[idx]):
+                    parts.append("state_age")
+                if not bool(dist_mask.loc[idx]):
+                    parts.append("dist_vwap_atr")
+                reasons.append("|".join(parts) if parts else "unknown")
+            failure_rows.insert(1, "reason", reasons)
+            fail_samples = failure_rows
+
+        return ctx_pass, counts, fail_samples
 
 
 def apply_allow_context_filters(

@@ -27,7 +27,7 @@ import pandas as pd
 from state_engine.features import FeatureConfig
 from state_engine.context_features import build_context_features
 from state_engine.config_loader import load_config
-from state_engine.gating import GatingPolicy, apply_allow_context_filters
+from state_engine.gating import GatingPolicy, GatingThresholds, apply_allow_context_filters
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel, StateEngineModelConfig
 from state_engine.mt5_connector import MT5Connector
@@ -339,6 +339,46 @@ def _load_symbol_config(symbol: str, logger: logging.Logger) -> dict[str, Any]:
     if not isinstance(config, dict):
         return {}
     return config
+
+
+def _build_transition_gating_thresholds(
+    symbol: str,
+    symbol_config: dict[str, Any],
+) -> tuple[GatingThresholds, dict[str, Any]]:
+    rule_cfg = {}
+    if isinstance(symbol_config, dict):
+        allow_cfg = symbol_config.get("allow_context_filters", {})
+        if isinstance(allow_cfg, dict):
+            rule_cfg = allow_cfg.get("ALLOW_transition_failure", {}) or {}
+    if not isinstance(rule_cfg, dict):
+        rule_cfg = {}
+    rule_cfg_raw = dict(rule_cfg)
+    if not rule_cfg.get("enabled", False):
+        rule_cfg = {}
+
+    overrides: dict[str, Any] = {}
+    if rule_cfg.get("sessions_in") is not None:
+        overrides["allowed_sessions"] = rule_cfg.get("sessions_in")
+    if rule_cfg.get("state_age_min") is not None:
+        overrides["state_age_min"] = int(rule_cfg["state_age_min"])
+    if rule_cfg.get("state_age_max") is not None:
+        overrides["state_age_max"] = int(rule_cfg["state_age_max"])
+    if rule_cfg.get("dist_vwap_atr_min") is not None:
+        overrides["dist_vwap_atr_min"] = float(rule_cfg["dist_vwap_atr_min"])
+    if rule_cfg.get("dist_vwap_atr_max") is not None:
+        overrides["dist_vwap_atr_max"] = float(rule_cfg["dist_vwap_atr_max"])
+    if rule_cfg.get("breakmag_min") is not None:
+        overrides["transition_breakmag_min"] = float(rule_cfg["breakmag_min"])
+    if rule_cfg.get("reentry_min") is not None:
+        overrides["transition_reentry_min"] = float(rule_cfg["reentry_min"])
+
+    thresholds = GatingThresholds(**{**asdict(GatingThresholds()), **overrides})
+    config_path = Path("configs") / "symbols" / f"{symbol}.yaml"
+    return thresholds, {
+        "keys_present": sorted(rule_cfg_raw.keys()),
+        "source": "symbol" if rule_cfg_raw else "missing",
+        "config_path": str(config_path) if config_path.exists() else "unknown",
+    }
 
 
 def _allow_filter_config_rows(symbol_config: dict[str, Any], allow_rule: str) -> list[dict[str, str]]:
@@ -1225,6 +1265,10 @@ def main() -> None:
         )
 
     symbol_config = _load_symbol_config(args.symbol, logger)
+    gating_thresholds, gating_config_meta = _build_transition_gating_thresholds(
+        args.symbol,
+        symbol_config,
+    )
 
     # Extra reporting helpers
     state_hat_dist = class_distribution(outputs["state_hat"].to_numpy(), label_order)
@@ -1239,9 +1283,15 @@ def main() -> None:
     logger.info("context_features_module=%s", build_context_features.__module__)
     context_mod = importlib.import_module(build_context_features.__module__)
     logger.info("context_features_file=%s", getattr(context_mod, "__file__", None))
-    gating_policy = GatingPolicy()
+    gating_policy = GatingPolicy(gating_thresholds)
     features_for_gating = full_features.join(ctx_features, how="left")
-    gating = gating_policy.apply(outputs, features_for_gating)
+    gating = gating_policy.apply(
+        outputs,
+        features_for_gating,
+        logger=logger,
+        symbol=args.symbol,
+        config_meta=gating_config_meta,
+    )
     allow_context_frame = gating.copy()
     context_cols = {}
     if "ctx_session_bucket" in ctx_features.columns:
