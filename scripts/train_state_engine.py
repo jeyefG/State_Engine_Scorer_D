@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import importlib
 import logging
@@ -32,7 +33,6 @@ from state_engine.pipeline import DatasetBuilder
 from state_engine.quality import (
     assign_quality_labels,
     build_quality_diagnostics,
-    format_quality_diagnostics,
     load_quality_config,
 )
 
@@ -78,8 +78,24 @@ def parse_args() -> argparse.Namespace:
         default=Path(PROJECT_ROOT / "state_engine" / "models"),
         help="Directorio base para guardar el modelo cuando --model-out no se especifica.",
     )
-    parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
+    parser.add_argument(
+        "--log-level",
+        choices=["minimal", "verbose", "debug"],
+        default="minimal",
+        help="Nivel de reporte en consola (minimal, verbose, debug).",
+    )
+    parser.add_argument(
+        "--logging-level",
+        default="INFO",
+        help="Logging level (INFO, DEBUG, WARNING)",
+    )
     parser.add_argument("--min-samples", type=int, default=2000, help="Minimum samples required to train")
+    parser.add_argument(
+        "--ev-min-split-samples",
+        type=int,
+        default=50,
+        help="Minimum samples per split for EV stability",
+    )
     parser.add_argument("--split-ratio", type=float, default=0.8, help="Train/test split ratio (0-1)")
     parser.add_argument("--no-rich", action="store_true", help="Disable rich console output")
     parser.add_argument("--report-out", type=Path, help="Optional report output path (.json)")
@@ -183,6 +199,241 @@ def render_table(
     console.print(table)
 
 
+REPORT_LEVELS = {"minimal": 0, "verbose": 1, "debug": 2}
+
+
+def _bucketize(series: pd.Series, bins: list[float], labels: list[str]) -> pd.Series:
+    if series is None or series.empty or not series.notna().any():
+        return pd.Series("NA", index=series.index if series is not None else None)
+    bucketed = pd.cut(series.astype(float), bins=bins, labels=labels, include_lowest=True)
+    return bucketed.astype(object).fillna("NA")
+
+
+def _session_bucket_from_timestamp(index: pd.DatetimeIndex) -> pd.Series:
+    hours = pd.Series(index.hour, index=index)
+    bins = [
+        (0, 6, "ASIA"),
+        (7, 12, "LONDON"),
+        (13, 17, "NY"),
+        (18, 23, "NY_PM"),
+    ]
+    def _map_hour(hour: int) -> str:
+        for start, end, label in bins:
+            if start <= hour <= end:
+                return label
+        return "NY_PM"
+    return hours.map(_map_hour).rename("ctx_session_bucket")
+
+
+def _split_time_terciles(index: pd.DatetimeIndex) -> list[pd.Series]:
+    index_ns = index.view("i8")
+    t33 = np.quantile(index_ns, 0.33)
+    t66 = np.quantile(index_ns, 0.66)
+    return [
+        index_ns <= t33,
+        (index_ns > t33) & (index_ns <= t66),
+        index_ns > t66,
+    ]
+
+
+def _print_block(
+    title: str,
+    df: pd.DataFrame,
+    *,
+    console: Any | None,
+    table_class: Any | None,
+    logger: logging.Logger,
+    max_rows: int | None = None,
+) -> None:
+    if max_rows is not None:
+        df = df.head(max_rows)
+    if console and table_class:
+        render_table(console, table_class, title, df.columns.tolist(), df.values.tolist())
+    else:
+        logger.info("%s\n%s", title, df.to_string(index=False))
+
+
+def _build_ev_extended_table(
+    ev_frame: pd.DataFrame,
+    outputs: pd.DataFrame,
+    gating: pd.DataFrame,
+    ctx_features: pd.DataFrame,
+    min_hvc_samples: int,
+    logger: logging.Logger,
+    warnings_state: dict[str, bool],
+) -> tuple[pd.DataFrame, dict[str, int], pd.DataFrame]:
+    base = ev_frame[["ret_struct", "state_hat"]].copy()
+    state_name = base["state_hat"].map(lambda v: StateLabels(v).name if not pd.isna(v) else "NA")
+    base["state"] = state_name
+    if "quality_label" in outputs.columns:
+        base["quality_label"] = outputs["quality_label"].reindex(base.index).fillna("NA")
+    else:
+        base["quality_label"] = "NA"
+    if "ctx_session_bucket" in ctx_features.columns and ctx_features["ctx_session_bucket"].notna().any():
+        base["ctx_session_bucket"] = (
+            ctx_features["ctx_session_bucket"].reindex(base.index).fillna("NA")
+        )
+    else:
+        if not warnings_state.get("missing_session_bucket", False):
+            logger.warning(
+                "ctx_session_bucket missing; fallback to timestamp hour bucket (tz-naive)."
+            )
+            warnings_state["missing_session_bucket"] = True
+        base["ctx_session_bucket"] = _session_bucket_from_timestamp(base.index)
+    if "ctx_state_age" in ctx_features.columns and ctx_features["ctx_state_age"].notna().any():
+        base["ctx_state_age_bucket"] = _bucketize(
+            ctx_features["ctx_state_age"].reindex(base.index),
+            bins=[0, 2, 5, 10, np.inf],
+            labels=["0-2", "3-5", "6-10", "11+"],
+        )
+    else:
+        base["ctx_state_age_bucket"] = "NA"
+    if "ctx_dist_vwap_atr" in ctx_features.columns and ctx_features["ctx_dist_vwap_atr"].notna().any():
+        base["ctx_dist_vwap_atr_bucket"] = _bucketize(
+            ctx_features["ctx_dist_vwap_atr"].reindex(base.index),
+            bins=[-np.inf, 0.5, 1.0, 2.0, np.inf],
+            labels=["<=0.5", "0.5-1", "1-2", ">2"],
+        )
+    else:
+        base["ctx_dist_vwap_atr_bucket"] = "NA"
+
+    allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
+    if not allow_cols:
+        if not warnings_state.get("missing_allow_cols", False):
+            logger.warning("No ALLOW_* columns found; skipping EV extended allow conditioning.")
+            warnings_state["missing_allow_cols"] = True
+        coverage = {
+            "total_rows_used": int(len(base)),
+            "total_rows_allowed": 0,
+            "rows_before_explode": 0,
+            "rows_after_explode": 0,
+        }
+        return pd.DataFrame(), coverage, pd.DataFrame()
+    allow_df = gating[allow_cols].reindex(base.index).fillna(False).astype(bool)
+    allow_rules = allow_df.apply(
+        lambda row: [col for col, val in row.items() if bool(val)],
+        axis=1,
+    )
+    allowed_mask = allow_rules.map(bool)
+    before_explode_rows = int(allowed_mask.sum())
+    exploded = base.loc[allowed_mask].assign(allow_rule=allow_rules.loc[allowed_mask]).explode(
+        "allow_rule"
+    )
+    after_explode_rows = int(len(exploded))
+    coverage = {
+        "total_rows_used": int(len(base)),
+        "total_rows_allowed": int(before_explode_rows),
+        "rows_before_explode": before_explode_rows,
+        "rows_after_explode": after_explode_rows,
+    }
+    if exploded.empty:
+        return pd.DataFrame(), coverage, pd.DataFrame()
+
+    group_cols = [
+        "state",
+        "quality_label",
+        "allow_rule",
+        "ctx_session_bucket",
+        "ctx_state_age_bucket",
+        "ctx_dist_vwap_atr_bucket",
+    ]
+    state_means = exploded.groupby("state")["ret_struct"].mean()
+
+    grouped = exploded.groupby(group_cols)["ret_struct"]
+    summary = grouped.agg(
+        n_samples="count",
+        ev_mean="mean",
+        ev_p10=lambda s: s.quantile(0.1),
+        ev_p50="median",
+        winrate=lambda s: float((s > 0).mean() * 100.0),
+    ).reset_index()
+    summary["uplift_vs_state"] = summary.apply(
+        lambda row: row["ev_mean"] - state_means.get(row["state"], np.nan),
+        axis=1,
+    )
+    summary = summary[summary["n_samples"] >= min_hvc_samples].reset_index(drop=True)
+    summary = summary[
+        [
+            "state",
+            "allow_rule",
+            "quality_label",
+            "ctx_session_bucket",
+            "ctx_state_age_bucket",
+            "ctx_dist_vwap_atr_bucket",
+            "n_samples",
+            "ev_mean",
+            "ev_p10",
+            "ev_p50",
+            "winrate",
+            "uplift_vs_state",
+        ]
+    ]
+    return summary, coverage, exploded
+
+
+def _build_ev_extended_stability(
+    exploded: pd.DataFrame,
+    ev_extended: pd.DataFrame,
+    ev_min_split_samples: int,
+) -> pd.DataFrame:
+    if exploded.empty or ev_extended.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        "state",
+        "quality_label",
+        "allow_rule",
+        "ctx_session_bucket",
+        "ctx_state_age_bucket",
+        "ctx_dist_vwap_atr_bucket",
+    ]
+    valid_keys = set(tuple(row) for row in ev_extended[group_cols].to_numpy())
+    index = exploded.sort_index().index
+    split_masks = _split_time_terciles(index)
+    uplifts_by_group: dict[tuple[Any, ...], list[float]] = {}
+    for mask in split_masks:
+        split = exploded.loc[mask]
+        if split.empty:
+            continue
+        state_counts = split.groupby("state")["ret_struct"].count()
+        state_means = split.groupby("state")["ret_struct"].mean()
+        group_counts = split.groupby(group_cols)["ret_struct"].count()
+        group_means = split.groupby(group_cols)["ret_struct"].mean()
+        for key, ev_mean in group_means.items():
+            state_key = key[0]
+            if key not in valid_keys:
+                continue
+            if (
+                state_key not in state_means.index
+                or state_counts.get(state_key, 0) < ev_min_split_samples
+                or group_counts.get(key, 0) < ev_min_split_samples
+            ):
+                continue
+            uplift = ev_mean - state_means.loc[state_key]
+            uplifts_by_group.setdefault(key, []).append(float(uplift))
+
+    rows: list[dict[str, Any]] = []
+    for key, uplifts in uplifts_by_group.items():
+        uplifts_arr = np.array(uplifts, dtype=float)
+        rows.append(
+            {
+                "state": key[0],
+                "quality_label": key[1],
+                "allow_rule": key[2],
+                "ctx_session_bucket": key[3],
+                "ctx_state_age_bucket": key[4],
+                "ctx_dist_vwap_atr_bucket": key[5],
+                "n_splits_present": int(len(uplifts_arr)),
+                "uplift_mean": float(np.mean(uplifts_arr)) if len(uplifts_arr) else np.nan,
+                "uplift_std": float(np.std(uplifts_arr)) if len(uplifts_arr) else np.nan,
+                "pct_splits_uplift_pos": float(np.mean(uplifts_arr > 0) * 100.0)
+                if len(uplifts_arr)
+                else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     args = parse_args()
     
@@ -195,7 +446,12 @@ def main() -> None:
         args.model_out = args.model_dir / f"{sym}_state_engine.pkl"
         
     rich_modules = try_import_rich() if not args.no_rich else None
-    logger = setup_logging(args.log_level)
+    logger = setup_logging(args.logging_level)
+    report_rank = REPORT_LEVELS[args.log_level]
+    is_verbose = report_rank >= REPORT_LEVELS["verbose"]
+    is_debug = report_rank >= REPORT_LEVELS["debug"]
+    warnings_state: dict[str, bool] = {}
+    logging.getLogger("state_engine.context_features").setLevel(logging.WARNING)
 
     console = None
     use_rich = bool(rich_modules)
@@ -329,6 +585,8 @@ def main() -> None:
     elapsed_outputs = step_done(stage_start)
     logger.info("outputs_rows=%s elapsed=%.2fs", len(outputs), elapsed_outputs)
 
+    quality_diagnostics = None
+    quality_warnings = []
     if args.quality:
         quality_config, quality_sources, quality_warnings = load_quality_config(
             args.symbol,
@@ -341,14 +599,12 @@ def main() -> None:
             quality_config,
         )
         outputs["quality_label"] = quality_labels
-        diagnostics = build_quality_diagnostics(
+        quality_diagnostics = build_quality_diagnostics(
             outputs["state_hat"],
             quality_labels,
             quality_sources,
             [*quality_warnings, *quality_warnings_assign],
         )
-        for line in format_quality_diagnostics(diagnostics):
-            logger.info(line)
 
     ctx_features = build_context_features(
         ohlcv,
@@ -360,8 +616,9 @@ def main() -> None:
         ctx_features = pd.DataFrame(index=outputs.index)
     else:
         ctx_features = ctx_features.reindex(outputs.index)
-    logger.info("ctx_features_cols=%s", list(ctx_features.columns))
-    logger.info("ctx_features_nonnull_tail=\n%s", ctx_features.tail(5).to_string())
+    if is_debug:
+        logger.info("ctx_features_cols=%s", list(ctx_features.columns))
+        logger.info("ctx_features_nonnull_tail=\n%s", ctx_features.tail(5).to_string())
     ctx_cols = [col for col in ctx_features.columns if col.startswith("ctx_")]
     if ctx_features.empty or not ctx_cols:
         logger.warning(
@@ -419,60 +676,20 @@ def main() -> None:
             }
         )
 
-    hvc_rows: list[dict[str, Any]] = []
-    for label in label_order:
-        mask_state = ev_frame["state_hat"] == label
-        ev_state = float(ev_frame.loc[mask_state, "ret_struct"].mean()) if mask_state.any() else 0.0
-        for col in gating.columns:
-            mask = mask_state & ev_frame[col].astype(bool)
-            n_samples = int(mask.sum())
-            if n_samples < min_hvc_samples:
-                continue
-            ev_hvc = float(ev_frame.loc[mask, "ret_struct"].mean()) if n_samples else 0.0
-            hvc_rows.append(
-                {
-                    "state": label.name,
-                    "allow_rule": col,
-                    "n_samples": n_samples,
-                    "ev_hvc": ev_hvc,
-                    "uplift": ev_hvc - ev_state,
-                }
-            )
-
-    split_frames = np.array_split(ev_frame.sort_index(), 3) if not ev_frame.empty else []
-    hvc_stability: list[dict[str, Any]] = []
-    for row in hvc_rows:
-        uplifts: list[float] = []
-        for split in split_frames:
-            if split.empty:
-                continue
-            mask_state = split["state_hat"] == StateLabels[row["state"]]
-            ev_state = float(split.loc[mask_state, "ret_struct"].mean()) if mask_state.any() else np.nan
-            mask_hvc = mask_state & split[row["allow_rule"]].astype(bool)
-            ev_hvc = float(split.loc[mask_hvc, "ret_struct"].mean()) if mask_hvc.any() else np.nan
-            if np.isnan(ev_state) or np.isnan(ev_hvc):
-                continue
-            uplifts.append(ev_hvc - ev_state)
-        if not uplifts:
-            uplift_mean = np.nan
-            uplift_std = np.nan
-            pct_positive = 0.0
-            n_splits = 0
-        else:
-            uplift_mean = float(np.mean(uplifts))
-            uplift_std = float(np.std(uplifts))
-            pct_positive = float(np.mean([u > 0 for u in uplifts]) * 100)
-            n_splits = len(uplifts)
-        hvc_stability.append(
-            {
-                "state": row["state"],
-                "allow_rule": row["allow_rule"],
-                "uplift_mean": uplift_mean,
-                "uplift_std": uplift_std,
-                "pct_splits_positive": pct_positive,
-                "n_splits": n_splits,
-            }
-        )
+    ev_extended_table, ev_extended_coverage, ev_extended_exploded = _build_ev_extended_table(
+        ev_frame=ev_frame,
+        outputs=outputs,
+        gating=gating,
+        ctx_features=ctx_features,
+        min_hvc_samples=min_hvc_samples,
+        logger=logger,
+        warnings_state=warnings_state,
+    )
+    ev_extended_stability = _build_ev_extended_stability(
+        ev_extended_exploded,
+        ev_extended_table,
+        args.ev_min_split_samples,
+    )
     
     # --- "Última vela" para reporting
     last_idx = outputs.index.max()
@@ -505,17 +722,18 @@ def main() -> None:
             "Loaded gating.py does not include context thresholds fields. Check PYTHONPATH / repo root."
         )
 
-    if ctx_cols:
-        allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
-        debug_frame = (
-            outputs[["state_hat", "margin"]]
-            .join(ctx_features[ctx_cols], how="left")
-            .join(full_features[["BreakMag", "ReentryCount"]], how="left")
-            .join(gating[allow_cols], how="left")
-        )
-        logger.info("[CTX DIAGNOSTIC TABLE] last_rows=10\n%s", debug_frame.tail(10).to_string())
-    else:
-        logger.warning("ctx_features missing ctx_* columns; skipping ctx diagnostic table.")
+    if is_debug:
+        if ctx_cols:
+            allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
+            debug_frame = (
+                outputs[["state_hat", "margin"]]
+                .join(ctx_features[ctx_cols], how="left")
+                .join(full_features[["BreakMag", "ReentryCount"]], how="left")
+                .join(gating[allow_cols], how="left")
+            )
+            logger.info("[CTX DIAGNOSTIC TABLE] last_rows=10\n%s", debug_frame.tail(10).to_string())
+        else:
+            logger.warning("ctx_features missing ctx_* columns; skipping ctx diagnostic table.")
 
     stage_start = step("save_model")
     metadata = {
@@ -562,175 +780,282 @@ def main() -> None:
     transition_break = full_features["BreakMag"] >= gating_thresholds.transition_breakmag_min
     transition_reentry = full_features["ReentryCount"] >= gating_thresholds.transition_reentry_min
 
-    if use_rich and console:
-        table_class = rich_modules["Table"]
-        render_table(
-            console,
-            table_class,
-            "Distribución de clases",
-            ["Clase", "Count", "%"],
-            [[row["label"], row["count"], f"{row['pct']:.2f}%"] for row in label_dist],
+    table_class = rich_modules["Table"] if use_rich and console else None
+
+    def _emit_table(title: str, df: pd.DataFrame, max_rows: int | None = None) -> None:
+        _print_block(
+            title,
+            df,
+            console=console if use_rich else None,
+            table_class=table_class if use_rich else None,
+            logger=logger,
+            max_rows=max_rows,
         )
-        render_table(
-            console,
-            table_class,
-            "Distribución state_hat (predicción)",
-            ["Clase", "Count", "%"],
-            [[row["label"], row["count"], f"{row['pct']:.2f}%"] for row in state_hat_dist],
-        )
-        render_table(
-            console,
-            table_class,
-            "Percentiles (BreakMag / ReentryCount)",
-            ["Métrica", "p0", "p50", "p75", "p90", "p95", "p99", "p100"],
-            [
+
+    if is_verbose or is_debug:
+        summary_lines = [
+            f"Symbol: {args.symbol}",
+            f"Period: {args.start} -> {args.end}",
+            f"Timeframe: {args.timeframe}",
+            f"Window: {args.window_hours}h (~{derived_bars} bars)",
+            f"Samples: {len(features)} (train={len(features_train)}, test={len(features_test)})",
+            f"Baseline: {baseline_label} ({baseline_pct:.2f}%)",
+            f"Gating allow rate: {gating_allow_rate*100:.2f}%",
+        ]
+
+        if console and use_rich:
+            console.print("=== State Engine Training Summary ===")
+            for line in summary_lines:
+                console.print(line)
+        else:
+            logger.info("=== State Engine Training Summary ===\n%s", "\n".join(summary_lines))
+
+    if is_verbose:
+        state_hat_df = pd.DataFrame(state_hat_dist)
+        _emit_table("Distribución state_hat (predicción)", state_hat_df)
+
+        if quality_diagnostics is not None:
+            quality_dist_df = pd.DataFrame(quality_diagnostics.distribution_rows)
+            _emit_table("QUALITY_DISTRIBUTION", quality_dist_df)
+            quality_splits_df = pd.DataFrame(quality_diagnostics.split_rows)
+            _emit_table("QUALITY_SPLITS", quality_splits_df)
+
+            incomplete_warnings = [w for w in quality_warnings if w.startswith("config_incomplete")]
+            missing_total = 0
+            for warning in incomplete_warnings:
+                if "missing=" in warning:
+                    missing_str = warning.split("missing=", 1)[1]
+                    try:
+                        missing_list = ast.literal_eval(missing_str)
+                    except (ValueError, SyntaxError):
+                        missing_list = []
+                    missing_total += len(missing_list)
+            quality_summary = pd.DataFrame(
                 [
-                    "BreakMag",
-                    breakmag_p.get("0"),
-                    breakmag_p.get("50"),
-                    breakmag_p.get("75"),
-                    breakmag_p.get("90"),
-                    breakmag_p.get("95"),
-                    breakmag_p.get("99"),
-                    breakmag_p.get("100"),
-                ],
-                [
-                    "ReentryCount",
-                    reentry_p.get("0"),
-                    reentry_p.get("50"),
-                    reentry_p.get("75"),
-                    reentry_p.get("90"),
-                    reentry_p.get("95"),
-                    reentry_p.get("99"),
-                    reentry_p.get("100"),
-                ],
-            ],
-        )
-        render_table(
-            console,
-            table_class,
-            "Métricas (Test)",
-            ["Accuracy", "F1 Macro"],
-            [[f"{acc:.4f}", f"{f1:.4f}"]],
-        )
-        render_table(
-            console,
-            table_class,
-            "Matriz de confusión",
-            ["Actual \\ Pred", *[l.name for l in label_order]],
-            [
-                [label_order[i].name, *matrix[i].tolist()]
-                for i in range(len(label_order))
-            ],
-        )
-        render_table(
-            console,
-            table_class,
-            "Top features (importance)",
-            ["Feature", "Importance"],
-            [[idx, float(val)] for idx, val in importances.items()],
-        )
-        # Gating summary as-is (your gating object is boolean columns per rule)
-        gating_summary = []
-        for col in gating.columns:
-            count = int(gating[col].sum())
-            pct = (count / len(gating)) * 100 if len(gating) else 0.0
-            gating_summary.append([col, count, f"{pct:.2f}%"])
-        render_table(
-            console,
-            table_class,
-            "Resumen gating",
-            ["Regla", "Count", "%"],
-            gating_summary,
-        )
-        render_table(
-            console,
-            table_class,
-            "EV estructural (base)",
-            ["EV_BASE", "k_bars", "n_samples"],
-            [[f"{ev_base:.6f}", str(ev_k_bars), str(len(ev_frame))]],
-        )
-        render_table(
-            console,
-            table_class,
-            "EV por estado",
-            ["Estado", "n_samples", "EV_state"],
-            [[row["state"], row["n_samples"], f"{row['ev']:.6f}"] for row in ev_by_state],
-        )
-        render_table(
-            console,
-            table_class,
-            "EV por HVC (state, allow)",
-            ["Estado", "ALLOW_*", "n_samples", "EV_HVC", "uplift"],
-            [
-                [
-                    row["state"],
-                    row["allow_rule"],
-                    row["n_samples"],
-                    f"{row['ev_hvc']:.6f}",
-                    f"{row['uplift']:.6f}",
+                    {
+                        "config_incomplete": bool(incomplete_warnings),
+                        "missing_count": missing_total,
+                    }
                 ]
-                for row in hvc_rows
-            ],
-        )
-        render_table(
-            console,
-            table_class,
-            "Estabilidad EV por HVC (splits)",
-            ["Estado", "ALLOW_*", "uplift_mean", "uplift_std", "% splits uplift > 0", "n_splits"],
+            )
+            _emit_table("QUALITY_CONFIG_EFFECTIVE (summary)", quality_summary)
+
+    if is_debug and quality_diagnostics is not None:
+        quality_config_df = pd.DataFrame(
             [
-                [
-                    row["state"],
-                    row["allow_rule"],
-                    f"{row['uplift_mean']:.6f}" if not np.isnan(row["uplift_mean"]) else "NA",
-                    f"{row['uplift_std']:.6f}" if not np.isnan(row["uplift_std"]) else "NA",
-                    f"{row['pct_splits_positive']:.2f}%",
-                    row["n_splits"],
-                ]
-                for row in hvc_stability
-            ],
+                {"key": key, "source": src}
+                for key, src in sorted(quality_diagnostics.config_sources.items())
+            ]
         )
-        render_table(
-            console,
-            table_class,
-            "Detalles transición (guardrails)",
-            ["Condición", "Count"],
-            [
-                ["margin>=min", int(transition_rule.sum())],
-                ["margin+breakmag", int((transition_rule & transition_break).sum())],
-                ["margin+breakmag+reentry", int((transition_rule & transition_break & transition_reentry).sum())],
-            ],
+        _emit_table("QUALITY_CONFIG_EFFECTIVE", quality_config_df)
+        quality_persist_df = pd.DataFrame(quality_diagnostics.persistence_rows)
+        _emit_table("QUALITY_PERSISTENCE", quality_persist_df)
+        quality_warn_df = pd.DataFrame({"warning": quality_diagnostics.warnings or ["none"]})
+        _emit_table("QUALITY_WARNINGS", quality_warn_df)
+
+    ev_base_df = pd.DataFrame(
+        [
+            {
+                "EV_BASE": ev_base,
+                "k_bars": ev_k_bars,
+                "n_samples": len(ev_frame),
+            }
+        ]
+    )
+    _emit_table("EV_BASE", ev_base_df)
+
+    ev_state_df = pd.DataFrame(ev_by_state)
+    _emit_table("EV_state", ev_state_df)
+
+    if not ev_extended_exploded.empty:
+        ev_hvc_grouped = (
+            ev_extended_exploded.groupby(["state", "allow_rule"])["ret_struct"]
+            .agg(n_samples="count", ev_mean="mean")
+            .reset_index()
         )
-        console.print("=== State Engine Training Summary ===")
-        console.print(f"Symbol: {args.symbol}")
-        console.print(f"Period: {args.start} -> {args.end}")
-        console.print(f"Samples: {len(features)} (train={len(features_train)}, test={len(features_test)})")
-        console.print(f"Baseline: {baseline_label} ({baseline_pct:.2f}%)")
-        console.print(f"Accuracy: {acc:.4f} | F1 Macro: {f1:.4f}")
-        console.print(f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)")
-        console.print(f"Last {args.timeframe} bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
-        console.print(f"Server now (tick): {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}")
-        console.print(f"Last bar decision: ALLOW={last_allow} | state_hat={StateLabels(last_state_hat).name if last_state_hat is not None else 'NA'} | margin={last_margin:.4f}")
-        console.print(f"Last bar rules fired: {last_rules if last_rules else '[]'}")
-        console.print(f"Context window: {args.window_hours}h (~{derived_bars} bars @ {args.timeframe})")
-        console.print(f"Model saved: {args.model_out}")
+        ev_state_map = {
+            row["state"]: row["ev"] for row in ev_by_state
+        }
+        ev_hvc_grouped["uplift_vs_state"] = ev_hvc_grouped.apply(
+            lambda row: row["ev_mean"] - ev_state_map.get(row["state"], np.nan),
+            axis=1,
+        )
+        ev_hvc_grouped = ev_hvc_grouped[ev_hvc_grouped["n_samples"] >= min_hvc_samples]
     else:
-        logger.info("class_distribution=%s", label_dist)
-        logger.info("state_hat_distribution=%s", state_hat_dist)
-        logger.info("breakmag_percentiles=%s", breakmag_p)
-        logger.info("reentry_percentiles=%s", reentry_p)
-        logger.info("confusion_matrix=%s", matrix.tolist())
-        logger.info("top_features=%s", importances.to_dict())
-        logger.info("ev_structural_base=%s", {"ev_base": ev_base, "k_bars": ev_k_bars, "n_samples": len(ev_frame)})
-        logger.info("ev_by_state=%s", ev_by_state)
-        logger.info("ev_by_hvc=%s", hvc_rows)
-        logger.info("ev_hvc_stability=%s", hvc_stability)
-        logger.info(
-            "context_window=%sh (~%s bars @ %s)",
-            args.window_hours,
-            derived_bars,
-            args.timeframe,
+        ev_hvc_grouped = pd.DataFrame(columns=["state", "allow_rule", "n_samples", "ev_mean", "uplift_vs_state"])
+    _emit_table("EV_HVC (state, allow)", ev_hvc_grouped)
+
+    group_cols = [
+        "state",
+        "quality_label",
+        "allow_rule",
+        "ctx_session_bucket",
+        "ctx_state_age_bucket",
+        "ctx_dist_vwap_atr_bucket",
+    ]
+    if not ev_extended_stability.empty:
+        stability_ranked = ev_extended_stability.merge(
+            ev_extended_table[group_cols + ["n_samples"]],
+            on=group_cols,
+            how="left",
         )
+        stability_ranked["n_splits_present"] = stability_ranked["n_splits_present"].fillna(0)
+        stability_ranked["pct_splits_uplift_pos"] = stability_ranked["pct_splits_uplift_pos"].fillna(0.0)
+        stability_ranked["uplift_mean"] = stability_ranked["uplift_mean"].fillna(0.0)
+        stability_ranked["n_samples"] = stability_ranked["n_samples"].fillna(0)
+        stability_ranked = stability_ranked.sort_values(
+            by=[
+                "n_splits_present",
+                "pct_splits_uplift_pos",
+                "uplift_mean",
+                "n_samples",
+            ],
+            ascending=[False, False, False, False],
+        )
+        top_stability = stability_ranked.head(20)
+        top_extended = ev_extended_table.merge(
+            stability_ranked[group_cols],
+            on=group_cols,
+            how="inner",
+        )
+        top_extended = top_extended.set_index(group_cols).loc[
+            top_stability.set_index(group_cols).index
+        ].reset_index()
+    else:
+        top_stability = ev_extended_stability
+        top_extended = ev_extended_table.head(20)
+
+    if not ev_extended_table.empty:
+        _emit_table("EV_EXTENDED_TABLE (top 20)", top_extended, max_rows=20)
+        if not top_stability.empty:
+            _emit_table("EV_EXTENDED_STABILITY (top 20)", top_stability, max_rows=20)
+
+    coverage_rows = [
+        {
+            "total_rows_used": ev_extended_coverage.get("total_rows_used", 0),
+            "total_rows_allowed": ev_extended_coverage.get("total_rows_allowed", 0),
+            "rows_before_explode": ev_extended_coverage.get("rows_before_explode", 0),
+            "rows_after_explode": ev_extended_coverage.get("rows_after_explode", 0),
+            "coverage_before_explode_pct": (
+                ev_extended_coverage.get("rows_before_explode", 0)
+                / max(ev_extended_coverage.get("total_rows_used", 1), 1)
+                * 100.0
+            ),
+            "coverage_after_explode_pct": (
+                ev_extended_coverage.get("rows_after_explode", 0)
+                / max(ev_extended_coverage.get("total_rows_used", 1), 1)
+                * 100.0
+            ),
+        }
+    ]
+    _emit_table("COVERAGE_SUMMARY", pd.DataFrame(coverage_rows))
+    if is_debug:
+        state_cov_df = pd.DataFrame(
+            ev_frame["state_hat"].map(lambda v: StateLabels(v).name).value_counts()
+        ).reset_index()
+        state_cov_df.columns = ["state_hat", "count"]
+        _emit_table("COVERAGE_STATE", state_cov_df)
+
+        if "quality_label" in outputs.columns:
+            quality_cov_df = outputs.loc[ev_frame.index, "quality_label"].value_counts().reset_index()
+            quality_cov_df.columns = ["quality_label", "count"]
+            _emit_table("COVERAGE_QUALITY", quality_cov_df)
+
+        if not ev_extended_exploded.empty:
+            allow_cov_df = ev_extended_exploded["allow_rule"].value_counts().reset_index()
+            allow_cov_df.columns = ["allow_rule", "count"]
+            _emit_table("COVERAGE_ALLOW", allow_cov_df)
+
+        if "ctx_session_bucket" in ctx_features.columns:
+            session_cov_df = ctx_features.loc[ev_frame.index, "ctx_session_bucket"].value_counts().reset_index()
+            session_cov_df.columns = ["ctx_session_bucket", "count"]
+            _emit_table("COVERAGE_SESSION", session_cov_df)
+
+    if is_verbose:
+        if "ctx_dist_vwap_atr" in ctx_features.columns:
+            dist_series = pd.to_numeric(
+                ctx_features.loc[ev_frame.index, "ctx_dist_vwap_atr"], errors="coerce"
+            )
+            vwap_summary = pd.DataFrame(
+                [
+                    {
+                        "nan_pct": float(dist_series.isna().mean() * 100.0),
+                        "dist_nan_pct": float(dist_series.isna().mean() * 100.0),
+                        "dist_p50": float(dist_series.quantile(0.5)) if dist_series.notna().any() else np.nan,
+                        "dist_p90": float(dist_series.quantile(0.9)) if dist_series.notna().any() else np.nan,
+                    }
+                ]
+            )
+            _emit_table("VWAP_VALIDATION (summary)", vwap_summary)
+
+    if is_debug:
+        class_dist_df = pd.DataFrame(label_dist)
+        _emit_table("Distribución de clases", class_dist_df)
+        percentiles_df = pd.DataFrame(
+            [
+                {"metric": "BreakMag", **breakmag_p},
+                {"metric": "ReentryCount", **reentry_p},
+            ]
+        )
+        _emit_table("Percentiles (BreakMag / ReentryCount)", percentiles_df)
+        metrics_df = pd.DataFrame([{"accuracy": acc, "f1_macro": f1}])
+        _emit_table("Métricas (Test)", metrics_df)
+        confusion_df = pd.DataFrame(
+            matrix,
+            columns=[l.name for l in label_order],
+            index=[l.name for l in label_order],
+        ).reset_index().rename(columns={"index": "Actual"})
+        _emit_table("Matriz de confusión", confusion_df)
+        importances_df = importances.reset_index()
+        importances_df.columns = ["feature", "importance"]
+        _emit_table("Top features (importance)", importances_df)
+        gating_summary_df = pd.DataFrame(
+            [
+                {
+                    "allow_rule": col,
+                    "count": int(gating[col].sum()),
+                    "pct": float(gating[col].mean() * 100.0) if len(gating) else 0.0,
+                }
+                for col in gating.columns
+            ]
+        )
+        _emit_table("Resumen gating", gating_summary_df)
+        transition_df = pd.DataFrame(
+            [
+                {"condition": "margin>=min", "count": int(transition_rule.sum())},
+                {
+                    "condition": "margin+breakmag",
+                    "count": int((transition_rule & transition_break).sum()),
+                },
+                {
+                    "condition": "margin+breakmag+reentry",
+                    "count": int(
+                        (transition_rule & transition_break & transition_reentry).sum()
+                    ),
+                },
+            ]
+        )
+        _emit_table("Detalles transición (guardrails)", transition_df)
+        if "ctx_dist_vwap_atr" in ctx_features.columns and "ctx_session_bucket" in ctx_features.columns:
+            dist_series = pd.to_numeric(
+                ctx_features.loc[ev_frame.index, "ctx_dist_vwap_atr"], errors="coerce"
+            )
+            session_series = ctx_features.loc[ev_frame.index, "ctx_session_bucket"]
+            bucket_rows = []
+            for bucket, values in dist_series.groupby(session_series):
+                values = values.dropna()
+                if values.empty:
+                    continue
+                bucket_rows.append(
+                    {
+                        "bucket": bucket,
+                        "count": int(values.shape[0]),
+                        "dist_p50": float(values.quantile(0.5)),
+                        "dist_p90": float(values.quantile(0.9)),
+                    }
+                )
+            if bucket_rows:
+                _emit_table("VWAP_BUCKET_VALIDATION", pd.DataFrame(bucket_rows))
 
     # Optional: JSON report
     report_payload = {
