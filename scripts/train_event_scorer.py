@@ -30,7 +30,11 @@ from sklearn.metrics import roc_auc_score
 
 from state_engine.events import EventDetectionConfig, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
-from state_engine.gating import GatingPolicy, apply_allow_context_filters
+from state_engine.gating import (
+    GatingPolicy,
+    apply_allow_context_filters,
+    build_transition_gating_thresholds,
+)
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.labels import StateLabels
@@ -2849,7 +2853,8 @@ def main() -> None:
     state_model.load(model_path)
 
     feature_engineer = FeatureEngineer(FeatureConfig())
-    gating = GatingPolicy()
+    gating_thresholds, _ = build_transition_gating_thresholds(args.symbol, config_payload)
+    gating = GatingPolicy(gating_thresholds)
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, config_payload, logger)
 
     df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score)

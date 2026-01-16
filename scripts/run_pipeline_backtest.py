@@ -18,7 +18,11 @@ import pandas as pd
 from state_engine.backtest import BacktestConfig, Signal, run_backtest
 from state_engine.events import EventFamily, detect_events
 from state_engine.features import FeatureConfig, FeatureEngineer
-from state_engine.gating import GatingPolicy, apply_allow_context_filters
+from state_engine.gating import (
+    GatingPolicy,
+    apply_allow_context_filters,
+    build_transition_gating_thresholds,
+)
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
@@ -233,8 +237,9 @@ def main() -> None:
     state_model.load(state_model_path)
 
     feature_engineer = FeatureEngineer(FeatureConfig())
-    gating = GatingPolicy()
     symbol_cfg = load_symbol_config(args.symbol, logger)
+    gating_thresholds, _ = build_transition_gating_thresholds(args.symbol, symbol_cfg)
+    gating = GatingPolicy(gating_thresholds)
     ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, symbol_cfg, logger)
 
     df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
