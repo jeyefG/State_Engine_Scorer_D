@@ -341,7 +341,27 @@ def _print_block(
     if console and table_class:
         render_table(console, table_class, title, df.columns.tolist(), df.values.tolist())
     else:
-        logger.info("%s\n%s", title, df.to_string(index=False))
+        logger.info(
+            "%s\n%s",
+            title,
+            df.to_string(index=False, max_colwidth=None, line_width=2000),
+        )
+
+
+def _export_rescue_csv(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> None:
+    if df.empty:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_title = title.lower().replace(" ", "_")
+    output_path = output_dir / f"{safe_title}.csv"
+    df.to_csv(output_path, index=False)
+    logger.info("rescue_scan export_csv=%s rows=%s", output_path, len(df))
 
 
 def _rescue_scan_tables(
@@ -369,10 +389,13 @@ def _rescue_scan_tables(
     logger: logging.Logger | None = None,
     console: Any | None = None,
     table_class: Any | None = None,
+    rescue_output_dir: Path | None = None,
 ) -> None:
     logger = logger or logging.getLogger(__name__)
+    rescue_output_dir = rescue_output_dir or (PROJECT_ROOT / "state_engine" / "models" / "rescue")
 
     def _emit(title: str, df: pd.DataFrame, max_rows: int | None = None) -> None:
+        _export_rescue_csv(df, title=title, output_dir=rescue_output_dir, logger=logger)
         _print_block(
             title,
             df,
@@ -1401,6 +1424,7 @@ def main() -> None:
             logger=logger,
             console=console if use_rich else None,
             table_class=table_class if use_rich else None,
+            rescue_output_dir=PROJECT_ROOT / "state_engine" / "models" / "rescue",
         )
         _rescue_scan_tables(
             df_outputs,
@@ -1420,6 +1444,7 @@ def main() -> None:
             logger=logger,
             console=console if use_rich else None,
             table_class=table_class if use_rich else None,
+            rescue_output_dir=PROJECT_ROOT / "state_engine" / "models" / "rescue",
         )
 
     group_cols = [
