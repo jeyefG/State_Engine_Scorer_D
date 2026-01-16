@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import logging
 
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -10,6 +11,9 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 from .labels import StateLabels
+
+
+_CTX_DIAG_LOGGED = False
 
 
 @dataclass(frozen=True)
@@ -278,6 +282,9 @@ class GatingPolicy:
             return None
 
         th = self.thresholds
+        idx = outputs.index
+        transition_candidates = transition_candidates.reindex(idx).fillna(False)
+        allow_transition_failure = allow_transition_failure.reindex(idx).fillna(False)
         session_series = _get_col("ctx_session_bucket")
         state_age_series = _get_col("ctx_state_age")
         dist_series = _get_col("ctx_dist_vwap_atr")
@@ -285,15 +292,21 @@ class GatingPolicy:
         has_state_age = state_age_series is not None
         has_dist = dist_series is not None
         if not has_session:
-            session_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+            session_series = pd.Series([None] * len(idx), index=idx)
+        else:
+            session_series = session_series.reindex(idx)
         if not has_state_age:
-            state_age_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+            state_age_series = pd.Series([None] * len(idx), index=idx)
+        else:
+            state_age_series = state_age_series.reindex(idx)
         if not has_dist:
-            dist_series = pd.Series([None] * len(outputs.index), index=outputs.index)
+            dist_series = pd.Series([None] * len(idx), index=idx)
+        else:
+            dist_series = dist_series.reindex(idx)
 
-        session_mask = pd.Series(True, index=outputs.index)
-        state_age_mask = pd.Series(True, index=outputs.index)
-        dist_mask = pd.Series(True, index=outputs.index)
+        session_mask = pd.Series(True, index=idx)
+        state_age_mask = pd.Series(True, index=idx)
+        dist_mask = pd.Series(True, index=idx)
         active_masks: list[pd.Series] = []
 
         if th.allowed_sessions is not None and has_session:
@@ -334,12 +347,18 @@ class GatingPolicy:
                 ctx_pass = active_masks[0]
                 for mask in active_masks[1:]:
                     ctx_pass = ctx_pass | mask
-        after_guardrails = allow_transition_failure
+        after_guardrails = allow_transition_failure.reindex(idx).fillna(False)
+        ctx_pass = ctx_pass.reindex(idx).fillna(False)
+        session_mask = session_mask.reindex(idx).fillna(False)
+        state_age_mask = state_age_mask.reindex(idx).fillna(False)
+        dist_mask = dist_mask.reindex(idx).fillna(False)
 
         n_transition_candidates = int(transition_candidates.sum())
         n_after_guardrails = int(after_guardrails.sum())
         n_ctx_pass = int((after_guardrails & ctx_pass).sum())
         n_ctx_fail = n_after_guardrails - n_ctx_pass
+
+        fail_mask = after_guardrails & ~ctx_pass
 
         pass_session = int((after_guardrails & session_mask).sum())
         pass_state_age = int((after_guardrails & state_age_mask).sum())
@@ -355,16 +374,33 @@ class GatingPolicy:
             "pass_dist": pass_dist,
         }
 
+        logger = logging.getLogger(__name__)
+        global _CTX_DIAG_LOGGED
+        if not _CTX_DIAG_LOGGED:
+            features_len = len(features.index) if features is not None else None
+            idx_equal = outputs.index.equals(features.index) if features is not None else None
+            logger.info(
+                "CTX_FILTER_DIAG OUTPUTS_LEN=%s FEATURES_LEN=%s IDX_EQUAL=%s "
+                "MASK_LENS after_guardrails=%s ctx_pass=%s fail_mask=%s",
+                len(outputs.index),
+                features_len,
+                idx_equal,
+                len(after_guardrails),
+                len(ctx_pass),
+                len(fail_mask),
+            )
+            _CTX_DIAG_LOGGED = True
+
         fail_samples = None
         if n_ctx_fail > 0:
-            fail_mask = after_guardrails & ~ctx_pass
             failure_rows = pd.DataFrame(
                 {
-                    "index": outputs.index.astype(str),
+                    "index": idx.astype(str),
                     "ctx_session_bucket": session_series,
                     "ctx_state_age": state_age_series,
                     "ctx_dist_vwap_atr": dist_series,
-                }
+                },
+                index=idx,
             ).loc[fail_mask]
             failure_rows = failure_rows.head(5).copy()
             reasons: list[str] = []
