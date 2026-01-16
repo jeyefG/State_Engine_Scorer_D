@@ -160,6 +160,20 @@ class GatingPolicy:
         th = self.thresholds
         state_hat = outputs["state_hat"]
         margin = outputs["margin"]
+        # --- HARD ALIGN: features must follow outputs index (outputs is post-clean) ---
+        if features is not None and not features.index.equals(outputs.index):
+            if logger is not None:
+                logger.info(
+                    "GATING_ALIGN symbol=%s outputs_len=%s features_len_before=%s idx_equal_before=%s",
+                    symbol, len(outputs), len(features), features.index.equals(outputs.index)
+                )
+            features = features.reindex(outputs.index)
+            if logger is not None:
+                logger.info(
+                    "GATING_ALIGN_DONE symbol=%s features_len_after=%s idx_equal_after=%s",
+                    symbol, len(outputs), len(features), features.index.equals(outputs.index)
+                )
+        # ---------------------------------------------------------------------------
         allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_trend_continuation = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
         allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
@@ -251,6 +265,18 @@ class GatingPolicy:
                 ctx_counts.get("pass_state_age"),
                 ctx_counts.get("pass_dist"),
             )
+            if logger is not None:
+                total_rows = max(int(len(outputs.index)), 1)
+                n_after = int(ctx_counts.get("n_after_guardrails", 0) or 0)
+                n_pass  = int(ctx_counts.get("n_ctx_pass", 0) or 0)
+                before_pct = 100.0 * n_after / total_rows
+                after_pct  = 100.0 * n_pass  / total_rows
+                logger.info(
+                    "ALLOW_transition_failure_RATE symbol=%s after_guardrails=%s ctx_pass=%s total=%s "
+                    "before=%.2f%% after=%.2f%% delta=%.2f%%",
+                    symbol, n_after, n_pass, total_rows,
+                    before_pct, after_pct, (after_pct - before_pct)
+                )
             if ctx_fail_samples is not None and not ctx_fail_samples.empty:
                 logger.info(
                     "TRANSITION_CTX_FILTER_FAIL_SAMPLES\n%s",
@@ -393,15 +419,14 @@ class GatingPolicy:
 
         fail_samples = None
         if n_ctx_fail > 0:
-            failure_rows = pd.DataFrame(
-                {
-                    "index": idx.astype(str),
-                    "ctx_session_bucket": session_series,
-                    "ctx_state_age": state_age_series,
-                    "ctx_dist_vwap_atr": dist_series,
-                },
-                index=idx,
-            ).loc[fail_mask]
+            # --- build aligned diagnostic df (never trust incoming series lengths) ---
+            failure_rows = pd.DataFrame(index=idx)
+            failure_rows["index"] = idx.astype(str)
+            failure_rows["ctx_session_bucket"] = session_series.reindex(idx).values
+            failure_rows["ctx_state_age"] = state_age_series.reindex(idx).values
+            failure_rows["ctx_dist_vwap_atr"] = dist_series.reindex(idx).values
+        
+            failure_rows = failure_rows.loc[fail_mask]
             failure_rows = failure_rows.head(5).copy()
             reasons: list[str] = []
             for idx in failure_rows.index:
@@ -615,3 +640,4 @@ __all__ = [
     "apply_allow_context_filters",
     "build_transition_gating_thresholds",
 ]
+
