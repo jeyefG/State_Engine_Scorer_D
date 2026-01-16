@@ -107,6 +107,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Quality Layer config path (YAML/JSON)",
     )
+    parser.add_argument(
+        "--diagnose-rescue-scans",
+        action="store_true",
+        help="Run diagnostic BALANCE/TRANSITION rescue scans (telemetry only).",
+    )
+    parser.add_argument(
+        "--rescue-n-min",
+        type=int,
+        default=50,
+        help="Minimum samples per split for rescue scan candidates.",
+    )
+    parser.add_argument(
+        "--rescue-delta-max",
+        type=float,
+        default=0.10,
+        help="Max train/test share delta for rescue scan candidates.",
+    )
+    parser.add_argument(
+        "--rescue-top-k",
+        type=int,
+        default=12,
+        help="Top-k rows to display for rescue scan tables.",
+    )
     return parser.parse_args()
 
 
@@ -251,6 +274,211 @@ def _print_block(
         render_table(console, table_class, title, df.columns.tolist(), df.values.tolist())
     else:
         logger.info("%s\n%s", title, df.to_string(index=False))
+
+
+def _rescue_scan_tables(
+    df_outputs: pd.DataFrame,
+    *,
+    target_state: str,
+    state_col_candidates: tuple[str, ...] = ("state", "state_base"),
+    quality_col: str = "quality",
+    time_col: str = "time",
+    split_col: str = "split",
+    top_k: int = 12,
+    n_min: int = 50,
+    delta_max: float = 0.10,
+    age_bins: tuple[float, ...] = (0, 2, 4, 8, float("inf")),
+    age_labels: tuple[str, ...] = ("0-1", "2-3", "4-7", "8+"),
+    dist_bins: tuple[float, ...] = (0, 0.5, 1.0, 2.0, float("inf")),
+    dist_labels: tuple[str, ...] = ("<0.5", "0.5-1.0", "1.0-2.0", "2.0+"),
+    confidence_cols: tuple[str, ...] = ("score_margin", "margin", "confidence"),
+    logger: logging.Logger | None = None,
+    console: Any | None = None,
+    table_class: Any | None = None,
+) -> None:
+    logger = logger or logging.getLogger(__name__)
+
+    def _emit(title: str, df: pd.DataFrame, max_rows: int | None = None) -> None:
+        _print_block(
+            title,
+            df,
+            console=console,
+            table_class=table_class,
+            logger=logger,
+            max_rows=max_rows,
+        )
+
+    state_col = next((col for col in state_col_candidates if col in df_outputs.columns), None)
+    if state_col is None:
+        logger.warning(
+            "rescue_scan target=%s skipped: missing state column (candidates=%s)",
+            target_state,
+            state_col_candidates,
+        )
+        return
+
+    total_rows = len(df_outputs)
+    state_df = df_outputs.loc[df_outputs[state_col] == target_state].copy()
+    n_state = len(state_df)
+    pct_total = (n_state / total_rows * 100.0) if total_rows else 0.0
+
+    if "session_bucket" in state_df.columns:
+        state_df["session_bucket"] = state_df["session_bucket"].fillna("ALL")
+    else:
+        logger.info("rescue_scan target=%s session_bucket missing; using ALL", target_state)
+        state_df["session_bucket"] = "ALL"
+
+    if "state_age" in state_df.columns:
+        state_df["state_age_bucket"] = pd.cut(
+            pd.to_numeric(state_df["state_age"], errors="coerce"),
+            bins=list(age_bins),
+            labels=list(age_labels),
+            include_lowest=True,
+        ).astype(object).fillna("MISSING")
+    else:
+        logger.info("rescue_scan target=%s state_age missing; using MISSING", target_state)
+        state_df["state_age_bucket"] = "MISSING"
+
+    if "dist_vwap_atr" in state_df.columns:
+        state_df["dist_vwap_atr_bucket"] = pd.cut(
+            pd.to_numeric(state_df["dist_vwap_atr"], errors="coerce"),
+            bins=list(dist_bins),
+            labels=list(dist_labels),
+            include_lowest=True,
+        ).astype(object).fillna("MISSING")
+    else:
+        logger.info("rescue_scan target=%s dist_vwap_atr missing; using MISSING", target_state)
+        state_df["dist_vwap_atr_bucket"] = "MISSING"
+
+    if split_col in state_df.columns:
+        state_df["_split_col"] = state_df[split_col].astype(str)
+    else:
+        if time_col in state_df.columns:
+            ordered_index = state_df[time_col].sort_values(kind="mergesort").index
+        elif isinstance(state_df.index, pd.DatetimeIndex):
+            ordered_index = state_df.index.sort_values()
+        else:
+            ordered_index = state_df.index
+        n_train = int(len(state_df) * 0.8)
+        train_idx = set(ordered_index[:n_train])
+        state_df["_split_col"] = np.where(state_df.index.isin(train_idx), "train", "test")
+    split_col_name = "_split_col"
+
+    composition_rows = [
+        {
+            "bucket": "TOTAL_STATE",
+            "n": n_state,
+            "pct_total": pct_total,
+            "pct_state": 100.0 if n_state else 0.0,
+        }
+    ]
+    if quality_col in state_df.columns:
+        quality_counts = state_df[quality_col].fillna("NA").astype(str).value_counts()
+        top_quality = quality_counts.head(top_k)
+        for label, count in top_quality.items():
+            composition_rows.append(
+                {
+                    "bucket": f"quality:{label}",
+                    "n": int(count),
+                    "pct_total": (count / total_rows * 100.0) if total_rows else 0.0,
+                    "pct_state": (count / n_state * 100.0) if n_state else 0.0,
+                }
+            )
+        if len(quality_counts) > top_k:
+            other_count = int(quality_counts.iloc[top_k:].sum())
+            composition_rows.append(
+                {
+                    "bucket": "quality:OTHER",
+                    "n": other_count,
+                    "pct_total": (other_count / total_rows * 100.0) if total_rows else 0.0,
+                    "pct_state": (other_count / n_state * 100.0) if n_state else 0.0,
+                }
+            )
+    else:
+        logger.info("rescue_scan target=%s skipped quality (missing %s)", target_state, quality_col)
+
+    composition_df = pd.DataFrame(composition_rows)
+    _emit(f"{target_state}_COMPOSITION", composition_df)
+
+    group_cols = ["session_bucket", "state_age_bucket", "dist_vwap_atr_bucket"]
+    if n_state:
+        grouped = state_df.groupby(group_cols, dropna=False)
+        grid = grouped.size().rename("n_total").to_frame()
+        split_counts = grouped[split_col_name].value_counts().unstack(fill_value=0)
+        grid = grid.join(split_counts, how="left")
+        grid["n_train"] = grid.get("train", 0)
+        grid["n_test"] = grid.get("test", 0)
+        grid = grid.reset_index()
+        grid["pct_total"] = (grid["n_total"] / total_rows * 100.0) if total_rows else 0.0
+        grid["pct_state"] = (grid["n_total"] / n_state * 100.0) if n_state else 0.0
+        grid["train_share"] = np.where(grid["n_total"] > 0, grid["n_train"] / grid["n_total"], 0.0)
+        grid["test_share"] = np.where(grid["n_total"] > 0, grid["n_test"] / grid["n_total"], 0.0)
+        grid["share_delta"] = (grid["train_share"] - grid["test_share"]).abs()
+        grid["min_split_n"] = grid[["n_train", "n_test"]].min(axis=1)
+    else:
+        grid = pd.DataFrame(
+            columns=group_cols
+            + [
+                "n_total",
+                "pct_total",
+                "pct_state",
+                "n_train",
+                "n_test",
+                "train_share",
+                "test_share",
+                "share_delta",
+                "min_split_n",
+            ]
+        )
+
+    grid = grid[
+        [
+            "session_bucket",
+            "state_age_bucket",
+            "dist_vwap_atr_bucket",
+            "n_total",
+            "pct_total",
+            "pct_state",
+            "n_train",
+            "n_test",
+            "train_share",
+            "test_share",
+            "share_delta",
+            "min_split_n",
+        ]
+    ]
+    _emit(f"{target_state}_RESCUE_GRID", grid)
+
+    candidates = grid.loc[
+        (grid["min_split_n"] >= n_min) & (grid["share_delta"] <= delta_max)
+    ].copy()
+    if not candidates.empty:
+        candidates = candidates.sort_values(
+            by=["pct_state", "min_split_n", "share_delta"],
+            ascending=[False, False, True],
+        )
+    _emit(f"{target_state}_TOP_CANDIDATES", candidates, max_rows=top_k)
+
+    conf_col = next((col for col in confidence_cols if col in state_df.columns), None)
+    if conf_col is None:
+        logger.info("rescue_scan target=%s skipped confidence summary (missing)", target_state)
+        return
+    state_df[conf_col] = pd.to_numeric(state_df[conf_col], errors="coerce")
+    if not state_df[conf_col].notna().any():
+        logger.info("rescue_scan target=%s skipped confidence summary (empty)", target_state)
+        return
+
+    conf_summary = (
+        state_df.groupby(group_cols, dropna=False)[conf_col]
+        .agg(
+            mean="mean",
+            p10=lambda s: s.quantile(0.10),
+            p50=lambda s: s.quantile(0.50),
+            p90=lambda s: s.quantile(0.90),
+        )
+        .reset_index()
+    )
+    _emit(f"{target_state}_CONFIDENCE_SUMMARY", conf_summary)
 
 
 def _build_ev_extended_table(
@@ -884,6 +1112,41 @@ def main() -> None:
     else:
         ev_hvc_grouped = pd.DataFrame(columns=["state", "allow_rule", "n_samples", "ev_mean", "uplift_vs_state"])
     _emit_table("EV_HVC (state, allow)", ev_hvc_grouped)
+
+    if args.diagnose_rescue_scans:
+        df_outputs = outputs.copy()
+        df_outputs["state"] = outputs["state_hat"].map(
+            lambda v: StateLabels(v).name if not pd.isna(v) else "NA"
+        )
+        if "ctx_session_bucket" in ctx_features.columns:
+            df_outputs["session_bucket"] = ctx_features["ctx_session_bucket"]
+        if "ctx_state_age" in ctx_features.columns:
+            df_outputs["state_age"] = ctx_features["ctx_state_age"]
+        if "ctx_dist_vwap_atr" in ctx_features.columns:
+            df_outputs["dist_vwap_atr"] = ctx_features["ctx_dist_vwap_atr"]
+        df_outputs["time"] = df_outputs.index
+        _rescue_scan_tables(
+            df_outputs,
+            target_state="BALANCE",
+            quality_col="quality_label",
+            top_k=args.rescue_top_k,
+            n_min=args.rescue_n_min,
+            delta_max=args.rescue_delta_max,
+            logger=logger,
+            console=console if use_rich else None,
+            table_class=table_class if use_rich else None,
+        )
+        _rescue_scan_tables(
+            df_outputs,
+            target_state="TRANSITION",
+            quality_col="quality_label",
+            top_k=args.rescue_top_k,
+            n_min=args.rescue_n_min,
+            delta_max=args.rescue_delta_max,
+            logger=logger,
+            console=console if use_rich else None,
+            table_class=table_class if use_rich else None,
+        )
 
     group_cols = [
         "state",
