@@ -159,9 +159,12 @@ class EventExtractor:
                 created_session_id = True
             reset_mode = _resolve_vwap_reset_mode(df, self.config.vwap_reset_mode)
             if reset_mode == "cumulative":
-                self.logger.warning("USING CUMULATIVE VWAP FALLBACK – supply may be broken.")
+                self.logger.info("VWAP not provided; computing cumulative VWAP from OHLC (secondary path).")
             else:
-                self.logger.warning("VWAP column missing; computing %s VWAP fallback.", reset_mode)
+                self.logger.info(
+                    "VWAP not provided; computing %s VWAP from OHLC (secondary path).",
+                    reset_mode,
+                )
             vwap_metadata["vwap_reset_mode_effective"] = reset_mode
             if cut_hour_used is not None:
                 vwap_metadata["vwap_session_cut_hour"] = cut_hour_used
