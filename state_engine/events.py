@@ -295,7 +295,12 @@ class EventExtractor:
         )
 
         context_cols = [
-            col for col in df.columns if col in {"state_hat_H1", "margin_H1"} or col.startswith("ALLOW_")
+            col
+            for col in df.columns
+            if col.startswith("ALLOW_")
+            or col.startswith("state_hat_")
+            or col.startswith("margin_")
+            or col in {"state_hat_ctx", "margin_ctx"}
         ]
         context = df[context_cols] if context_cols else None
 

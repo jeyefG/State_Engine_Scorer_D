@@ -57,7 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start", default=default_start, help="Fecha inicio (YYYY-MM-DD) para descarga score/allow")
     parser.add_argument("--end", default=default_end, help="Fecha fin (YYYY-MM-DD) para descarga score/allow")
     parser.add_argument("--score-tf", default="M5", help="Timeframe para scoring (ej. M5, M15)")
-    parser.add_argument("--allow-tf", default="H1", help="Timeframe para contexto allow (default H1)")
+    parser.add_argument("--allow-tf", default="H1", help="Timeframe legado para contexto allow (deprecated)")
+    parser.add_argument(
+        "--context-tf",
+        default=None,
+        help="Timeframe del contexto State/ALLOW (ej. H2). Default: metadata del State Engine o allow-tf.",
+    )
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--model-out", type=Path, default=None, help="Ruta de salida para Event Scorer")
     parser.add_argument(
@@ -97,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         default="baseline",
         choices=["baseline", "research", "production"],
         help="Modo de thresholds para reportes diagnósticos",
+    )
+    parser.add_argument(
+        "--phase-e",
+        action="store_true",
+        help="Habilitar modo Fase E (telemetría sin decisiones ni thresholds).",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
     return parser.parse_args()
@@ -211,15 +221,15 @@ def setup_logging(level: str) -> logging.Logger:
     return logger
 
 
-def build_h1_context(
-    ohlcv_h1: pd.DataFrame,
+def build_context(
+    ohlcv_ctx: pd.DataFrame,
     state_model: StateEngineModel,
     feature_engineer: FeatureEngineer,
     gating: GatingPolicy,
     symbol_cfg: dict | None,
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    full_features = feature_engineer.compute_features(ohlcv_h1)
+    full_features = feature_engineer.compute_features(ohlcv_ctx)
     features = feature_engineer.training_features(full_features)
     outputs = state_model.predict_outputs(features)
     allows = gating.apply(outputs, features=full_features)
@@ -237,7 +247,7 @@ def build_h1_context(
     return ctx
 
 
-def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame) -> pd.DataFrame:
+def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame, *, context_tf: str) -> pd.DataFrame:
     logger = logging.getLogger("event_scorer")
     h1 = ctx_h1.copy().sort_index()
     score = ohlcv_score.copy().sort_index()
@@ -249,8 +259,11 @@ def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame) -> pd.Dat
     score = score.reset_index().rename(columns={score.index.name or "index": "time"})
     merged = pd.merge_asof(score, h1, on="time", direction="backward")
     merged = merged.set_index("time")
-    merged = merged.rename(columns={"state_hat": "state_hat_H1", "margin": "margin_H1"})
-    missing_ctx = merged[["state_hat_H1", "margin_H1"]].isna().mean()
+    context_tf_norm = _normalize_timeframe(context_tf)
+    state_col = f"state_hat_{context_tf_norm}"
+    margin_col = f"margin_{context_tf_norm}"
+    merged = merged.rename(columns={"state_hat": state_col, "margin": margin_col})
+    missing_ctx = merged[[state_col, margin_col]].isna().mean()
     if (missing_ctx > 0.25).any():
         logger.warning("High missing context after merge: %s", missing_ctx.to_dict())
     return merged
@@ -328,6 +341,25 @@ def _attach_output_metadata(
 
 def _normalize_timeframe(timeframe: str) -> str:
     return str(timeframe).upper()
+
+
+def _resolve_context_tf(
+    *,
+    requested: str | None,
+    allow_tf: str | None,
+    model_metadata: dict[str, object],
+    logger: logging.Logger,
+) -> str:
+    meta_tf = model_metadata.get("timeframe") if isinstance(model_metadata, dict) else None
+    candidates = [requested, meta_tf, allow_tf]
+    for candidate in candidates:
+        if candidate:
+            resolved = _normalize_timeframe(str(candidate))
+            logger.info("context_tf resolved to %s (requested=%s meta=%s allow_tf=%s)", resolved, requested, meta_tf, allow_tf)
+            return resolved
+    resolved = "H1"
+    logger.info("context_tf fallback=%s (requested=%s meta=%s allow_tf=%s)", resolved, requested, meta_tf, allow_tf)
+    return resolved
 
 
 _TIMEFRAME_FLOOR_MAP = {
@@ -591,9 +623,11 @@ def _conditional_edge_regime_table(
     events_diag: pd.DataFrame,
     pseudo_col: str,
     min_n: int,
+    *,
+    state_col: str,
 ) -> pd.DataFrame:
     columns = [
-        "state_hat_H1",
+        state_col,
         "margin_bin",
         "allow_id",
         "family_id",
@@ -609,7 +643,7 @@ def _conditional_edge_regime_table(
         return pd.DataFrame(columns=columns)
 
     grouped = events_diag.groupby(
-        ["state_hat_H1", "margin_bin", "allow_id", "family_id", pseudo_col],
+        [state_col, "margin_bin", "allow_id", "family_id", pseudo_col],
         observed=True,
     )
 
@@ -635,17 +669,24 @@ def _meta_policy_mask(
     allow_cols: list[str],
     margin_min: float,
     margin_max: float,
+    *,
+    margin_col: str,
 ) -> pd.Series:
     allow_active = (
         events_df[allow_cols].fillna(0).sum(axis=1) > 0
         if allow_cols
         else pd.Series(False, index=events_df.index)
     )
-    margin_ok = events_df["margin_H1"].between(margin_min, margin_max, inclusive="both")
+    margin_ok = events_df[margin_col].between(margin_min, margin_max, inclusive="both")
     return allow_active & margin_ok
 
 
-def _coverage_table(events_diag: pd.DataFrame, df_score_ctx: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _coverage_table(
+    events_diag: pd.DataFrame,
+    df_score_ctx: pd.DataFrame | None,
+    *,
+    state_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     columns_global = [
         "events_total_post_meta",
         "events_per_day",
@@ -658,7 +699,7 @@ def _coverage_table(events_diag: pd.DataFrame, df_score_ctx: pd.DataFrame | None
         "margin_bin_m2_pct",
         "events_index_match_pct",
     ]
-    columns_by = ["state_hat_H1", "margin_bin", "events_count", "events_pct"]
+    columns_by = [state_col, "margin_bin", "events_count", "events_pct"]
     if events_diag.empty:
         empty_global = pd.DataFrame([{col: 0.0 for col in columns_global}])
         empty_global["events_index_match_pct"] = float("nan") if df_score_ctx is None else float("nan")
@@ -667,7 +708,7 @@ def _coverage_table(events_diag: pd.DataFrame, df_score_ctx: pd.DataFrame | None
     total = len(events_diag)
     unique_days = events_diag.index.normalize().nunique()
     events_per_day = total / unique_days if unique_days else 0.0
-    state_counts = events_diag["state_hat_H1"].value_counts()
+    state_counts = events_diag[state_col].value_counts()
     margin_counts = events_diag["margin_bin"].value_counts()
     index_match = (
         float(events_diag.index.isin(df_score_ctx.index).mean()) if df_score_ctx is not None else float("nan")
@@ -685,19 +726,15 @@ def _coverage_table(events_diag: pd.DataFrame, df_score_ctx: pd.DataFrame | None
         "events_index_match_pct": index_match,
     }
     coverage_global = pd.DataFrame([global_row])[columns_global]
-    by_state = (
-        events_diag.groupby(["state_hat_H1", "margin_bin"], observed=True)
-        .size()
-        .reset_index(name="events_count")
-    )
+    by_state = events_diag.groupby([state_col, "margin_bin"], observed=True).size().reset_index(name="events_count")
     by_state["events_pct"] = (by_state["events_count"] / total * 100.0) if total else 0.0
-    by_state = by_state.sort_values(["state_hat_H1", "margin_bin"]).reset_index(drop=True)
+    by_state = by_state.sort_values([state_col, "margin_bin"]).reset_index(drop=True)
     return coverage_global, by_state[columns_by]
 
 
-def _regime_edge_table(events_diag: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _regime_edge_table(events_diag: pd.DataFrame, *, state_col: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     columns = [
-        "state_hat_H1",
+        state_col,
         "margin_bin",
         "allow_id",
         "n",
@@ -709,7 +746,7 @@ def _regime_edge_table(events_diag: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
     ]
     if events_diag.empty:
         return pd.DataFrame(columns=columns), pd.DataFrame(columns=columns)
-    grouped = events_diag.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+    grouped = events_diag.groupby([state_col, "margin_bin", "allow_id"], observed=True)
     summary = grouped.agg(
         n=("win", "size"),
         winrate=("win", "mean"),
@@ -718,13 +755,13 @@ def _regime_edge_table(events_diag: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
         p10=("r", lambda s: s.quantile(0.1)),
         p90=("r", lambda s: s.quantile(0.9)),
     ).reset_index()
-    summary = summary.sort_values(["state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    summary = summary.sort_values([state_col, "margin_bin", "allow_id"]).reset_index(drop=True)
     ranked_desc = summary.sort_values(
-        ["r_mean", "n", "winrate", "state_hat_H1", "margin_bin", "allow_id"],
+        ["r_mean", "n", "winrate", state_col, "margin_bin", "allow_id"],
         ascending=[False, False, False, True, True, True],
     )
     ranked_asc = summary.sort_values(
-        ["r_mean", "n", "winrate", "state_hat_H1", "margin_bin", "allow_id"],
+        ["r_mean", "n", "winrate", state_col, "margin_bin", "allow_id"],
         ascending=[True, False, False, True, True, True],
     )
     top10 = ranked_desc.head(10)
@@ -743,10 +780,10 @@ def _temporal_splits() -> list[tuple[str, pd.Timestamp, pd.Timestamp]]:
     ]
 
 
-def _stability_table(events_diag: pd.DataFrame) -> pd.DataFrame:
+def _stability_table(events_diag: pd.DataFrame, *, state_col: str) -> pd.DataFrame:
     columns = [
         "split",
-        "state_hat_H1",
+        state_col,
         "margin_bin",
         "allow_id",
         "n",
@@ -764,7 +801,7 @@ def _stability_table(events_diag: pd.DataFrame) -> pd.DataFrame:
         split_events = events_diag.loc[mask]
         if split_events.empty:
             continue
-        grouped = split_events.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+        grouped = split_events.groupby([state_col, "margin_bin", "allow_id"], observed=True)
         summary = grouped.agg(
             n=("win", "size"),
             winrate=("win", "mean"),
@@ -778,13 +815,13 @@ def _stability_table(events_diag: pd.DataFrame) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=columns)
     table = pd.concat(rows, ignore_index=True)
-    table = table.sort_values(["split", "state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    table = table.sort_values(["split", state_col, "margin_bin", "allow_id"]).reset_index(drop=True)
     return table[columns]
 
 
-def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -> pd.DataFrame:
+def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace, *, state_col: str) -> pd.DataFrame:
     columns = [
-        "state_hat_H1",
+        state_col,
         "margin_bin",
         "allow_id",
         "n",
@@ -798,7 +835,7 @@ def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -
     ]
     if events_diag.empty:
         return pd.DataFrame(columns=columns)
-    grouped = events_diag.groupby(["state_hat_H1", "margin_bin", "allow_id"], observed=True)
+    grouped = events_diag.groupby([state_col, "margin_bin", "allow_id"], observed=True)
     summary = grouped.agg(
         n=("win", "size"),
         winrate=("win", "mean"),
@@ -827,7 +864,7 @@ def _decision_table(events_diag: pd.DataFrame, thresholds: argparse.Namespace) -
         )
     decision_df = pd.DataFrame(decisions)
     summary = pd.concat([summary, decision_df], axis=1)
-    summary = summary.sort_values(["state_hat_H1", "margin_bin", "allow_id"]).reset_index(drop=True)
+    summary = summary.sort_values([state_col, "margin_bin", "allow_id"]).reset_index(drop=True)
     return summary[columns]
 
 
@@ -845,7 +882,7 @@ def _session_bucket_series(
     )
 
 
-def _build_research_summary_from_grid(grid_results: pd.DataFrame) -> dict[str, object]:
+def _build_research_summary_from_grid(grid_results: pd.DataFrame, *, phase_e: bool) -> dict[str, object]:
     if grid_results.empty:
         return {
             "qualified_variants": 0,
@@ -873,7 +910,10 @@ def _build_research_summary_from_grid(grid_results: pd.DataFrame) -> dict[str, o
             "p10",
         ]
     ]
-    verdict = "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION" if qualified_count > 0 else "NO LOCAL EDGE DETECTED"
+    if qualified_count > 0:
+        verdict = "LOCAL EDGE OBSERVED (TELEMETRY ONLY)" if phase_e else "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
+    else:
+        verdict = "NO LOCAL EDGE DETECTED"
     return {
         "qualified_variants": qualified_count,
         "top_5_variants_by_r_mean": top_rows.to_dict(orient="records"),
@@ -992,10 +1032,13 @@ def _persist_research_outputs(
 def _session_conditional_edge_table(
     events_diag: pd.DataFrame,
     thresholds: argparse.Namespace,
+    *,
+    state_col: str,
+    phase_e: bool,
 ) -> pd.DataFrame:
     columns = [
         "family_id",
-        "state_hat_H1",
+        state_col,
         "margin_bin",
         "pf_session_bucket",
         "n",
@@ -1007,7 +1050,7 @@ def _session_conditional_edge_table(
     if events_diag.empty or "pf_session_bucket" not in events_diag.columns:
         return pd.DataFrame(columns=columns)
     grouped = events_diag.groupby(
-        ["family_id", "state_hat_H1", "margin_bin", "pf_session_bucket"],
+        ["family_id", state_col, "margin_bin", "pf_session_bucket"],
         observed=True,
     )
     summary = grouped.agg(
@@ -1016,21 +1059,24 @@ def _session_conditional_edge_table(
         r_mean=("r", "mean"),
         p10=("r", lambda s: s.quantile(0.1)),
     ).reset_index()
-    decision_reasons = []
-    for _, row in summary.iterrows():
-        reasons = []
-        if row["n"] < thresholds.decision_n_min:
-            reasons.append(f"n<{thresholds.decision_n_min}")
-        if row["r_mean"] < thresholds.decision_r_mean_min:
-            reasons.append(f"r_mean<{thresholds.decision_r_mean_min}")
-        if row["winrate"] < thresholds.decision_winrate_min:
-            reasons.append(f"winrate<{thresholds.decision_winrate_min}")
-        if thresholds.decision_p10_min is not None and row["p10"] < thresholds.decision_p10_min:
-            reasons.append(f"p10<{thresholds.decision_p10_min}")
-        decision_reasons.append("|".join(reasons))
-    summary["decision_reason"] = decision_reasons
+    if phase_e:
+        summary["decision_reason"] = ""
+    else:
+        decision_reasons = []
+        for _, row in summary.iterrows():
+            reasons = []
+            if row["n"] < thresholds.decision_n_min:
+                reasons.append(f"n<{thresholds.decision_n_min}")
+            if row["r_mean"] < thresholds.decision_r_mean_min:
+                reasons.append(f"r_mean<{thresholds.decision_r_mean_min}")
+            if row["winrate"] < thresholds.decision_winrate_min:
+                reasons.append(f"winrate<{thresholds.decision_winrate_min}")
+            if thresholds.decision_p10_min is not None and row["p10"] < thresholds.decision_p10_min:
+                reasons.append(f"p10<{thresholds.decision_p10_min}")
+            decision_reasons.append("|".join(reasons))
+        summary["decision_reason"] = decision_reasons
     summary = summary.sort_values(
-        ["family_id", "state_hat_H1", "margin_bin", "pf_session_bucket"],
+        ["family_id", state_col, "margin_bin", "pf_session_bucket"],
     ).reset_index(drop=True)
     return summary[columns]
 
@@ -1051,11 +1097,16 @@ def _apply_fallback_guardrails(events_total_post_meta: int, fallback_min_samples
     return events_total_post_meta < fallback_min_samples
 
 
-def _print_research_summary_block(session_edge: pd.DataFrame) -> None:
+def _print_research_summary_block(
+    session_edge: pd.DataFrame,
+    *,
+    state_col: str,
+    phase_e: bool,
+) -> None:
     min_n = 150
     min_r_mean = 0.05
     min_winrate = 0.55
-    if session_edge.empty:
+    if phase_e or session_edge.empty:
         qualifying = pd.DataFrame()
     else:
         qualifying = session_edge[
@@ -1076,29 +1127,33 @@ def _print_research_summary_block(session_edge: pd.DataFrame) -> None:
             .reset_index(drop=True)
         )
     print("\n=== SYMBOL SPECIALIZATION RESEARCH SUMMARY ===")
-    print(
-        "qualified_session_buckets={count} (n>={n_min}, r_mean>={r_min}, winrate>={w_min})".format(
-            count=qualifying_count,
-            n_min=min_n,
-            r_min=min_r_mean,
-            w_min=min_winrate,
+    if phase_e:
+        print("phase_e=ON (telemetry only; no qualification thresholds)")
+    else:
+        print(
+            "qualified_session_buckets={count} (n>={n_min}, r_mean>={r_min}, winrate>={w_min})".format(
+                count=qualifying_count,
+                n_min=min_n,
+                r_min=min_r_mean,
+                w_min=min_winrate,
+            )
         )
-    )
     print("top_5_candidate_cells_by_r_mean:")
     if top_rows.empty:
         print("(no candidates)")
     else:
         for _, row in top_rows.iterrows():
-            cell = (
-                f"{row['family_id']} | {row['state_hat_H1']} | {row['margin_bin']} | {row['pf_session_bucket']}"
-            )
+            cell = f"{row['family_id']} | {row[state_col]} | {row['margin_bin']} | {row['pf_session_bucket']}"
             print(cell)
-    verdict = (
-        "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
-        if qualifying_count > 0
-        else "NO LOCAL EDGE DETECTED"
-    )
-    print(f"verdict={verdict}")
+    if phase_e:
+        print("verdict=TELEMETRY_ONLY")
+    else:
+        verdict = (
+            "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
+            if qualifying_count > 0
+            else "NO LOCAL EDGE DETECTED"
+        )
+        print(f"verdict={verdict}")
 
 
 def _save_model_if_ready(
@@ -1472,20 +1527,26 @@ def _build_training_diagnostic_report(
     events_diag: pd.DataFrame,
     df_score_ctx: pd.DataFrame | None,
     thresholds: argparse.Namespace,
+    *,
+    state_col: str,
+    phase_e: bool,
 ) -> dict[str, pd.DataFrame]:
     report = {}
-    coverage_global, coverage_by = _coverage_table(events_diag, df_score_ctx)
-    regime_full, regime_ranked = _regime_edge_table(events_diag)
-    stability = _stability_table(events_diag)
-    decision = _decision_table(events_diag, thresholds)
-    session_edge = _session_conditional_edge_table(events_diag, thresholds)
-    base_frames = [coverage_global, coverage_by, regime_full, regime_ranked, stability, decision, session_edge]
+    coverage_global, coverage_by = _coverage_table(events_diag, df_score_ctx, state_col=state_col)
+    regime_full, regime_ranked = _regime_edge_table(events_diag, state_col=state_col)
+    stability = _stability_table(events_diag, state_col=state_col)
+    decision = _decision_table(events_diag, thresholds, state_col=state_col) if not phase_e else pd.DataFrame()
+    session_edge = _session_conditional_edge_table(events_diag, thresholds, state_col=state_col, phase_e=phase_e)
+    base_frames = [coverage_global, coverage_by, regime_full, regime_ranked, stability, session_edge]
+    if not phase_e:
+        base_frames.append(decision)
     report["coverage_global"] = coverage_global
     report["coverage_by_state_margin"] = coverage_by
     report["regime_edge_full"] = regime_full
     report["regime_edge_ranked"] = regime_ranked
     report["stability"] = stability
-    report["decision"] = decision
+    if not phase_e:
+        report["decision"] = decision
     report["session_conditional_edge"] = session_edge
     for pseudo_col in PSEUDO_FEATURES.keys():
         redistribution = _redistribution_table(events_diag, pseudo_col)
@@ -1495,6 +1556,7 @@ def _build_training_diagnostic_report(
             events_diag,
             pseudo_col,
             min_n=thresholds.decision_n_min,
+            state_col=state_col,
         )
         report[f"conditional_edge_regime_{pseudo_col}"] = conditional_regime
         base_frames.append(conditional_regime)
@@ -1511,7 +1573,8 @@ def _build_training_diagnostic_report(
     print(_format_table_block("Regime Edge (full)", regime_full))
     print(_format_table_block("Regime Edge (top 10 / bottom 10 by r_mean)", regime_ranked))
     print(_format_table_block("Stability temporal (regime edge por split)", stability))
-    print(_format_table_block("Decision", decision))
+    if not phase_e:
+        print(_format_table_block("Decision", decision))
     print(_format_table_block("Session-Conditional Edge", session_edge))
     for pseudo_col in PSEUDO_FEATURES.keys():
         print(_format_table_block(f"Redistribution (family x {pseudo_col})", report[f"redistribution_{pseudo_col}"]))
@@ -1591,7 +1654,7 @@ def _run_training_for_k(
     if events.empty:
         logger.warning("No labeled events after filtering.")
         events_diag = pd.DataFrame(
-            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
+            columns=[args.context_state_col, "allow_id", "margin", "r", "win", "margin_bin"]
         )
         events_diag.index = pd.DatetimeIndex([])
         is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
@@ -1600,9 +1663,19 @@ def _run_training_for_k(
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(
+            events_diag,
+            df_score_ctx,
+            thresholds=args,
+            state_col=args.context_state_col,
+            phase_e=args.phase_e,
+        )
         if research_mode:
-            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
+            _print_research_summary_block(
+                diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
+                state_col=args.context_state_col,
+                phase_e=args.phase_e,
+            )
         if research_mode and research_variants:
             diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
             report = evaluate_research_variants(
@@ -1634,9 +1707,9 @@ def _run_training_for_k(
     allow_cols = [col for col in events_all.columns if col.startswith("ALLOW_")]
     if not allow_cols:
         logger.warning("No ALLOW_* columns found on events; meta policy will be empty.")
-    margin_bins = _margin_bins(events_all["margin_H1"], q=3)
+    margin_bins = _margin_bins(events_all[args.context_margin_col], q=3)
     margin_bin_label = margin_bins.map(_format_interval)
-    state_label = events_all["state_hat_H1"].map(_state_label)
+    state_label = events_all[args.context_state_col].map(_state_label)
     events_all["state_label"] = state_label
     events_all["margin_bin"] = margin_bin_label
     events_all["allow_id"] = _build_allow_id(events_all, allow_cols)
@@ -1707,7 +1780,7 @@ def _run_training_for_k(
     print(f"allow_active_pct={allow_active_pct:.2f}%")
     if not allow_id_top.empty:
         print("allow_id_top:\n" + allow_id_top.to_string())
-    margin_ok_series = events_state_filtered["margin_H1"].between(
+    margin_ok_series = events_state_filtered[args.context_margin_col].between(
         args.meta_margin_min,
         args.meta_margin_max,
         inclusive="both",
@@ -1723,6 +1796,7 @@ def _run_training_for_k(
         allow_cols,
         args.meta_margin_min,
         args.meta_margin_max,
+        margin_col=args.context_margin_col,
     )
     events_meta = events_state_filtered.loc[meta_mask].copy()
 
@@ -1769,7 +1843,7 @@ def _run_training_for_k(
     print(f"events_labeled={labeled_total}")
     print(f"events_post_state_filter={len(events_state_filtered)}")
     print(f"events_post_meta={len(events_for_training)}")
-    required_columns = {"state_label", "allow_id", "margin_H1", "r_outcome", "label"}
+    required_columns = {"state_label", "allow_id", args.context_margin_col, "r_outcome", "label"}
     missing_columns = sorted(required_columns - set(events_for_training.columns))
     if missing_columns:
         raise ValueError(f"Missing required columns in events_for_training: {missing_columns}")
@@ -1777,9 +1851,9 @@ def _run_training_for_k(
         raise ValueError("events_for_training index must be DatetimeIndex")
     events_diag = pd.DataFrame(
         {
-            "state_hat_H1": events_for_training["state_label"],
+            args.context_state_col: events_for_training["state_label"],
             "allow_id": events_for_training["allow_id"],
-            "margin": events_for_training["margin_H1"],
+            "margin": events_for_training[args.context_margin_col],
             "r": events_for_training["r_outcome"],
             "win": events_for_training["label"].astype(int),
             "family_id": events_for_training["family_id"],
@@ -1807,7 +1881,13 @@ def _run_training_for_k(
             "=== FALLBACK DIAGNÓSTICO: events_total_post_meta="
             f"{events_total_post_meta} reasons={','.join(fallback_reasons)} ==="
         )
-    diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
+    diagnostic_report = _build_training_diagnostic_report(
+        events_diag,
+        df_score_ctx,
+        thresholds=args,
+        state_col=args.context_state_col,
+        phase_e=args.phase_e,
+    )
 
     if is_fallback:
         args.model_dir.mkdir(parents=True, exist_ok=True)
@@ -2420,6 +2500,7 @@ def _run_training_for_k(
         "symbol": args.symbol,
         "score_tf": args.score_tf,
         "allow_tf": args.allow_tf,
+        "context_tf": args.context_tf,
         "train_ratio": args.train_ratio,
         "k_bars": k_bars,
         "reward_r": args.reward_r,
@@ -2501,7 +2582,7 @@ def _run_training_for_k(
         sample_cols = ["family_id", "side", "label", "r_outcome"]
         sample_df = events.loc[y_calib.index, sample_cols].copy()
         sample_df["score"] = preds_meta
-        sample_df["margin_H1"] = df_score_ctx["margin_H1"].reindex(sample_df.index)
+        sample_df[args.context_margin_col] = df_score_ctx[args.context_margin_col].reindex(sample_df.index)
         sample_df = sample_df.sort_values("score", ascending=False).head(10)
         sample_df = sample_df.reset_index().rename(columns={sample_df.index.name or "index": "time"})
         sample_path = _with_suffix(
@@ -2626,7 +2707,11 @@ def _run_training_for_k(
     logger.info("summary_out=%s", summary_path)
     logger.info("=" * 96)
     if research_mode:
-        _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
+        _print_research_summary_block(
+            diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
+            state_col=args.context_state_col,
+            phase_e=args.phase_e,
+        )
     if research_mode and research_variants:
         if preds_meta is None or y_calib.empty or len(y_calib) == 0:
             variant_report = _empty_research_variant_report(research_variants, "NO_PREDICTIONS")
@@ -2729,6 +2814,7 @@ def main() -> None:
         if isinstance(event_cfg, dict):
             args.score_tf = event_cfg.get("score_tf", args.score_tf)
             args.allow_tf = event_cfg.get("allow_tf", args.allow_tf)
+            args.context_tf = event_cfg.get("context_tf", args.context_tf)
             args.train_ratio = event_cfg.get("train_ratio", args.train_ratio)
             args.k_bars = event_cfg.get("k_bars", args.k_bars)
             args.reward_r = event_cfg.get("reward_r", args.reward_r)
@@ -2779,6 +2865,8 @@ def main() -> None:
     args.allow_tf = _normalize_timeframe(args.allow_tf)
     event_cfg = config_payload.get("event_scorer", {}) if isinstance(config_payload.get("event_scorer"), dict) else {}
     if event_cfg:
+        if "context_tf" in event_cfg:
+            args.context_tf = event_cfg.get("context_tf")
         args.k_bars = _resolve_k_bars_by_tf(event_cfg, args.score_tf, args.k_bars)
 
     logger.info(
@@ -2821,29 +2909,13 @@ def main() -> None:
     fecha_inicio = pd.to_datetime(args.start)
     fecha_fin = pd.to_datetime(args.end)
 
-    if args.allow_tf != "H1":
-        logger.warning("allow_tf=%s ignored; using H1 for state context.", args.allow_tf)
-        args.allow_tf = "H1"
-    ohlcv_h1 = connector.obtener_ohlcv(args.symbol, args.allow_tf, fecha_inicio, fecha_fin)
     ohlcv_score = connector.obtener_ohlcv(args.symbol, args.score_tf, fecha_inicio, fecha_fin)
     ohlcv_score["symbol"] = args.symbol
     server_now = connector.server_now(args.symbol).tz_localize(None)
 
-    allow_cutoff = server_now.floor(_timeframe_floor_freq(args.allow_tf))
-    h1_cutoff = allow_cutoff
     score_cutoff = server_now.floor(_timeframe_floor_freq(args.score_tf))
-    ohlcv_h1 = ohlcv_h1[ohlcv_h1.index < allow_cutoff]
     ohlcv_score = ohlcv_score[ohlcv_score.index < score_cutoff]
     score_dupes = int(ohlcv_score.index.duplicated().sum())
-    h1_dupes = int(ohlcv_h1.index.duplicated().sum())
-    logger.info(
-        "Period: %s -> %s | allow_cutoff=%s score_cutoff=%s",
-        fecha_inicio,
-        fecha_fin,
-        allow_cutoff,
-        score_cutoff,
-    )
-    logger.info("Rows: %s=%s %s=%s", args.allow_tf, len(ohlcv_h1), args.score_tf, len(ohlcv_score))
     print("\n=== EVENT SCORER TRAINING ===")
 
     if not model_path.exists():
@@ -2851,6 +2923,31 @@ def main() -> None:
 
     state_model = StateEngineModel()
     state_model.load(model_path)
+    context_tf = _resolve_context_tf(
+        requested=args.context_tf,
+        allow_tf=args.allow_tf,
+        model_metadata=state_model.metadata,
+        logger=logger,
+    )
+    args.context_tf = context_tf
+    state_col = f"state_hat_{context_tf}"
+    margin_col = f"margin_{context_tf}"
+    args.context_state_col = state_col
+    args.context_margin_col = margin_col
+    logger.info("context_tf=%s context_columns=%s/%s", context_tf, state_col, margin_col)
+
+    ohlcv_ctx = connector.obtener_ohlcv(args.symbol, context_tf, fecha_inicio, fecha_fin)
+    allow_cutoff = server_now.floor(_timeframe_floor_freq(context_tf))
+    ohlcv_ctx = ohlcv_ctx[ohlcv_ctx.index < allow_cutoff]
+    h1_dupes = int(ohlcv_ctx.index.duplicated().sum())
+    logger.info(
+        "Period: %s -> %s | context_cutoff=%s score_cutoff=%s",
+        fecha_inicio,
+        fecha_fin,
+        allow_cutoff,
+        score_cutoff,
+    )
+    logger.info("Rows: %s=%s %s=%s", context_tf, len(ohlcv_ctx), args.score_tf, len(ohlcv_score))
 
     feature_engineer = FeatureEngineer(FeatureConfig())
     gating_thresholds, _ = build_transition_gating_thresholds(
@@ -2859,14 +2956,14 @@ def main() -> None:
         logger=logger,
     )
     gating = GatingPolicy(gating_thresholds)
-    ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, config_payload, logger)
+    ctx_h1 = build_context(ohlcv_ctx, state_model, feature_engineer, gating, config_payload, logger)
 
-    df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score)
+    df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score, context_tf=context_tf)
     if "atr_14" not in df_score_ctx.columns:
         df_score_ctx["atr_14"] = _ensure_atr_14(df_score_ctx)
     logger.info("Rows after merge: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_merged = len(df_score_ctx)
-    ctx_nan_cols = ["state_hat_H1", "margin_H1"]
+    ctx_nan_cols = [state_col, margin_col]
     if "atr_short" in df_score_ctx.columns:
         ctx_nan_cols.append("atr_short")
     ctx_nan = df_score_ctx[ctx_nan_cols].isna().mean().mul(100).round(2)
@@ -2877,10 +2974,10 @@ def main() -> None:
         }
     )
     logger.info("Context NaN rates:\n%s", ctx_nan_table.to_string(index=False))
-    df_score_ctx = df_score_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
+    df_score_ctx = df_score_ctx.dropna(subset=[state_col, margin_col])
     logger.info("Rows after dropna ctx: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_dropna = len(df_score_ctx)
-    feature_builder = FeatureBuilder()
+    feature_builder = FeatureBuilder(context_tf=context_tf)
     features_all = feature_builder.build(df_score_ctx)
     # --- atr_ratio (diagnostic-only, comparable cross-symbol) ---
     atr14 = df_score_ctx["atr_14"].reindex(features_all.index)
@@ -2894,7 +2991,7 @@ def main() -> None:
     if research_enabled:
         research_features = _build_research_context_features(
             df_score_ctx,
-            ohlcv_h1,
+            ohlcv_ctx,
             args.symbol,
             research_cfg,
         )
@@ -2902,7 +2999,7 @@ def main() -> None:
             features_all = pd.concat([features_all, research_features], axis=1)
             logger.info("Research features enabled: %s", list(research_features.columns))
 
-    state_labels_before = df_score_ctx["state_hat_H1"].map(_state_label)
+    state_labels_before = df_score_ctx[state_col].map(_state_label)
     state_counts_before = state_labels_before.value_counts()
     print(f"[STATE MIX | {args.score_tf}_CTX]")
     for line in _format_state_mix(state_counts_before, ["BALANCE", "TREND", "TRANSITION"]):
@@ -2915,7 +3012,7 @@ def main() -> None:
     if detected_events.empty:
         logger.warning("No events detected; exiting.")
         events_diag = pd.DataFrame(
-            columns=["state_hat_H1", "allow_id", "margin", "r", "win", "margin_bin"]
+            columns=[state_col, "allow_id", "margin", "r", "win", "margin_bin"]
         )
         events_diag.index = pd.DatetimeIndex([])
         is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
@@ -2924,9 +3021,19 @@ def main() -> None:
                 "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
                 f"{args.fallback_min_samples} ==="
             )
-        diagnostic_report = _build_training_diagnostic_report(events_diag, df_score_ctx, thresholds=args)
+        diagnostic_report = _build_training_diagnostic_report(
+            events_diag,
+            df_score_ctx,
+            thresholds=args,
+            state_col=state_col,
+            phase_e=args.phase_e,
+        )
         if research_mode:
-            _print_research_summary_block(diagnostic_report.get("session_conditional_edge", pd.DataFrame()))
+            _print_research_summary_block(
+                diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
+                state_col=state_col,
+                phase_e=args.phase_e,
+            )
         return
 
     events_dupes = int(detected_events.index.duplicated().sum())
@@ -3044,7 +3151,7 @@ def main() -> None:
         else:
             combined_grid = pd.DataFrame()
         combined_families = pd.concat(research_family_frames, ignore_index=True) if research_family_frames else None
-        research_summary = _build_research_summary_from_grid(combined_grid)
+        research_summary = _build_research_summary_from_grid(combined_grid, phase_e=args.phase_e)
         _persist_research_outputs(
             model_dir=args.model_dir,
             symbol=args.symbol,

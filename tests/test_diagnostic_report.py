@@ -35,8 +35,20 @@ def test_diagnostic_report_determinism_seeded() -> None:
     events_diag["margin_bin"] = _make_margin_bin_rank(events_diag["margin"])
     df_m5_ctx = pd.DataFrame({"atr_14": np.full(n, 1.0)}, index=idx)
 
-    report_a = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=_thresholds())
-    report_b = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=_thresholds())
+    report_a = _build_training_diagnostic_report(
+        events_diag,
+        df_m5_ctx,
+        thresholds=_thresholds(),
+        state_col="state_hat_H1",
+        phase_e=False,
+    )
+    report_b = _build_training_diagnostic_report(
+        events_diag,
+        df_m5_ctx,
+        thresholds=_thresholds(),
+        state_col="state_hat_H1",
+        phase_e=False,
+    )
 
     for key in report_a:
         pdt.assert_frame_equal(report_a[key], report_b[key])
@@ -99,7 +111,13 @@ def test_coverage_sanity_index_match_and_atr() -> None:
     )
     events_diag["margin_bin"] = _make_margin_bin_rank(events_diag["margin"])
 
-    report = _build_training_diagnostic_report(events_diag, df_m5_ctx, thresholds=_thresholds())
+    report = _build_training_diagnostic_report(
+        events_diag,
+        df_m5_ctx,
+        thresholds=_thresholds(),
+        state_col="state_hat_H1",
+        phase_e=False,
+    )
     coverage_global = report["coverage_global"]
     assert float(coverage_global.loc[0, "events_index_match_pct"]) == 1.0
     assert not df_m5_ctx.loc[events_diag.index, "atr_14"].isna().any()

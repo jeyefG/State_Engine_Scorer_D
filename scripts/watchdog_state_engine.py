@@ -108,6 +108,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Umbral mínimo para mostrar eventos en el ranking.",
     )
+    parser.add_argument(
+        "--context-tf",
+        default=None,
+        help="Timeframe del contexto State/ALLOW (default: metadata del State Engine).",
+    )
+    parser.add_argument(
+        "--phase-e",
+        action="store_true",
+        help="Modo Fase E (telemetría sin thresholds).",
+    )
     return parser.parse_args()
 
 
@@ -141,6 +151,15 @@ def load_model(symbol: str, model_dir: Path, template: str) -> tuple[StateEngine
     return model, path
 
 
+def resolve_context_tf(requested: str | None, model: StateEngineModel) -> str:
+    meta_tf = model.metadata.get("timeframe") if isinstance(model.metadata, dict) else None
+    if requested:
+        return str(requested).upper()
+    if meta_tf:
+        return str(meta_tf).upper()
+    return "H1"
+
+
 def load_event_scorer(
     symbol: str,
     scorer_dir: Path,
@@ -169,13 +188,15 @@ def build_m5_context(
     gating: pd.DataFrame,
     *,
     symbol: str | None = None,
+    context_tf: str = "H1",
 ) -> pd.DataFrame:
     if symbol is not None and "symbol" not in df_m5.columns:
         df_m5 = df_m5.copy()
         df_m5["symbol"] = symbol
     ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
+    context_tf_norm = str(context_tf).upper()
     h1_ctx = outputs[["state_hat", "margin", *ctx_cols]].rename(
-        columns={"state_hat": "state_hat_H1", "margin": "margin_H1"}
+        columns={"state_hat": f"state_hat_{context_tf_norm}", "margin": f"margin_{context_tf_norm}"}
     )
     h1_ctx = h1_ctx.join(gating).shift(1).sort_index()
     m5 = df_m5.sort_index().reset_index()
@@ -315,17 +336,22 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
+        context_tfs: dict[str, str] = {}
+        feature_builders: dict[str, FeatureBuilder] = {}
         for symbol in symbols:
             model, path = load_model(symbol, args.model_dir, args.model_template)
             models[symbol] = model
             model_paths[symbol] = path
             feature_configs[symbol] = feature_config_from_metadata(model.metadata)
+            context_tf = resolve_context_tf(args.context_tf, model)
+            context_tfs[symbol] = context_tf
+            feature_builders[symbol] = FeatureBuilder(context_tf=context_tf)
+            print(f"[watchdog] symbol={symbol} context_tf={context_tf}")
             scorer, scorer_path = load_event_scorer(symbol, scorer_dir, args.scorer_template)
             scorers[symbol] = scorer
             scorer_paths[symbol] = scorer_path
 
         last_seen: dict[str, pd.Timestamp] = {}
-        feature_builder = FeatureBuilder()
 
         while True:
             if stop_event.is_set():
@@ -398,7 +424,14 @@ def main() -> None:
                         last_seen[symbol] = last_bar_ts
                         continue
 
-                    df_m5_ctx = build_m5_context(df_m5, outputs, gating, symbol=symbol)
+                    context_tf = context_tfs.get(symbol, "H1")
+                    df_m5_ctx = build_m5_context(
+                        df_m5,
+                        outputs,
+                        gating,
+                        symbol=symbol,
+                        context_tf=context_tf,
+                    )
                     try:
                         events_df = detect_events(df_m5_ctx)
                     except Exception as exc:
@@ -424,16 +457,22 @@ def main() -> None:
                             lines.append("scorer not available – cannot rank opportunities.")
                         else:
                             try:
+                                feature_builder = feature_builders[symbol]
                                 base_features = feature_builder.build(df_m5_ctx)
                                 event_features = base_features.loc[events_df.index]
                                 event_features = feature_builder.add_family_features(
                                     event_features, events_df["family_id"]
                                 )
-                                edge_scores = scorer.predict_proba(event_features, events["family_id"])
+                                edge_scores = scorer.predict_proba(event_features, events_df["family_id"])
                                 ranked = events_df.copy()
                                 ranked["edge_score"] = edge_scores
                                 ranked = _entry_proxy(ranked, df_m5)
-                                if args.min_edge_score is not None:
+                                if args.phase_e:
+                                    if args.min_edge_score is not None:
+                                        lines.append(
+                                            "phase_e=ON: min_edge_score ignored (telemetry only)."
+                                        )
+                                elif args.min_edge_score is not None:
                                     ranked = ranked[ranked["edge_score"] >= args.min_edge_score]
                                 ranked = ranked.sort_values("edge_score", ascending=False)
                                 lines.append("Top events (sorted by edge_score desc):")

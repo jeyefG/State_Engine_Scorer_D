@@ -31,12 +31,36 @@ class EventScorerConfig:
 class FeatureBuilder:
     """Build M5 features for event scoring."""
 
-    def __init__(self, atr_window: int = 14, micro_window: int = 6) -> None:
+    def __init__(
+        self,
+        atr_window: int = 14,
+        micro_window: int = 6,
+        *,
+        context_tf: str = "H1",
+        context_prefix: str | None = None,
+    ) -> None:
         self.atr_window = atr_window
         self.micro_window = micro_window
+        self.context_tf = str(context_tf).upper()
+        self.context_prefix = context_prefix
+
+    def _resolve_context_columns(self, df_m5_ctx: pd.DataFrame) -> tuple[str, str]:
+        if self.context_prefix:
+            state_col = f"{self.context_prefix}state_hat"
+            margin_col = f"{self.context_prefix}margin"
+            if state_col in df_m5_ctx.columns and margin_col in df_m5_ctx.columns:
+                return state_col, margin_col
+        state_col = f"state_hat_{self.context_tf}"
+        margin_col = f"margin_{self.context_tf}"
+        if state_col in df_m5_ctx.columns and margin_col in df_m5_ctx.columns:
+            return state_col, margin_col
+        if "state_hat_ctx" in df_m5_ctx.columns and "margin_ctx" in df_m5_ctx.columns:
+            return "state_hat_ctx", "margin_ctx"
+        return state_col, margin_col
 
     def build(self, df_m5_ctx: pd.DataFrame) -> pd.DataFrame:
-        required = {"open", "high", "low", "close", "state_hat_H1", "margin_H1"}
+        state_col, margin_col = self._resolve_context_columns(df_m5_ctx)
+        required = {"open", "high", "low", "close", state_col, margin_col}
         missing = required - set(df_m5_ctx.columns)
         if missing:
             raise ValueError(f"Missing required columns for feature building: {sorted(missing)}")
@@ -141,12 +165,12 @@ class FeatureBuilder:
                 "pullback_depth_0_1": pullback_depth_0_1,
                 "hour_sin": hour_sin,
                 "hour_cos": hour_cos,
-                "margin_H1": df["margin_H1"],
+                "margin_ctx": df[margin_col],
             },
             index=df.index,
         )
 
-        state_one_hot = pd.get_dummies(df["state_hat_H1"].map(_state_name), prefix="state")
+        state_one_hot = pd.get_dummies(df[state_col].map(_state_name), prefix="state")
         for state_name in ("balance", "transition", "trend"):
             col = f"state_{state_name}"
             if col not in state_one_hot.columns:
