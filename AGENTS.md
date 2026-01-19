@@ -111,12 +111,12 @@ Las Quality Labels son:
 
 ---
 
-## Fase D — ALLOWs  
+## Fase D — LOOK_FORs  
 **Contextualización estructural avanzada**
 
-### Rol real de un ALLOW
+### Rol real de un LOOK_FOR
 
-Un **ALLOW** es una **etiqueta de contexto adicional**, definida sobre el output conjunto de:
+Un **LOOK_FOR** es una **etiqueta de contexto adicional**, definida sobre el output conjunto de:
 
 - State Layer  
 - Quality Layer  
@@ -124,19 +124,19 @@ Un **ALLOW** es una **etiqueta de contexto adicional**, definida sobre el output
 Su función es **describir una sub-configuración estructural específica**,  
 no evaluar su conveniencia económica.
 
-### Qué es un ALLOW
+### Qué es un LOOK_FOR
 - una **descripción contextual más granular**
 - una **condición estructural explícita**
 - una **etiqueta interpretable**
 
-### Qué NO es un ALLOW
+### Qué NO es un LOOK_FOR
 - NO es una señal
 - NO es una decisión
 - NO implica operabilidad
 - NO habilita ni bloquea trades
 - NO asume edge
 
-Un ALLOW **no responde a la pregunta**:  
+Un LOOK_FOR **no responde a la pregunta**:  
 > “¿Conviene tradear este contexto?”
 
 Sino a:  
@@ -148,17 +148,18 @@ sin implicar decisión ni operabilidad.
 
 ### Especialización por símbolo
 
-En Fase D, los ALLOWs:
+En Fase D, los LOOK_FORs:
 - **sí pueden especializarse por símbolo**
 - siguen siendo descriptivos
 - no reentrenan modelos
 - no optimizan performance
 
-Cualquier uso posterior de ALLOWs como filtros operativos o gates económicos:
+Cualquier uso posterior de LOOK_FORs como filtros operativos o gates económicos:
 - es **una decisión de diseño futura**
 - no está asumida
 - no es parte de esta fase
 
+LOOK_FORs nunca afectan filas ni métricas de ‘permitido’; son tags
 ---
 
 ## Fase E — Exploración de edge condicionado (Event Scorer)  
