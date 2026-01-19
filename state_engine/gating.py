@@ -11,6 +11,22 @@ import pandas as pd
 from .config_loader import normalize_phase_d_config
 from .labels import StateLabels
 
+LOOK_FOR_COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "session": ("ctx_session_bucket",),
+    "state_age": ("ctx_state_age",),
+    "dist_vwap_atr": ("ctx_dist_vwap_atr",),
+    "breakmag": ("BreakMag", "ctx_breakmag"),
+    "reentry": ("ReentryCount", "ctx_reentry_count", "ctx_reentrycount"),
+    "margin": ("margin", "margin_ctx", "margin_context"),
+}
+
+
+def resolve_look_for_column_map(available_columns: set[str]) -> dict[str, str | None]:
+    resolved: dict[str, str | None] = {}
+    for key, candidates in LOOK_FOR_COLUMN_CANDIDATES.items():
+        resolved[key] = next((name for name in candidates if name in available_columns), None)
+    return resolved
+
 
 @dataclass(frozen=True)
 class PhaseDConfig:
@@ -131,12 +147,15 @@ class GatingPolicy:
                 coverage = (n_after / total_rows) * 100.0 if total_rows else 0.0
                 logger.info(
                     "LOOK_FOR_AUDIT symbol=%s look_for=%s base_state=%s filters=%s missing_cols=%s "
-                    "n_before=%s n_after=%s coverage=%.2f%%",
+                    "required_cols=%s available_cols=%s resolved_column_map=%s n_before=%s n_after=%s coverage=%.2f%%",
                     symbol,
                     look_for_name,
                     counts.get("base_state"),
                     counts.get("active_filters"),
                     counts.get("missing_columns"),
+                    counts.get("required_cols"),
+                    counts.get("available_cols"),
+                    counts.get("resolved_column_map"),
                     n_before,
                     n_after,
                     coverage,
@@ -154,18 +173,13 @@ class GatingPolicy:
         logger,
         symbol: str | None,
     ) -> tuple[pd.Series, dict[str, Any], pd.DataFrame | None]:
-        def _get_col(column: str) -> pd.Series | None:
+        def _get_col(column: str | None) -> pd.Series | None:
+            if column is None:
+                return None
             if features is not None and column in features.columns:
                 return features[column]
             if column in outputs.columns:
                 return outputs[column]
-            return None
-
-        def _resolve_col(candidates: Sequence[str]) -> pd.Series | None:
-            for name in candidates:
-                series = _get_col(name)
-                if series is not None:
-                    return series
             return None
 
         idx = outputs.index
@@ -176,23 +190,38 @@ class GatingPolicy:
         filters_cfg = rule_cfg.get("filters", {}) if isinstance(rule_cfg.get("filters"), dict) else {}
         require_all = bool(rule_cfg.get("require_all", True))
 
-        session_series = _resolve_col(["ctx_session_bucket"])
-        state_age_series = _resolve_col(["ctx_state_age"])
-        dist_series = _resolve_col(["ctx_dist_vwap_atr"])
-        breakmag_series = _resolve_col(["BreakMag"])
-        reentry_series = _resolve_col(["ReentryCount"])
-        margin_series = _resolve_col(["margin"])
+        available_columns = set(outputs.columns)
+        if features is not None:
+            available_columns |= set(features.columns)
+        resolved_column_map = resolve_look_for_column_map(available_columns)
+
+        session_series = _get_col(resolved_column_map.get("session"))
+        state_age_series = _get_col(resolved_column_map.get("state_age"))
+        dist_series = _get_col(resolved_column_map.get("dist_vwap_atr"))
+        breakmag_series = _get_col(resolved_column_map.get("breakmag"))
+        reentry_series = _get_col(resolved_column_map.get("reentry"))
+        margin_series = _get_col(resolved_column_map.get("margin"))
 
         masks: list[pd.Series] = []
         mask_map: dict[str, pd.Series] = {}
         applied: set[str] = set()
         missing_columns: list[str] = []
         active_filters: list[str] = []
+        required_cols: list[str] = []
+
+        def _mark_required(key: str) -> None:
+            resolved = resolved_column_map.get(key)
+            if resolved is not None:
+                required_cols.append(resolved)
+            else:
+                required_cols.append(LOOK_FOR_COLUMN_CANDIDATES[key][0])
 
         sessions_in = filters_cfg.get("sessions_in")
         if sessions_in is not None and session_series is None:
+            _mark_required("session")
             missing_columns.append("ctx_session_bucket")
         if sessions_in is not None and session_series is not None:
+            _mark_required("session")
             allowed = {str(val) for val in sessions_in}
             mask = session_series.astype(str).isin(allowed)
             masks.append(mask)
@@ -203,8 +232,10 @@ class GatingPolicy:
         state_age_min = filters_cfg.get("state_age_min")
         state_age_max = filters_cfg.get("state_age_max")
         if (state_age_min is not None or state_age_max is not None) and state_age_series is None:
+            _mark_required("state_age")
             missing_columns.append("ctx_state_age")
         if (state_age_min is not None or state_age_max is not None) and state_age_series is not None:
+            _mark_required("state_age")
             series = pd.to_numeric(state_age_series, errors="coerce")
             mask = pd.Series(True, index=idx)
             if state_age_min is not None:
@@ -219,8 +250,10 @@ class GatingPolicy:
         dist_min = filters_cfg.get("dist_vwap_atr_min")
         dist_max = filters_cfg.get("dist_vwap_atr_max")
         if (dist_min is not None or dist_max is not None) and dist_series is None:
+            _mark_required("dist_vwap_atr")
             missing_columns.append("ctx_dist_vwap_atr")
         if (dist_min is not None or dist_max is not None) and dist_series is not None:
+            _mark_required("dist_vwap_atr")
             series = pd.to_numeric(dist_series, errors="coerce")
             mask = pd.Series(True, index=idx)
             if dist_min is not None:
@@ -235,8 +268,10 @@ class GatingPolicy:
         breakmag_min = filters_cfg.get("breakmag_min")
         breakmag_max = filters_cfg.get("breakmag_max")
         if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is None:
+            _mark_required("breakmag")
             missing_columns.append("BreakMag")
         if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is not None:
+            _mark_required("breakmag")
             series = pd.to_numeric(breakmag_series, errors="coerce")
             mask = pd.Series(True, index=idx)
             if breakmag_min is not None:
@@ -251,8 +286,10 @@ class GatingPolicy:
         reentry_min = filters_cfg.get("reentry_min")
         reentry_max = filters_cfg.get("reentry_max")
         if (reentry_min is not None or reentry_max is not None) and reentry_series is None:
+            _mark_required("reentry")
             missing_columns.append("ReentryCount")
         if (reentry_min is not None or reentry_max is not None) and reentry_series is not None:
+            _mark_required("reentry")
             series = pd.to_numeric(reentry_series, errors="coerce")
             mask = pd.Series(True, index=idx)
             if reentry_min is not None:
@@ -267,8 +304,10 @@ class GatingPolicy:
         margin_min = filters_cfg.get("margin_min")
         margin_max = filters_cfg.get("margin_max")
         if (margin_min is not None or margin_max is not None) and margin_series is None:
+            _mark_required("margin")
             missing_columns.append("margin")
         if (margin_min is not None or margin_max is not None) and margin_series is not None:
+            _mark_required("margin")
             series = pd.to_numeric(margin_series, errors="coerce")
             mask = pd.Series(True, index=idx)
             if margin_min is not None:
@@ -281,8 +320,26 @@ class GatingPolicy:
             active_filters.append("margin")
 
         if missing_columns:
+            if logger is not None:
+                logger.error(
+                    "LOOK_FOR_COLUMNS_MISSING symbol=%s look_for=%s required_cols=%s available_cols=%s "
+                    "resolved_column_map=%s missing_cols=%s",
+                    symbol,
+                    look_for_name,
+                    sorted(set(required_cols)),
+                    sorted(available_columns),
+                    resolved_column_map,
+                    sorted(set(missing_columns)),
+                )
             raise ValueError(
-                f"LOOK_FOR {look_for_name} missing required columns: {sorted(set(missing_columns))}."
+                "LOOK_FOR {name} missing required columns: {missing}. "
+                "required_cols={required} available_cols={available} resolved_column_map={resolved}".format(
+                    name=look_for_name,
+                    missing=sorted(set(missing_columns)),
+                    required=sorted(set(required_cols)),
+                    available=sorted(available_columns),
+                    resolved=resolved_column_map,
+                )
             )
 
         if logger is not None:
@@ -328,6 +385,9 @@ class GatingPolicy:
                 "status": "no_effective_conditions",
                 "active_filters": active_filters,
                 "missing_columns": sorted(set(missing_columns)),
+                "required_cols": sorted(set(required_cols)),
+                "available_cols": sorted(available_columns),
+                "resolved_column_map": resolved_column_map,
                 "base_state": rule_cfg.get("base_state"),
             }
             return base_mask, counts, None
@@ -366,6 +426,9 @@ class GatingPolicy:
             "pass_margin": _pass_count("margin"),
             "active_filters": active_filters,
             "missing_columns": sorted(set(missing_columns)),
+            "required_cols": sorted(set(required_cols)),
+            "available_cols": sorted(available_columns),
+            "resolved_column_map": resolved_column_map,
             "base_state": rule_cfg.get("base_state"),
         }
 
@@ -442,6 +505,8 @@ class GatingPolicy:
 
 
 __all__ = [
+    "LOOK_FOR_COLUMN_CANDIDATES",
+    "resolve_look_for_column_map",
     "PhaseDConfig",
     "GatingPolicy",
 ]
