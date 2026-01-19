@@ -29,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from state_engine.events import EventDetectionConfig, detect_events, label_events
+from state_engine.events import EventDetectionConfig, EventFamily, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
     GatingPolicy,
@@ -259,6 +259,105 @@ def setup_logging(level: str) -> logging.Logger:
     logger.addHandler(handler)
     logger.propagate = False
     return logger
+
+
+def _active_allow_filters(symbol_cfg: dict | None) -> set[str]:
+    if not isinstance(symbol_cfg, dict):
+        return set()
+    allow_cfg = symbol_cfg.get("allow_context_filters")
+    if not isinstance(allow_cfg, dict):
+        return set()
+    return {
+        allow_name
+        for allow_name, rule_cfg in allow_cfg.items()
+        if isinstance(rule_cfg, dict) and rule_cfg.get("enabled", False)
+    }
+
+
+def _required_allow_by_family() -> dict[str, str]:
+    return {
+        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
+        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
+        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
+        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
+    }
+
+
+def _validate_active_allow_columns(
+    ctx: pd.DataFrame,
+    active_allows: set[str],
+    logger: logging.Logger,
+) -> None:
+    if not active_allows:
+        logger.info("Phase E allow contract: no active allow_context_filters configured.")
+        return
+    missing = sorted(active_allows - set(ctx.columns))
+    if missing:
+        raise ValueError(f"Missing ALLOW columns from Phase D: {missing}")
+    logger.info("Phase E allow contract: active allow columns present: %s", sorted(active_allows))
+
+
+def _apply_event_allow_gates(
+    events_df: pd.DataFrame,
+    *,
+    required_allow_by_family: dict[str, str],
+    active_allows: set[str],
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    if events_df.empty:
+        return events_df
+    required_allow = events_df["family_id"].map(required_allow_by_family)
+    missing_family_mask = required_allow.isna()
+    if missing_family_mask.any():
+        missing_families = sorted(set(events_df.loc[missing_family_mask, "family_id"]))
+        logger.warning(
+            "Phase E allow gate: dropping events with unmapped families=%s",
+            missing_families,
+        )
+        events_df = events_df.loc[~missing_family_mask]
+        if events_df.empty:
+            return events_df
+        required_allow = required_allow.loc[events_df.index]
+    required_allow_values = sorted(set(required_allow_by_family.values()))
+    missing_cols = sorted(set(required_allow_values) - set(events_df.columns))
+    if missing_cols:
+        raise ValueError(f"Missing required ALLOW columns for Phase E gating: {missing_cols}")
+    events = events_df.copy()
+    events["required_allow"] = required_allow
+    allow_values = pd.Series(0, index=events.index)
+    for allow_name in required_allow_values:
+        mask = required_allow.eq(allow_name)
+        if not mask.any():
+            continue
+        allow_values.loc[mask] = pd.to_numeric(events.loc[mask, allow_name], errors="coerce").fillna(0).astype(int)
+    keep_mask = allow_values.eq(1)
+    dropped = events.loc[~keep_mask]
+    if len(dropped):
+        dropped_counts = dropped["required_allow"].value_counts().to_dict()
+        logger.info(
+            "Phase E allow gate: dropped=%s total=%s breakdown=%s",
+            len(dropped),
+            len(events),
+            dropped_counts,
+        )
+    else:
+        logger.info("Phase E allow gate: dropped=0 total=%s", len(events))
+    coverage_rows = []
+    for allow_name in required_allow_values:
+        total = int(required_allow.eq(allow_name).sum())
+        kept = int((keep_mask & required_allow.eq(allow_name)).sum())
+        coverage_pct = (kept / total * 100.0) if total else 0.0
+        coverage_rows.append(
+            {"allow": allow_name, "events_total": total, "events_kept": kept, "coverage_pct": coverage_pct}
+        )
+    coverage_df = pd.DataFrame(coverage_rows)
+    logger.info("Phase E allow coverage:\n%s", coverage_df.to_string(index=False))
+    if active_allows:
+        for allow_name in sorted(active_allows):
+            total = coverage_df.loc[coverage_df["allow"] == allow_name, "events_total"]
+            if total.empty or int(total.iloc[0]) == 0:
+                logger.warning("Phase E allow coverage: active allow has no events: %s", allow_name)
+    return events.loc[keep_mask].drop(columns=["required_allow"])
 
 
 def build_context(
@@ -3831,6 +3930,8 @@ def main() -> None:
         effective_mode,
         run_id,
     )
+    active_allows = _active_allow_filters(config_payload)
+    required_allow_by_family = _required_allow_by_family()
 
     research_mode = effective_mode == "research"
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
@@ -3944,6 +4045,7 @@ def main() -> None:
     df_score_ctx = df_score_ctx.dropna(subset=[state_col, margin_col])
     logger.info("Rows after dropna ctx: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_dropna = len(df_score_ctx)
+    _validate_active_allow_columns(df_score_ctx, active_allows, logger)
     feature_builder = FeatureBuilder(context_tf=context_tf)
     features_all = feature_builder.build(df_score_ctx)
     # --- atr_ratio (diagnostic-only, comparable cross-symbol) ---
@@ -3984,6 +4086,12 @@ def main() -> None:
     if vwap_plot_path is not None:
         logger.info("VWAP diagnostic plot path=%s", vwap_plot_path)
     detected_events = detect_events(df_score_ctx, config=event_config)
+    detected_events = _apply_event_allow_gates(
+        detected_events,
+        required_allow_by_family=required_allow_by_family,
+        active_allows=active_allows,
+        logger=logger,
+    )
     vwap_valid_pct = detected_events.attrs.get("vwap_valid_pct")
     vwap_invalid_reason = detected_events.attrs.get("vwap_invalid_reason")
     vwap_invalid_bars = detected_events.attrs.get("vwap_invalid_bars")
