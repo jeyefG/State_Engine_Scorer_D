@@ -1,6 +1,7 @@
 import pandas as pd
 
-from state_engine.events import EventDetectionConfig, EventExtractor, EventFamily, EventType, _compute_vwap
+from state_engine.events import EventDetectionConfig, EventExtractor, EventFamily, EventType
+from state_engine.vwap import compute_vwap_mt5_daily
 
 
 def _make_m5_df() -> pd.DataFrame:
@@ -122,8 +123,8 @@ def test_vwap_daily_reset() -> None:
         },
         index=idx,
     )
-    vwap = _compute_vwap(df_m5, vwap_col="vwap", reset_mode="daily", vwap_window=50)
-    assert vwap["vwap"].iloc[2] == 200
+    vwap = compute_vwap_mt5_daily(df_m5)
+    assert vwap.iloc[2] == 200
 
 
 def test_family_id_from_allow() -> None:

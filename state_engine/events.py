@@ -9,6 +9,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from state_engine.vwap import compute_vwap_mt5_daily
+
 EPS = 1e-9
 BASE_SCORE_TF = "M5"
 _TIMEFRAME_MINUTES = {
@@ -98,6 +100,7 @@ class EventDetectionConfig:
     near_vwap_cooldown_bars: int = 3
     vwap_reset_mode: str | None = None
     vwap_session_cut_hour: int = 22
+    vwap_tz_server: str | None = None
     near_vwap_mode: str = "enter"
     touch_mode: str = "on"
     rejection_mode: str = "on"
@@ -147,52 +150,25 @@ class EventExtractor:
         df = df_m5.copy()
         vwap_metadata: dict[str, object] = {}
         if vwap_col not in df.columns:
-            ts = pd.to_datetime(_extract_timestamp(df))
-            ts = pd.Series(ts.to_numpy(), index=df.index)
-            has_session_col = any(col in df.columns for col in ("session_id", "session"))
-            created_session_id = False
-            cut_hour_used: int | None = None
-            if self.config.vwap_reset_mode in {None, "session"} and not has_session_col:
-                cut_hour_used = int(self.config.vwap_session_cut_hour)
-                session_day = ts - pd.to_timedelta((ts.dt.hour < cut_hour_used).astype(int), unit="D")
-                df["session_id"] = session_day.dt.date.astype(str)
-                created_session_id = True
-            reset_mode = _resolve_vwap_reset_mode(df, self.config.vwap_reset_mode)
-            if reset_mode == "cumulative":
-                self.logger.info("VWAP not provided; computing cumulative VWAP from OHLC (secondary path).")
-            else:
-                self.logger.info(
-                    "VWAP not provided; computing %s VWAP from OHLC (secondary path).",
-                    reset_mode,
-                )
-            vwap_metadata["vwap_reset_mode_effective"] = reset_mode
-            if cut_hour_used is not None:
-                vwap_metadata["vwap_session_cut_hour"] = cut_hour_used
-            sort_order = np.arange(len(df))
-            df_sorted = df.assign(
-                _sort_ts=ts.to_numpy(),
-                _sort_order=sort_order,
-            ).sort_values(["_sort_ts", "_sort_order"], kind="mergesort")
-            vwap_sorted = _compute_vwap(
-                df_sorted.drop(columns=["_sort_ts", "_sort_order"]),
-                vwap_col=vwap_col,
-                reset_mode=reset_mode,
-                vwap_window=self.config.vwap_window,
+            time_col = None
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if "ts" in df.columns:
+                    time_col = "ts"
+                elif "time" in df.columns:
+                    time_col = "time"
+            self.logger.info("VWAP not provided; computing mt5_daily VWAP from OHLC.")
+            vwap_series = compute_vwap_mt5_daily(
+                df,
+                time_col=time_col,
+                high_col="high",
+                low_col="low",
+                close_col="close",
+                real_vol_col="volume",
+                tick_vol_col="tick_volume",
+                tz_server=self.config.vwap_tz_server,
             )
-            df_sorted[vwap_col] = vwap_sorted["vwap"]
-            df[vwap_col] = df_sorted.sort_values("_sort_order")[vwap_col].to_numpy()
-            df_sorted = df_sorted.drop(columns=["_sort_ts", "_sort_order"])
-            vwap_metadata.update(vwap_sorted["metadata"])
-            vwap_nan_pct = float(df[vwap_col].isna().mean() * 100)
-            self.logger.info(
-                "VWAP fallback computed: effective_mode=%s cut_hour=%s created_session_id=%s",
-                reset_mode,
-                cut_hour_used,
-                created_session_id,
-            )
-            self.logger.info("VWAP fallback nan_pct=%.2f%%", vwap_nan_pct)
-            if created_session_id:
-                df = df.drop(columns=["session_id"])
+            df[vwap_col] = vwap_series.to_numpy()
+            vwap_metadata.update(vwap_series.attrs)
         else:
             vwap_metadata["vwap_reset_mode_effective"] = "provided"
             vwap_metadata["vwap_volume_source"] = "provided"
@@ -243,6 +219,12 @@ class EventExtractor:
         lower_wick_ratio = lower_wick / (range_1 + self.eps)
 
         atr_14 = _ensure_atr_14(df)
+
+        self._log_vwap_telemetry(
+            close=close,
+            vwap=vwap,
+            atr=atr_14,
+        )
 
         dist_to_vwap_atr = dist_to_vwap / (atr_14 + self.eps)
 
@@ -380,6 +362,42 @@ class EventExtractor:
         if vwap_metadata:
             events_df.attrs.update(vwap_metadata)
         return events_df
+
+    def _log_vwap_telemetry(
+        self,
+        *,
+        close: pd.Series,
+        vwap: pd.Series,
+        atr: pd.Series,
+    ) -> None:
+        vwap_nan_pct = float(vwap.isna().mean() * 100.0) if len(vwap) else 0.0
+        vwap_min = float(vwap.min()) if vwap.notna().any() else float("nan")
+        vwap_max = float(vwap.max()) if vwap.notna().any() else float("nan")
+        self.logger.info(
+            "VWAP mt5_daily telemetry: mode=mt5_daily nan_pct=%.2f vwap_min=%.5f vwap_max=%.5f",
+            vwap_nan_pct,
+            vwap_min,
+            vwap_max,
+        )
+        if atr is not None and atr.notna().any():
+            denom = np.maximum(atr.to_numpy(), self.eps)
+            dist = (close - vwap).abs().to_numpy() / denom
+            dist_series = pd.Series(dist, index=close.index)
+            quantiles = dist_series.quantile([0.1, 0.5, 0.9, 0.99]).to_dict()
+            self.logger.info(
+                "VWAP mt5_daily sanity: abs_dist_to_vwap_atr_q=%s",
+                {k: round(v, 4) for k, v in quantiles.items()},
+            )
+        else:
+            returns = close.pct_change()
+            scale = float(returns.std()) if returns.notna().any() else np.nan
+            if not np.isnan(scale) and scale > 0:
+                dist = (close - vwap).abs() / scale
+                quantiles = dist.quantile([0.1, 0.5, 0.9, 0.99]).to_dict()
+                self.logger.info(
+                    "VWAP mt5_daily sanity: abs_dist_to_vwap_stdret_q=%s",
+                    {k: round(v, 4) for k, v in quantiles.items()},
+                )
 
 
 def _compute_vwap(

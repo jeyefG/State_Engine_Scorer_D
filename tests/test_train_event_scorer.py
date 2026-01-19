@@ -25,7 +25,7 @@ def test_fallback_no_model_saved(tmp_path: Path) -> None:
     assert not model_path.exists()
 
 
-def test_vwap_reporting_uses_fallback_metadata_session_mode() -> None:
+def test_vwap_reporting_uses_mt5_daily_metadata() -> None:
     idx = pd.date_range("2024-01-01 21:50", periods=6, freq="5min")
     df_m5 = pd.DataFrame(
         {
@@ -37,17 +37,16 @@ def test_vwap_reporting_uses_fallback_metadata_session_mode() -> None:
         },
         index=idx,
     )
-    config = EventDetectionConfig(vwap_reset_mode=None, vwap_session_cut_hour=22)
+    config = EventDetectionConfig()
     extractor = EventExtractor(config=config)
 
     events = extractor.extract(df_m5, symbol="TEST")
 
-    assert events.attrs["vwap_reset_mode_effective"] == "session"
-    assert events.attrs["vwap_session_cut_hour"] == 22
+    assert events.attrs["vwap_reset_mode_effective"] == "mt5_daily"
+    assert events.attrs["vwap_mode"] == "mt5_daily"
 
     report_mode = _resolve_vwap_report_mode(events, df_m5, config)
-    assert report_mode == "session"
-    assert "daily" not in report_mode
+    assert report_mode == "mt5_daily"
 
 
 def test_guardrails_flags_low_calib_samples() -> None:

@@ -29,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from state_engine.events import EventDetectionConfig, _compute_vwap, _resolve_vwap_reset_mode, detect_events, label_events
+from state_engine.events import EventDetectionConfig, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
     GatingPolicy,
@@ -48,6 +48,7 @@ from state_engine.research import (
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.session import SESSION_BUCKETS, get_session_bucket
 from state_engine.config_loader import deep_merge, load_config
+from state_engine.vwap import compute_vwap_mt5_daily, mt5_day_id
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +117,16 @@ def parse_args() -> argparse.Namespace:
         help="Habilitar modo Fase E (telemetría sin decisiones ni thresholds).",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
+    parser.add_argument(
+        "--vwap-check-date",
+        default=None,
+        help="Fecha (YYYY-MM-DD) para generar PNG de VWAP check.",
+    )
+    parser.add_argument(
+        "--vwap-tz-server",
+        default=None,
+        help="Timezone del servidor MT5 para reset diario (ej. Europe/Athens).",
+    )
     return parser.parse_args()
 
 
@@ -536,19 +547,16 @@ def _resolve_vwap_report_mode(
     df_score_ctx: pd.DataFrame,
     event_config: EventDetectionConfig,
 ) -> str:
-    attrs_mode = events_df.attrs.get("vwap_reset_mode_effective")
+    attrs_mode = events_df.attrs.get("vwap_mode")
+    if attrs_mode is None:
+        attrs_mode = events_df.attrs.get("vwap_reset_mode_effective")
     if attrs_mode is None and "vwap_reset_mode_effective" in events_df.columns and not events_df.empty:
         attrs_mode = events_df["vwap_reset_mode_effective"].iloc[0]
     if attrs_mode is not None:
         return str(attrs_mode)
     if "vwap" in df_score_ctx.columns:
         return "provided (no metadata)"
-    config_mode = (
-        event_config.vwap_reset_mode
-        if event_config.vwap_reset_mode is not None
-        else ("session" if any(col in df_score_ctx.columns for col in ("session_id", "session")) else "daily")
-    )
-    return f"config_{config_mode} (no metadata)"
+    return "mt5_daily (no metadata)"
 
 
 def _write_vwap_diagnostic_plot(
@@ -556,6 +564,8 @@ def _write_vwap_diagnostic_plot(
     symbol: str,
     event_config: EventDetectionConfig,
     logger: logging.Logger,
+    *,
+    check_date: str | None = None,
 ) -> Path | None:
     if ohlcv_score.empty:
         logger.warning("VWAP diagnostic plot skipped: empty OHLCV input.")
@@ -563,46 +573,42 @@ def _write_vwap_diagnostic_plot(
     df = ohlcv_score.copy()
     if not isinstance(df.index, pd.DatetimeIndex):
         df = df.set_index(pd.to_datetime(df.index))
-    reset_mode = _resolve_vwap_reset_mode(df, event_config.vwap_reset_mode)
-    created_session_id = False
-    if reset_mode == "session" and not any(col in df.columns for col in ("session_id", "session")):
-        cut_hour = int(event_config.vwap_session_cut_hour)
-        session_day = df.index - pd.to_timedelta((df.index.hour < cut_hour).astype(int), unit="D")
-        df["session_id"] = session_day.date.astype(str)
-        created_session_id = True
-    vwap_result = _compute_vwap(
+    vwap_series = compute_vwap_mt5_daily(
         df,
-        vwap_col="vwap",
-        reset_mode=reset_mode,
-        vwap_window=event_config.vwap_window,
+        high_col="high",
+        low_col="low",
+        close_col="close",
+        real_vol_col="volume",
+        tick_vol_col="tick_volume",
+        tz_server=event_config.vwap_tz_server,
     )
-    if isinstance(vwap_result, pd.Series):
-        vwap_series = vwap_result
-    else:
-        vwap_series = vwap_result.get("vwap") if isinstance(vwap_result, dict) else None
-    if vwap_series is None:
+    if vwap_series is None or vwap_series.empty:
         logger.warning("VWAP diagnostic plot skipped: compute_vwap returned no series.")
         return None
     df["vwap"] = vwap_series
-    if reset_mode == "session":
-        session_key = df["session_id"] if "session_id" in df.columns else df["session"]
-    else:
-        session_key = df.index.date
-    if not isinstance(session_key, pd.Series):
-        session_key = pd.Series(session_key, index=df.index)
-    if session_key.empty:
+    day_id = mt5_day_id(df, tz_server=event_config.vwap_tz_server)
+    if day_id.empty:
         logger.warning("VWAP diagnostic plot skipped: no session key available.")
         return None
-    last_session = session_key.iloc[-1]
-    session_mask = session_key == last_session
-    session_df = df.loc[session_mask]
+    if check_date:
+        target_day = pd.to_datetime(check_date).date()
+        day_mask = day_id.dt.date == target_day
+        if not day_mask.any():
+            logger.warning("VWAP diagnostic plot skipped: date %s not found.", check_date)
+            return None
+        session_label = str(target_day)
+    else:
+        last_day = day_id.iloc[-1]
+        day_mask = day_id == last_day
+        session_label = str(last_day.date() if hasattr(last_day, "date") else last_day)
+    session_df = df.loc[day_mask]
     if session_df.empty:
         logger.warning("VWAP diagnostic plot skipped: last session empty.")
         return None
-    diagnostics_dir = PROJECT_ROOT / "diagnostics" / "vwap_check"
+    diagnostics_dir = PROJECT_ROOT / "outputs" / "vwap_check"
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
-    session_label = str(last_session).replace("/", "-").replace(" ", "_")
-    output_path = diagnostics_dir / f"{_safe_symbol(symbol)}_{session_label}.png"
+    file_label = str(session_label).replace("/", "-").replace(" ", "_")
+    output_path = diagnostics_dir / f"{_safe_symbol(symbol)}_{file_label}.png"
 
     try:
         import matplotlib.pyplot as plt
@@ -623,7 +629,7 @@ def _write_vwap_diagnostic_plot(
             alpha=0.1,
             label="High/Low",
         )
-    ax.set_title(f"{symbol} VWAP check | session={last_session} | mode={reset_mode}")
+    ax.set_title(f"{symbol} VWAP check | session={session_label} | mode=mt5_daily")
     ax.set_xlabel("Time")
     ax.set_ylabel("Price")
     ax.legend()
@@ -631,9 +637,16 @@ def _write_vwap_diagnostic_plot(
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
-    if created_session_id:
-        df.drop(columns=["session_id"], inplace=True)
     logger.info("VWAP diagnostic plot saved: %s", output_path)
+    mean_abs_diff = (session_df["close"] - session_df["vwap"]).abs().mean()
+    range_mean = (session_df["high"] - session_df["low"]).mean()
+    ratio = float(mean_abs_diff / range_mean) if range_mean and not np.isnan(range_mean) else float("nan")
+    logger.info(
+        "VWAP diagnostic ratio: mean_abs_diff=%.6f range_mean=%.6f ratio=%.6f",
+        mean_abs_diff,
+        range_mean,
+        ratio,
+    )
     return output_path
 
 def _value_state(
@@ -2033,10 +2046,17 @@ def _run_training_for_k(
         print(line)
 
     vwap_mode = _resolve_vwap_report_mode(detected_events, df_score_ctx, event_config)
+    vwap_real_col = detected_events.attrs.get("vwap_real_volume_col")
+    vwap_tick_col = detected_events.attrs.get("vwap_tick_volume_col")
+    vwap_price_cols = detected_events.attrs.get("vwap_price_columns")
     dist_abs = events_all["dist_to_vwap_atr"].abs()
     vwap_quantiles = dist_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict() if not dist_abs.empty else {}
     print("\n[VWAP SANITY]")
-    print(f"vwap_mode={vwap_mode} near_vwap_atr={event_config.near_vwap_atr}")
+    print(
+        "vwap_mode="
+        f"{vwap_mode} near_vwap_atr={event_config.near_vwap_atr} "
+        f"price_cols={vwap_price_cols} real_vol_col={vwap_real_col} tick_vol_col={vwap_tick_col}"
+    )
     if vwap_quantiles:
         print("dist_to_vwap_atr_abs_q=" + str({k: round(v, 4) for k, v in vwap_quantiles.items()}))
 
@@ -3440,8 +3460,14 @@ def main() -> None:
 
     score_total = len(ohlcv_score)
 
-    event_config = EventDetectionConfig().for_timeframe(args.score_tf)
-    vwap_plot_path = _write_vwap_diagnostic_plot(ohlcv_score, args.symbol, event_config, logger)
+    event_config = EventDetectionConfig(vwap_tz_server=args.vwap_tz_server).for_timeframe(args.score_tf)
+    vwap_plot_path = _write_vwap_diagnostic_plot(
+        ohlcv_score,
+        args.symbol,
+        event_config,
+        logger,
+        check_date=args.vwap_check_date,
+    )
     if vwap_plot_path is not None:
         logger.info("VWAP diagnostic plot path=%s", vwap_plot_path)
     detected_events = detect_events(df_score_ctx, config=event_config)
