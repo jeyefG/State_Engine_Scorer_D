@@ -72,6 +72,15 @@ class EventFamily(str, Enum):
     GENERIC_VWAP = "E_GENERIC_VWAP"
 
 
+def required_allow_by_family() -> dict[str, str]:
+    return {
+        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
+        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
+        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
+        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
+    }
+
+
 @dataclass(frozen=True)
 class EventDetectionConfig:
     score_tf: str = BASE_SCORE_TF
@@ -708,13 +717,7 @@ def _infer_family_id(events_df: pd.DataFrame, allow_cols: list[str]) -> pd.Serie
         return pd.Series(EventFamily.GENERIC_VWAP.value, index=events_df.index)
     allow_active = events_df[allow_cols].fillna(0).astype(int)
     family = pd.Series(EventFamily.GENERIC_VWAP.value, index=events_df.index)
-    priority = [
-        ("ALLOW_balance_fade", EventFamily.BALANCE_FADE.value),
-        ("ALLOW_transition_failure", EventFamily.TRANSITION_FAILURE.value),
-        ("ALLOW_trend_pullback", EventFamily.TREND_PULLBACK.value),
-        ("ALLOW_trend_continuation", EventFamily.TREND_CONTINUATION.value),
-    ]
-    for allow_col, family_value in priority:
+    for family_value, allow_col in required_allow_by_family().items():
         if allow_col not in allow_cols:
             continue
         mask = allow_active[allow_col].eq(1) & family.eq(EventFamily.GENERIC_VWAP.value)
@@ -740,6 +743,7 @@ __all__ = [
     "EventExtractor",
     "EventFamily",
     "EventDetectionConfig",
+    "required_allow_by_family",
     "detect_events",
     "label_events",
 ]

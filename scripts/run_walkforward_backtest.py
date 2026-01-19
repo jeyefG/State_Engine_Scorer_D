@@ -23,7 +23,6 @@ from state_engine.events import EventFamily, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
     GatingPolicy,
-    apply_allow_context_filters,
     build_transition_gating_thresholds,
 )
 from state_engine.model import StateEngineModel
@@ -31,6 +30,7 @@ from state_engine.mt5_connector import MT5Connector
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.walkforward import WalkForwardSplit, apply_edge_ablation, generate_walkforward_splits
 from state_engine.config_loader import load_config
+from state_engine.context_features import build_context_features
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,26 +107,22 @@ def build_h1_context(
     feature_engineer: FeatureEngineer,
     gating: GatingPolicy,
     symbol_cfg: dict | None,
+    symbol: str,
     logger: logging.Logger,
 ) -> pd.DataFrame:
     full_features = feature_engineer.compute_features(ohlcv_h1)
     features = feature_engineer.training_features(full_features)
     outputs = state_model.predict_outputs(features)
-    allows = gating.apply(outputs, features=full_features, config_meta=symbol_cfg)
-    allow_context_frame = allows.copy()
-    feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
-    if feature_cols:
-        allow_context_frame = allow_context_frame.join(
-            full_features[feature_cols].reindex(allow_context_frame.index)
-        )
-    allow_cols = list(allows.columns)
-    allows = apply_allow_context_filters(
-        allow_context_frame,
-        symbol_cfg,
-        logger,
-        phase_e=False,
-    )[allow_cols]
-    ctx = pd.concat([outputs[["state_hat", "margin"]], allows], axis=1)
+    ctx_features = build_context_features(
+        ohlcv_h1,
+        outputs,
+        symbol=symbol,
+        timeframe="H1",
+    )
+    features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
+    allows = gating.apply(outputs, features=features_for_gating, config_meta=symbol_cfg, logger=logger)
+    ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
+    ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], ctx_features, allows], axis=1)
     return ctx.shift(1)
 
 
@@ -347,7 +343,15 @@ def run_walkforward(symbol: str, args: argparse.Namespace, logger: logging.Logge
         logger=logger,
     )
     gating = GatingPolicy(gating_thresholds)
-    ctx_h1 = build_h1_context(ohlcv_h1, state_model, feature_engineer, gating, symbol_cfg, logger)
+    ctx_h1 = build_h1_context(
+        ohlcv_h1,
+        state_model,
+        feature_engineer,
+        gating,
+        symbol_cfg,
+        args.symbol,
+        logger,
+    )
     df_m5_ctx = merge_h1_m5(ctx_h1, ohlcv_m5)
     df_m5_ctx = df_m5_ctx.dropna(subset=["state_hat_H1", "margin_H1"])
 

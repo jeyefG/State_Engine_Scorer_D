@@ -29,11 +29,16 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from state_engine.events import EventDetectionConfig, EventFamily, detect_events, label_events
+from state_engine.events import (
+    EventDetectionConfig,
+    EventFamily,
+    detect_events,
+    label_events,
+    required_allow_by_family,
+)
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
     GatingPolicy,
-    apply_allow_context_filters,
     build_transition_gating_thresholds,
 )
 from state_engine.model import StateEngineModel
@@ -48,8 +53,8 @@ from state_engine.research import (
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.session import SESSION_BUCKETS, get_session_bucket
 from state_engine.config_loader import deep_merge, load_config
-from state_engine.context_features import build_context_features
 from state_engine.vwap import compute_vwap_mt5_daily, mt5_day_id
+from state_engine.pipeline_phase_d import build_context_bundle
 
 
 def parse_args() -> argparse.Namespace:
@@ -274,27 +279,35 @@ def _active_allow_filters(symbol_cfg: dict | None) -> set[str]:
     }
 
 
-def _required_allow_by_family() -> dict[str, str]:
-    return {
-        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
-        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
-        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
-        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
-    }
-
-
-def _validate_active_allow_columns(
+def _validate_phase_e_context_contract(
     ctx: pd.DataFrame,
-    active_allows: set[str],
+    symbol_cfg: dict | None,
+    required_allow_map: dict[str, str],
     logger: logging.Logger,
 ) -> None:
-    if not active_allows:
-        logger.info("Phase E allow contract: no active allow_context_filters configured.")
-        return
-    missing = sorted(active_allows - set(ctx.columns))
+    active_allows = _active_allow_filters(symbol_cfg)
+    required_allows = sorted(set(required_allow_map.values()))
+    missing = sorted(set(active_allows) - set(ctx.columns))
     if missing:
         raise ValueError(f"Missing ALLOW columns from Phase D: {missing}")
-    logger.info("Phase E allow contract: active allow columns present: %s", sorted(active_allows))
+    allows_to_check = sorted(set(active_allows) | set(required_allows))
+    for allow_name in allows_to_check:
+        if allow_name not in ctx.columns:
+            raise ValueError(f"Missing required ALLOW column in Phase E: {allow_name}")
+        series = pd.to_numeric(ctx[allow_name], errors="coerce")
+        if series.isna().any():
+            raise ValueError(f"ALLOW column {allow_name} has NaN values in Phase E context.")
+        unique_vals = set(series.unique())
+        if not unique_vals.issubset({0, 1}):
+            raise ValueError(
+                f"ALLOW column {allow_name} must be binary (0/1). Observed={sorted(unique_vals)}"
+            )
+    allow_rates = {allow: float(ctx[allow].mean() * 100.0) for allow in allows_to_check} if allows_to_check else {}
+    logger.info(
+        "Phase E context contract OK | allows=%s allow_rates=%s",
+        allows_to_check,
+        {k: round(v, 2) for k, v in allow_rates.items()},
+    )
 
 
 def _apply_event_allow_gates(
@@ -401,190 +414,6 @@ def _force_phase_e_allow_identity(
     allow_counts = events["allow_id"].value_counts().to_dict()
     logger.info("Phase E allow identity summary: %s", allow_counts)
     return events
-
-
-def build_context(
-    ohlcv_ctx: pd.DataFrame,
-    state_model: StateEngineModel,
-    feature_engineer: FeatureEngineer,
-    gating: GatingPolicy,
-    symbol_cfg: dict | None,
-    symbol: str,
-    context_tf: str,
-    mode: str,
-    phase_e: bool,
-    logger: logging.Logger,
-) -> pd.DataFrame:
-    def _required_columns_for_filter(rule_cfg: dict) -> set[str]:
-        required: set[str] = set()
-        if rule_cfg.get("sessions_in") is not None:
-            required.add("session")
-        if rule_cfg.get("state_age_min") is not None or rule_cfg.get("state_age_max") is not None:
-            required.add("state_age")
-        if rule_cfg.get("dist_vwap_atr_min") is not None or rule_cfg.get("dist_vwap_atr_max") is not None:
-            required.add("dist_vwap_atr")
-        if rule_cfg.get("breakmag_min") is not None or rule_cfg.get("breakmag_max") is not None:
-            required.add("BreakMag")
-        if rule_cfg.get("reentry_min") is not None or rule_cfg.get("reentry_max") is not None:
-            required.add("ReentryCount")
-        return required
-
-    full_features = feature_engineer.compute_features(ohlcv_ctx)
-    features = feature_engineer.training_features(full_features)
-    outputs = state_model.predict_outputs(features)
-    allows = gating.apply(
-        outputs,
-        features=full_features,
-        logger=logger,
-        symbol=symbol,
-        config_meta=symbol_cfg,
-    )
-    allow_context_frame = allows.copy()
-    ctx_features = build_context_features(
-        ohlcv_ctx,
-        outputs,
-        symbol=symbol,
-        timeframe=context_tf,
-    )
-    feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
-    if feature_cols:
-        allow_context_frame = allow_context_frame.join(
-            full_features[feature_cols].reindex(allow_context_frame.index)
-        )
-    if not ctx_features.empty:
-        allow_context_frame = allow_context_frame.join(
-            ctx_features.reindex(allow_context_frame.index)
-        )
-    logger.debug(
-        "CTX features joined | shape=%s columns=%s",
-        ctx_features.shape,
-        list(ctx_features.columns),
-    )
-    if "session" not in allow_context_frame.columns and "ctx_session_bucket" in allow_context_frame.columns:
-        allow_context_frame["session"] = allow_context_frame["ctx_session_bucket"]
-    if "state_age" not in allow_context_frame.columns and "ctx_state_age" in allow_context_frame.columns:
-        allow_context_frame["state_age"] = allow_context_frame["ctx_state_age"]
-    if "dist_vwap_atr" not in allow_context_frame.columns:
-        for source in ("ctx_dist_vwap_atr", "ctx_dist_vwap_atr_abs"):
-            if source in allow_context_frame.columns:
-                allow_context_frame["dist_vwap_atr"] = allow_context_frame[source]
-                break
-    allow_cols = list(allows.columns)
-    non_allow_cols = [col for col in allow_context_frame.columns if col not in allow_cols]
-    logger.info("ALLOW ctx columns available: %s", non_allow_cols)
-    logger.info(
-        "ALLOW ctx availability | has_session=%s has_state_age=%s has_dist_vwap_atr=%s",
-        "session" in allow_context_frame.columns,
-        "state_age" in allow_context_frame.columns,
-        "dist_vwap_atr" in allow_context_frame.columns,
-    )
-    nan_pct = {}
-    for col in ("session", "state_age", "dist_vwap_atr"):
-        if col in allow_context_frame.columns:
-            nan_pct[col] = float(allow_context_frame[col].isna().mean() * 100.0)
-        else:
-            nan_pct[col] = None
-    logger.info(
-        "ALLOW ctx NaN pct | session=%s state_age=%s dist_vwap_atr=%s",
-        "missing" if nan_pct["session"] is None else f"{nan_pct['session']:.2f}",
-        "missing" if nan_pct["state_age"] is None else f"{nan_pct['state_age']:.2f}",
-        "missing" if nan_pct["dist_vwap_atr"] is None else f"{nan_pct['dist_vwap_atr']:.2f}",
-    )
-    allow_cfg = symbol_cfg.get("allow_context_filters") if isinstance(symbol_cfg, dict) else None
-    filtered_symbol_cfg = symbol_cfg
-    missing_by_rule: dict[str, list[str]] = {}
-    available_cols = sorted(allow_context_frame.columns)
-    if isinstance(allow_cfg, dict):
-        for allow_rule, rule_cfg in allow_cfg.items():
-            if allow_rule == "ALLOW_transition_failure":
-                continue
-            if not isinstance(rule_cfg, dict) or not rule_cfg.get("enabled", False):
-                continue
-            required = _required_columns_for_filter(rule_cfg)
-            missing = sorted(required - set(allow_context_frame.columns))
-            if missing:
-                missing_by_rule[allow_rule] = missing
-    if missing_by_rule:
-        if phase_e or mode == "research":
-            missing_details = "; ".join(
-                f"{allow_rule} missing={missing_cols}"
-                for allow_rule, missing_cols in sorted(missing_by_rule.items())
-            )
-            raise ValueError(
-                "ALLOW context filters enabled but missing columns. "
-                f"{missing_details}. Available={available_cols}"
-            )
-        logger.warning(
-            "ALLOW context filters missing columns (auto-disable in mode=%s): %s | available=%s",
-            mode,
-            missing_by_rule,
-            available_cols,
-        )
-        if isinstance(symbol_cfg, dict) and isinstance(allow_cfg, dict):
-            filtered_symbol_cfg = dict(symbol_cfg)
-            allow_ctx = dict(allow_cfg)
-            for allow_rule in missing_by_rule:
-                rule_cfg = allow_ctx.get(allow_rule)
-                if isinstance(rule_cfg, dict):
-                    allow_ctx[allow_rule] = {**rule_cfg, "enabled": False}
-            filtered_symbol_cfg["allow_context_filters"] = allow_ctx
-            logger.info(
-                "ALLOW context filters auto-disabled for rules=%s",
-                sorted(missing_by_rule.keys()),
-            )
-    pre_filter_sums = (
-        allow_context_frame[allow_cols].fillna(0).sum().astype(int).to_dict() if allow_cols else {}
-    )
-    allows = apply_allow_context_filters(
-        allow_context_frame,
-        filtered_symbol_cfg,
-        logger,
-        phase_e=phase_e,
-    )[allow_cols]
-    post_filter_sums = allows.fillna(0).sum().astype(int).to_dict() if allow_cols else {}
-    logger.info("ALLOW sums pre_filter=%s post_filter=%s", pre_filter_sums, post_filter_sums)
-    if allow_cols:
-        allows = allows.fillna(0).astype(int)
-        allow_active_pct = float((allows.sum(axis=1) > 0).mean() * 100.0) if len(allows) else 0.0
-        allow_id = _build_allow_id(allows, allow_cols)
-        top_allow_id = allow_id.value_counts().head(3).to_dict()
-    else:
-        allow_active_pct = 0.0
-        top_allow_id = {}
-    logger.info(
-        "ALLOW post_filter stats | allow_active_pct=%.2f top_allow_id=%s",
-        allow_active_pct,
-        top_allow_id,
-    )
-    ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
-    ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], allows], axis=1)
-    ctx = ctx.shift(1)
-    return ctx
-
-
-def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame, *, context_tf: str) -> pd.DataFrame:
-    logger = logging.getLogger("event_scorer")
-    h1 = ctx_h1.copy().sort_index()
-    score = ohlcv_score.copy().sort_index()
-    if getattr(h1.index, "tz", None) is not None:
-        h1.index = h1.index.tz_localize(None)
-    if getattr(score.index, "tz", None) is not None:
-        score.index = score.index.tz_localize(None)
-    h1 = h1.reset_index().rename(columns={h1.index.name or "index": "time"})
-    score = score.reset_index().rename(columns={score.index.name or "index": "time"})
-    merged = pd.merge_asof(score, h1, on="time", direction="backward")
-    merged = merged.set_index("time")
-    context_tf_norm = _normalize_timeframe(context_tf)
-    state_col = f"state_hat_{context_tf_norm}"
-    margin_col = f"margin_{context_tf_norm}"
-    merged = merged.rename(columns={"state_hat": state_col, "margin": margin_col})
-    allow_cols = [col for col in merged.columns if col.startswith("ALLOW_")]
-    if allow_cols:
-        merged[allow_cols] = merged[allow_cols].fillna(0).astype(int)
-    missing_ctx = merged[[state_col, margin_col]].isna().mean()
-    if (missing_ctx > 0.25).any():
-        logger.warning("High missing context after merge: %s", missing_ctx.to_dict())
-    return merged
 
 
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
@@ -2627,7 +2456,7 @@ def _run_training_for_k(
     if args.phase_e:
         events_all = _force_phase_e_allow_identity(
             events_all,
-            required_allow_by_family=required_allow_by_family,
+            required_allow_by_family=required_allow_map,
             logger=logger,
         )
     else:
@@ -3992,7 +3821,7 @@ def main() -> None:
         run_id,
     )
     active_allows = _active_allow_filters(config_payload)
-    required_allow_by_family = _required_allow_by_family()
+    required_allow_map = required_allow_by_family()
 
     research_mode = effective_mode == "research"
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
@@ -4070,20 +3899,20 @@ def main() -> None:
         logger=logger,
     )
     gating = GatingPolicy(gating_thresholds)
-    ctx_h1 = build_context(
-        ohlcv_ctx,
-        state_model,
-        feature_engineer,
-        gating,
-        config_payload,
-        args.symbol,
-        context_tf,
-        effective_mode,
-        args.phase_e,
-        logger,
+    context_bundle = build_context_bundle(
+        symbol=args.symbol,
+        context_tf=context_tf,
+        score_tf=args.score_tf,
+        ohlcv_ctx=ohlcv_ctx,
+        ohlcv_score=ohlcv_score,
+        state_model=state_model,
+        feature_engineer=feature_engineer,
+        gating_policy=gating,
+        symbol_cfg=config_payload,
+        phase_e=args.phase_e,
+        logger=logger,
     )
-
-    df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score, context_tf=context_tf)
+    df_score_ctx = context_bundle.df_score_ctx
     if "atr_14" not in df_score_ctx.columns:
         df_score_ctx["atr_14"] = _ensure_atr_14(df_score_ctx)
     ctx_cols = [col for col in df_score_ctx.columns if col.startswith("ctx_")]
@@ -4106,7 +3935,8 @@ def main() -> None:
     df_score_ctx = df_score_ctx.dropna(subset=[state_col, margin_col])
     logger.info("Rows after dropna ctx: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_dropna = len(df_score_ctx)
-    _validate_active_allow_columns(df_score_ctx, active_allows, logger)
+    if args.phase_e:
+        _validate_phase_e_context_contract(df_score_ctx, config_payload, required_allow_map, logger)
     feature_builder = FeatureBuilder(context_tf=context_tf)
     features_all = feature_builder.build(df_score_ctx)
     # --- atr_ratio (diagnostic-only, comparable cross-symbol) ---
@@ -4149,14 +3979,14 @@ def main() -> None:
     detected_events = detect_events(df_score_ctx, config=event_config)
     detected_events = _apply_event_allow_gates(
         detected_events,
-        required_allow_by_family=required_allow_by_family,
+        required_allow_by_family=required_allow_map,
         active_allows=active_allows,
         logger=logger,
     )
     if args.phase_e:
         detected_events = _force_phase_e_allow_identity(
             detected_events,
-            required_allow_by_family=required_allow_by_family,
+            required_allow_by_family=required_allow_map,
             logger=logger,
         )
         if not detected_events.empty:
