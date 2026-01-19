@@ -228,22 +228,28 @@ class GatingPolicy:
                 enabled_extras,
             )
 
+        base_masks = {
+            "balance": allow_balance_fade,
+            "transition": allow_transition_failure,
+            "trend": allow_trend_pullback,
+            "any": pd.Series(True, index=outputs.index),
+        }
+        allowed_base_states = set(base_masks.keys())
+
         for allow_name in extra_allow_names:
-            lower_name = allow_name.lower()
-            if "trend" in lower_name:
-                allow_map[allow_name] = allow_trend_pullback
-            elif "transition" in lower_name:
-                allow_map[allow_name] = guardrails_ok
-            elif "balance" in lower_name:
-                allow_map[allow_name] = allow_balance_fade
-            else:
-                if logger is not None:
-                    logger.warning(
-                        "GATING_ALLOW_UNKNOWN_STATE symbol=%s allow_name=%s base_mask=false",
-                        symbol,
-                        allow_name,
-                    )
-                allow_map[allow_name] = pd.Series(False, index=outputs.index)
+            ctx_meta = ctx_allows.get(allow_name) if isinstance(ctx_allows, dict) else None
+            if not isinstance(ctx_meta, dict):
+                raise ValueError(f"ALLOW {allow_name} missing config block for base_state.")
+            base_state = ctx_meta.get("base_state") or ctx_meta.get("anchor_state")
+            if base_state is None:
+                raise ValueError(f"ALLOW {allow_name} missing required base_state.")
+            base_state_norm = str(base_state).strip().lower()
+            if base_state_norm not in allowed_base_states:
+                raise ValueError(
+                    f"ALLOW {allow_name} has invalid base_state={base_state}. "
+                    f"Expected one of {sorted(allowed_base_states)}."
+                )
+            allow_map[allow_name] = base_masks[base_state_norm]
 
         allow_names = base_allow_names + extra_allow_names
         for allow_name in allow_names:
@@ -252,7 +258,20 @@ class GatingPolicy:
                 ctx_all = config_meta.get("allow_context_filters")
                 if isinstance(ctx_all, dict):
                     ctx_meta = ctx_all.get(allow_name)
-            filtered_mask, _, _ = self._apply_allow_context_filter(
+            if ctx_meta is None and allow_name in {
+                "ALLOW_trend_pullback",
+                "ALLOW_trend_continuation",
+                "ALLOW_balance_fade",
+                "ALLOW_transition_failure",
+            }:
+                default_base_state = {
+                    "ALLOW_trend_pullback": "trend",
+                    "ALLOW_trend_continuation": "trend",
+                    "ALLOW_balance_fade": "balance",
+                    "ALLOW_transition_failure": "transition",
+                }[allow_name]
+                ctx_meta = {"enabled": False, "base_state": default_base_state}
+            filtered_mask, counts, _ = self._apply_allow_context_filter(
                 allow_name,
                 allow_map[allow_name],
                 outputs,
@@ -262,6 +281,23 @@ class GatingPolicy:
                 symbol,
             )
             allow_map[allow_name] = filtered_mask
+            if logger is not None and counts is not None:
+                n_before = int(counts.get("n_base", 0))
+                n_after = int(counts.get("n_pass", 0))
+                total_rows = max(int(counts.get("total_rows", 0)), 1)
+                allow_rate = (n_after / total_rows) * 100.0 if total_rows else 0.0
+                logger.info(
+                    "ALLOW_AUDIT symbol=%s allow_name=%s base_state=%s filters=%s missing_cols=%s "
+                    "n_before=%s n_after=%s allow_rate=%.2f%%",
+                    symbol,
+                    allow_name,
+                    counts.get("base_state"),
+                    counts.get("active_filters"),
+                    counts.get("missing_columns"),
+                    n_before,
+                    n_after,
+                    allow_rate,
+                )
         allow_payload = {allow_name: allow_map[allow_name].astype(int) for allow_name in allow_names}
         return pd.DataFrame(allow_payload, index=outputs.index)
 
@@ -307,25 +343,24 @@ class GatingPolicy:
         masks: list[pd.Series] = []
         mask_map: dict[str, pd.Series] = {}
         applied: set[str] = set()
+        missing_columns: list[str] = []
+        active_filters: list[str] = []
 
         sessions_in = ctx_meta.get("sessions_in") if ctx_meta else None
         if enabled and sessions_in is not None and session_series is None:
-            raise ValueError(
-                f"ALLOW {allow_name} requires session column (ctx_session_bucket/session) but none found."
-            )
+            missing_columns.append("session")
         if sessions_in is not None and session_series is not None:
             allowed = {str(val) for val in sessions_in}
             mask = session_series.astype(str).isin(allowed)
             masks.append(mask)
             mask_map["session"] = mask
             applied.add("session")
+            active_filters.append("sessions_in")
 
         state_age_min = ctx_meta.get("state_age_min") if ctx_meta else None
         state_age_max = ctx_meta.get("state_age_max") if ctx_meta else None
         if enabled and (state_age_min is not None or state_age_max is not None) and state_age_series is None:
-            raise ValueError(
-                f"ALLOW {allow_name} requires state_age column (ctx_state_age/state_age) but none found."
-            )
+            missing_columns.append("state_age")
         if (state_age_min is not None or state_age_max is not None) and state_age_series is not None:
             series = pd.to_numeric(state_age_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -336,13 +371,12 @@ class GatingPolicy:
             masks.append(mask)
             mask_map["state_age"] = mask
             applied.add("state_age")
+            active_filters.append("state_age")
 
         dist_min = ctx_meta.get("dist_vwap_atr_min") if ctx_meta else None
         dist_max = ctx_meta.get("dist_vwap_atr_max") if ctx_meta else None
         if enabled and (dist_min is not None or dist_max is not None) and dist_series is None:
-            raise ValueError(
-                f"ALLOW {allow_name} requires dist_vwap_atr column (ctx_dist_vwap_atr/dist_vwap_atr) but none found."
-            )
+            missing_columns.append("dist_vwap_atr")
         if (dist_min is not None or dist_max is not None) and dist_series is not None:
             series = pd.to_numeric(dist_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -353,13 +387,12 @@ class GatingPolicy:
             masks.append(mask)
             mask_map["dist_vwap_atr"] = mask
             applied.add("dist_vwap_atr")
+            active_filters.append("dist_vwap_atr")
 
         breakmag_min = ctx_meta.get("breakmag_min") if ctx_meta else None
         breakmag_max = ctx_meta.get("breakmag_max") if ctx_meta else None
         if enabled and (breakmag_min is not None or breakmag_max is not None) and breakmag_series is None:
-            raise ValueError(
-                f"ALLOW {allow_name} requires BreakMag column but none found."
-            )
+            missing_columns.append("BreakMag")
         if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is not None:
             series = pd.to_numeric(breakmag_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -370,13 +403,12 @@ class GatingPolicy:
             masks.append(mask)
             mask_map["breakmag"] = mask
             applied.add("breakmag")
+            active_filters.append("breakmag")
 
         reentry_min = ctx_meta.get("reentry_min") if ctx_meta else None
         reentry_max = ctx_meta.get("reentry_max") if ctx_meta else None
         if enabled and (reentry_min is not None or reentry_max is not None) and reentry_series is None:
-            raise ValueError(
-                f"ALLOW {allow_name} requires ReentryCount column but none found."
-            )
+            missing_columns.append("ReentryCount")
         if (reentry_min is not None or reentry_max is not None) and reentry_series is not None:
             series = pd.to_numeric(reentry_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -387,6 +419,12 @@ class GatingPolicy:
             masks.append(mask)
             mask_map["reentry"] = mask
             applied.add("reentry")
+            active_filters.append("reentry")
+
+        if enabled and missing_columns:
+            raise ValueError(
+                f"ALLOW {allow_name} missing required columns: {sorted(set(missing_columns))}."
+            )
 
         if not enabled:
             counts = {
@@ -395,6 +433,9 @@ class GatingPolicy:
                 "n_pass": int(base_mask.sum()),
                 "n_fail": 0,
                 "status": "disabled",
+                "active_filters": active_filters,
+                "missing_columns": sorted(set(missing_columns)),
+                "base_state": ctx_meta.get("base_state") if ctx_meta else None,
             }
             return base_mask, counts, None
 
@@ -436,6 +477,9 @@ class GatingPolicy:
                 "n_pass": int(base_mask.sum()),
                 "n_fail": 0,
                 "status": "no_effective_conditions",
+                "active_filters": active_filters,
+                "missing_columns": sorted(set(missing_columns)),
+                "base_state": ctx_meta.get("base_state") if ctx_meta else None,
             }
             return base_mask, counts, None
 
@@ -470,6 +514,9 @@ class GatingPolicy:
             "pass_dist": _pass_count("dist_vwap_atr"),
             "pass_breakmag": _pass_count("breakmag"),
             "pass_reentry": _pass_count("reentry"),
+            "active_filters": active_filters,
+            "missing_columns": sorted(set(missing_columns)),
+            "base_state": ctx_meta.get("base_state") if ctx_meta else None,
         }
 
         if logger is not None:

@@ -79,6 +79,7 @@ event_scorer:
 allow_context_filters:
   ALLOW_transition_failure:
     enabled: true
+    base_state: transition
     require_all: true
     sessions_in: ["LONDON", "NY"]
     state_age_max: 5

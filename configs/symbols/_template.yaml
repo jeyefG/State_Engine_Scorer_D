@@ -69,6 +69,7 @@ allow_context_filters:
   # Example ALLOW filters (optional). Each ALLOW_* block mirrors the gating filters in code.
   ALLOW_transition_failure:
     enabled: false
+    base_state: transition
     require_all: true
     sessions_in: ["LONDON", "NY"]
     state_age_max: 5

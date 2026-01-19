@@ -81,8 +81,19 @@ def validate_allow_context_requirements(
         return any(col in available_columns for col in candidates)
 
     missing_by_rule: dict[str, list[str]] = {}
+    missing_base_state: dict[str, str] = {}
+    allowed_base_states = {"balance", "transition", "trend", "any"}
     for allow_rule, rule_cfg in allow_cfg.items():
-        if not isinstance(rule_cfg, dict) or not rule_cfg.get("enabled", False):
+        if not isinstance(rule_cfg, dict):
+            continue
+        base_state = rule_cfg.get("base_state") or rule_cfg.get("anchor_state")
+        if base_state is None:
+            missing_base_state[allow_rule] = "missing"
+        else:
+            base_state_norm = str(base_state).strip().lower()
+            if base_state_norm not in allowed_base_states:
+                missing_base_state[allow_rule] = f"invalid:{base_state}"
+        if not rule_cfg.get("enabled", False):
             continue
         required: list[str] = []
         if rule_cfg.get("sessions_in") is not None and not _has_any(
@@ -123,6 +134,15 @@ def validate_allow_context_requirements(
         raise ValueError(
             "ALLOW context filters enabled but missing columns. "
             f"{missing_details}. Available={sorted(available_columns)}"
+        )
+    if missing_base_state:
+        missing_details = "; ".join(
+            f"{allow_rule} base_state={detail}"
+            for allow_rule, detail in sorted(missing_base_state.items())
+        )
+        raise ValueError(
+            "ALLOW context filters missing required base_state. "
+            f"{missing_details}. Allowed={sorted(allowed_base_states)}"
         )
     logger.info("Phase D allow requirements OK | allows=%s", sorted(allow_cfg.keys()))
 

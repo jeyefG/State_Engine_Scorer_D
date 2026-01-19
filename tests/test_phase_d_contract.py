@@ -19,6 +19,7 @@ def test_allow_context_filters_missing_dist_vwap_atr_raises() -> None:
         "allow_context_filters": {
             "ALLOW_balance_vwap_proximity": {
                 "enabled": True,
+                "base_state": "balance",
                 "dist_vwap_atr_min": 0.1,
             }
         }
