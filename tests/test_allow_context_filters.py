@@ -52,5 +52,5 @@ def test_apply_allow_context_filters_missing_column_warns(caplog) -> None:
     logger = logging.getLogger("test")
     with caplog.at_level(logging.WARNING):
         result = apply_allow_context_filters(gating_df, symbol_cfg, logger)
-    pd.testing.assert_frame_equal(result, gating_df)
-    assert "missing dist_vwap_atr column" in caplog.text
+    assert result["ALLOW_transition_failure"].tolist() == [0, 0, 0]
+    assert "missing required columns" in caplog.text

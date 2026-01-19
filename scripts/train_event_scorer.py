@@ -432,7 +432,13 @@ def build_context(
     full_features = feature_engineer.compute_features(ohlcv_ctx)
     features = feature_engineer.training_features(full_features)
     outputs = state_model.predict_outputs(features)
-    allows = gating.apply(outputs, features=full_features)
+    allows = gating.apply(
+        outputs,
+        features=full_features,
+        logger=logger,
+        symbol=symbol,
+        config_meta=symbol_cfg,
+    )
     allow_context_frame = allows.copy()
     ctx_features = build_context_features(
         ohlcv_ctx,
@@ -529,7 +535,12 @@ def build_context(
     pre_filter_sums = (
         allow_context_frame[allow_cols].fillna(0).sum().astype(int).to_dict() if allow_cols else {}
     )
-    allows = apply_allow_context_filters(allow_context_frame, filtered_symbol_cfg, logger)[allow_cols]
+    allows = apply_allow_context_filters(
+        allow_context_frame,
+        filtered_symbol_cfg,
+        logger,
+        phase_e=phase_e,
+    )[allow_cols]
     post_filter_sums = allows.fillna(0).sum().astype(int).to_dict() if allow_cols else {}
     logger.info("ALLOW sums pre_filter=%s post_filter=%s", pre_filter_sums, post_filter_sums)
     if allow_cols:

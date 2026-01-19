@@ -519,6 +519,8 @@ def apply_allow_context_filters(
     gating_df: pd.DataFrame,
     symbol_cfg: dict | None,
     logger,
+    *,
+    phase_e: bool = False,
 ) -> pd.DataFrame:
     """Apply config-driven context filters to ALLOW_* rules."""
     if not symbol_cfg or not isinstance(symbol_cfg, dict):
@@ -534,19 +536,37 @@ def apply_allow_context_filters(
         return None
 
     filtered = gating_df.copy()
+    created_allows: list[str] = []
+    forced_zero_allows: list[str] = []
+    enabled_allows: list[str] = []
     for allow_rule, rule_cfg in allow_cfg.items():
         if not isinstance(rule_cfg, dict):
             logger.warning("allow_context_filters.%s must be a mapping; skipping.", allow_rule)
             continue
         if not rule_cfg.get("enabled", False):
             continue
+        enabled_allows.append(allow_rule)
         # Transition is handled inside GatingPolicy.apply() (Fase D). Avoid double-apply and misleading logs.
         if allow_rule == "ALLOW_transition_failure":
+            if allow_rule not in filtered.columns:
+                msg = f"allow_context_filters.{allow_rule} enabled but missing in gating_df."
+                if phase_e:
+                    raise ValueError(msg)
+                logger.warning("%s Filling with zeros.", msg)
+                filtered[allow_rule] = 0
+                created_allows.append(allow_rule)
+                forced_zero_allows.append(allow_rule)
             logger.info("allow_context_filters.%s handled in gating.py; skipping second pass.", allow_rule)
             continue
         
         if allow_rule not in filtered.columns:
-            logger.warning("allow_context_filters.%s missing in gating_df; skipping.", allow_rule)
+            msg = f"allow_context_filters.{allow_rule} missing in gating_df"
+            if phase_e:
+                raise ValueError(f"{msg}. Available={sorted(filtered.columns)}")
+            logger.warning("%s; creating column with zeros.", msg)
+            filtered[allow_rule] = 0
+            created_allows.append(allow_rule)
+            forced_zero_allows.append(allow_rule)
             continue
 
         allow_series = filtered[allow_rule].astype(bool)
@@ -556,14 +576,13 @@ def apply_allow_context_filters(
         masks: list[pd.Series] = []
         applied_conditions: list[str] = []
 
+        missing_required: list[str] = []
+
         sessions_in = rule_cfg.get("sessions_in")
         if sessions_in is not None:
             col_name = _resolve_column(filtered, ["session", "session_bucket"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing session column; skipping sessions_in.",
-                    allow_rule,
-                )
+                missing_required.append("session")
             else:
                 allowed = {str(val) for val in sessions_in}
                 mask = filtered[col_name].astype(str).isin(allowed)
@@ -574,10 +593,7 @@ def apply_allow_context_filters(
         if state_age_min is not None:
             col_name = _resolve_column(filtered, ["state_age"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing state_age column; skipping state_age_min.",
-                    allow_rule,
-                )
+                missing_required.append("state_age")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series >= float(state_age_min)
@@ -588,10 +604,7 @@ def apply_allow_context_filters(
         if state_age_max is not None:
             col_name = _resolve_column(filtered, ["state_age"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing state_age column; skipping state_age_max.",
-                    allow_rule,
-                )
+                missing_required.append("state_age")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series <= float(state_age_max)
@@ -602,10 +615,7 @@ def apply_allow_context_filters(
         if dist_vwap_atr_min is not None:
             col_name = _resolve_column(filtered, ["dist_vwap_atr"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing dist_vwap_atr column; skipping dist_vwap_atr_min.",
-                    allow_rule,
-                )
+                missing_required.append("dist_vwap_atr")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series >= float(dist_vwap_atr_min)
@@ -616,10 +626,7 @@ def apply_allow_context_filters(
         if dist_vwap_atr_max is not None:
             col_name = _resolve_column(filtered, ["dist_vwap_atr"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing dist_vwap_atr column; skipping dist_vwap_atr_max.",
-                    allow_rule,
-                )
+                missing_required.append("dist_vwap_atr")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series <= float(dist_vwap_atr_max)
@@ -630,10 +637,7 @@ def apply_allow_context_filters(
         if breakmag_min is not None:
             col_name = _resolve_column(filtered, ["BreakMag"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing BreakMag column; skipping breakmag_min.",
-                    allow_rule,
-                )
+                missing_required.append("BreakMag")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series >= float(breakmag_min)
@@ -644,10 +648,7 @@ def apply_allow_context_filters(
         if breakmag_max is not None:
             col_name = _resolve_column(filtered, ["BreakMag"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing BreakMag column; skipping breakmag_max.",
-                    allow_rule,
-                )
+                missing_required.append("BreakMag")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series <= float(breakmag_max)
@@ -658,10 +659,7 @@ def apply_allow_context_filters(
         if reentry_min is not None:
             col_name = _resolve_column(filtered, ["ReentryCount"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing ReentryCount column; skipping reentry_min.",
-                    allow_rule,
-                )
+                missing_required.append("ReentryCount")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series >= float(reentry_min)
@@ -672,15 +670,24 @@ def apply_allow_context_filters(
         if reentry_max is not None:
             col_name = _resolve_column(filtered, ["ReentryCount"])
             if col_name is None:
-                logger.warning(
-                    "allow_context_filters.%s missing ReentryCount column; skipping reentry_max.",
-                    allow_rule,
-                )
+                missing_required.append("ReentryCount")
             else:
                 series = pd.to_numeric(filtered[col_name], errors="coerce")
                 mask = series <= float(reentry_max)
                 masks.append(mask)
                 applied_conditions.append(f"reentry_max<={reentry_max} via {col_name}")
+
+        if missing_required:
+            missing_required = sorted(set(missing_required))
+            msg = (
+                f"allow_context_filters.{allow_rule} missing required columns={missing_required}"
+            )
+            if phase_e:
+                raise ValueError(f"{msg}. Available={sorted(filtered.columns)}")
+            logger.warning("%s; forcing ALLOW=0.", msg)
+            filtered[allow_rule] = 0
+            forced_zero_allows.append(allow_rule)
+            continue
 
         if not masks:
             logger.info("allow_context_filters.%s no effective conditions; skipping.", allow_rule)
@@ -706,6 +713,22 @@ def apply_allow_context_filters(
             delta * 100.0,
         )
         logger.info("%s conditions=%s", allow_rule, "; ".join(applied_conditions))
+
+    if enabled_allows:
+        allow_pcts = {}
+        for allow_rule in enabled_allows:
+            if allow_rule not in filtered.columns:
+                continue
+            pct = float(filtered[allow_rule].fillna(0).astype(int).mean() * 100.0)
+            allow_pcts[allow_rule] = pct
+            if pct == 0.0:
+                logger.warning("ALLOW %s has 0%% of 1s after context filters.", allow_rule)
+        logger.info(
+            "ALLOW context columns created=%s forced_zero=%s allow_pct_ones=%s",
+            sorted(set(created_allows)),
+            sorted(set(forced_zero_allows)),
+            allow_pcts,
+        )
 
     return filtered
 

@@ -112,7 +112,7 @@ def build_h1_context(
     full_features = feature_engineer.compute_features(ohlcv_h1)
     features = feature_engineer.training_features(full_features)
     outputs = state_model.predict_outputs(features)
-    allows = gating.apply(outputs, features=full_features)
+    allows = gating.apply(outputs, features=full_features, config_meta=symbol_cfg)
     allow_context_frame = allows.copy()
     feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
     if feature_cols:
@@ -120,7 +120,12 @@ def build_h1_context(
             full_features[feature_cols].reindex(allow_context_frame.index)
         )
     allow_cols = list(allows.columns)
-    allows = apply_allow_context_filters(allow_context_frame, symbol_cfg, logger)[allow_cols]
+    allows = apply_allow_context_filters(
+        allow_context_frame,
+        symbol_cfg,
+        logger,
+        phase_e=False,
+    )[allow_cols]
     ctx = pd.concat([outputs[["state_hat", "margin"]], allows], axis=1)
     return ctx.shift(1)
 
