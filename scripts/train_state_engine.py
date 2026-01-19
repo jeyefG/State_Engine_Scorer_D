@@ -325,6 +325,88 @@ def _build_look_for_coverage_table(
     return pd.DataFrame(rows)
 
 
+def _build_time_splits(index: pd.Index) -> dict[str, pd.Series]:
+    if len(index) == 0:
+        return {}
+    index_series = pd.Series(index)
+    q1 = index_series.quantile(1 / 3)
+    q2 = index_series.quantile(2 / 3)
+    return {
+        "early": index <= q1,
+        "mid": (index > q1) & (index <= q2),
+        "late": index > q2,
+    }
+
+
+def _build_coverage_by_split(
+    look_for_df: pd.DataFrame,
+    outputs: pd.DataFrame,
+    look_for_cfg: dict[str, Any],
+) -> pd.DataFrame:
+    from state_engine.gating import _base_state_mask
+
+    look_for_cols = [col for col in look_for_df.columns if col.startswith("LOOK_FOR_")]
+    splits = _build_time_splits(outputs.index)
+    if not look_for_cols or not splits:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    state_hat = outputs["state_hat"]
+    for split_name, split_mask in splits.items():
+        n_total = int(split_mask.sum())
+        for look_for_name in look_for_cols:
+            rule_cfg = look_for_cfg.get(look_for_name, {}) if isinstance(look_for_cfg, dict) else {}
+            base_state = None
+            if isinstance(rule_cfg, dict):
+                base_state = rule_cfg.get("base_state") or rule_cfg.get("anchor_state")
+            if base_state is None:
+                continue
+            base_mask = _base_state_mask(state_hat, base_state, outputs.index)
+            n_base_state = int((base_mask & split_mask).sum())
+            n_hits = int((look_for_df[look_for_name].astype(bool) & split_mask).sum())
+            pct_total = (n_hits / n_total) if n_total else 0.0
+            pct_of_base = (n_hits / n_base_state) if n_base_state else float("nan")
+            rows.append(
+                {
+                    "split": split_name,
+                    "look_for": look_for_name,
+                    "base_state": base_state,
+                    "n": n_hits,
+                    "pct_total": pct_total,
+                    "n_base_state": n_base_state,
+                    "pct_of_base_state": pct_of_base,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _build_look_for_jaccard(look_for_df: pd.DataFrame) -> pd.DataFrame:
+    look_for_cols = [col for col in look_for_df.columns if col.startswith("LOOK_FOR_")]
+    if len(look_for_cols) < 2:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for idx_a, col_a in enumerate(look_for_cols):
+        mask_a = look_for_df[col_a].astype(bool)
+        for col_b in look_for_cols[idx_a + 1 :]:
+            mask_b = look_for_df[col_b].astype(bool)
+            inter = int((mask_a & mask_b).sum())
+            union = int((mask_a | mask_b).sum())
+            jaccard = (inter / union) if union else float("nan")
+            rows.append(
+                {
+                    "A": col_a,
+                    "B": col_b,
+                    "jaccard": jaccard,
+                    "inter": inter,
+                    "union": union,
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    jaccard_df = pd.DataFrame(rows)
+    jaccard_df = jaccard_df.sort_values(by="jaccard", ascending=False, na_position="last")
+    return jaccard_df.head(20).reset_index(drop=True)
+
+
 def _load_diagnostic_table_config(symbol: str, logger: logging.Logger) -> dict[str, Any]:
     config_path = Path("configs") / "symbols" / f"{symbol}.yaml"
     if not config_path.exists():
@@ -913,6 +995,20 @@ def main() -> None:
     confidence_summary_df = _build_confidence_summary(outputs)
     context_audit_df = _build_context_features_audit(ctx_features)
     look_for_coverage_df = _build_look_for_coverage_table(gating, outputs)
+    phase_d_cfg = symbol_config.get("phase_d", {}) if isinstance(symbol_config, dict) else {}
+    look_for_cfg = phase_d_cfg.get("look_fors", {}) if isinstance(phase_d_cfg, dict) else {}
+    coverage_by_split_df = _build_coverage_by_split(gating, outputs, look_for_cfg)
+    look_for_jaccard_df = _build_look_for_jaccard(gating)
+    look_for_values = pd.unique(gating.to_numpy().ravel()) if len(gating.columns) else []
+    look_for_values_set = {int(val) for val in look_for_values if pd.notna(val)}
+    is_binary = look_for_values_set.issubset({0, 1})
+    logger.info(
+        "PHASE_D_LOOK_FOR_SANITY total_look_fors=%s total_rows=%s is_binary=%s values=%s",
+        len(gating.columns),
+        len(gating),
+        is_binary,
+        sorted(look_for_values_set),
+    )
 
     _emit_table("PHASE_D_COMPOSITION_STATE", composition_state_df)
     if not composition_quality_df.empty:
@@ -922,6 +1018,10 @@ def main() -> None:
     _emit_table("PHASE_D_CONTEXT_FEATURES_AUDIT", context_audit_df)
     if not look_for_coverage_df.empty:
         _emit_table("PHASE_D_LOOK_FOR_COVERAGE", look_for_coverage_df)
+    if not coverage_by_split_df.empty:
+        _emit_table("PHASE_D_COVERAGE_BY_SPLIT", coverage_by_split_df)
+    if not look_for_jaccard_df.empty:
+        _emit_table("PHASE_D_LOOK_FOR_JACCARD_TOP", look_for_jaccard_df)
 
     if is_verbose or is_debug:
         summary_lines = [
