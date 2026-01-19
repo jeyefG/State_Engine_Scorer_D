@@ -34,7 +34,6 @@ from state_engine.events import (
     EventFamily,
     detect_events,
     label_events,
-    required_allow_by_family,
 )
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
@@ -276,6 +275,15 @@ def _active_allow_filters(symbol_cfg: dict | None) -> set[str]:
         allow_name
         for allow_name, rule_cfg in allow_cfg.items()
         if isinstance(rule_cfg, dict) and rule_cfg.get("enabled", False)
+    }
+
+
+def _required_allow_by_family() -> dict[str, str]:
+    return {
+        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
+        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
+        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
+        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
     }
 
 

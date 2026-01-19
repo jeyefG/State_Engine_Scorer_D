@@ -29,6 +29,7 @@ from state_engine.scoring import EventScorerBundle, FeatureBuilder
 from state_engine.sweep import run_param_sweep
 from state_engine.config_loader import load_config
 from state_engine.context_features import build_context_features
+from state_engine.pipeline_phase_d import validate_allow_context_requirements
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +113,11 @@ def build_h1_context(
         timeframe="H1",
     )
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
+    validate_allow_context_requirements(
+        symbol_cfg,
+        set(features_for_gating.columns) | set(outputs.columns),
+        logger=logger,
+    )
     allows = gating.apply(outputs, features=features_for_gating, config_meta=symbol_cfg, logger=logger)
     ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
     ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], ctx_features, allows], axis=1)

@@ -37,6 +37,68 @@ def _active_allow_filters(symbol_cfg: dict | None) -> list[str]:
     )
 
 
+def validate_allow_context_requirements(
+    symbol_cfg: dict | None,
+    available_columns: set[str],
+    *,
+    logger: logging.Logger,
+) -> None:
+    if not isinstance(symbol_cfg, dict):
+        return
+    allow_cfg = symbol_cfg.get("allow_context_filters")
+    if not isinstance(allow_cfg, dict):
+        return
+
+    def _has_any(candidates: list[str]) -> bool:
+        return any(col in available_columns for col in candidates)
+
+    missing_by_rule: dict[str, list[str]] = {}
+    for allow_rule, rule_cfg in allow_cfg.items():
+        if not isinstance(rule_cfg, dict) or not rule_cfg.get("enabled", False):
+            continue
+        required: list[str] = []
+        if rule_cfg.get("sessions_in") is not None and not _has_any(
+            ["ctx_session_bucket", "session", "session_bucket"]
+        ):
+            required.append("session")
+        if (
+            rule_cfg.get("state_age_min") is not None
+            or rule_cfg.get("state_age_max") is not None
+        ) and not _has_any(["ctx_state_age", "state_age"]):
+            required.append("state_age")
+        if (
+            rule_cfg.get("dist_vwap_atr_min") is not None
+            or rule_cfg.get("dist_vwap_atr_max") is not None
+        ) and not _has_any(
+            ["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"]
+        ):
+            required.append("dist_vwap_atr")
+        if (
+            rule_cfg.get("breakmag_min") is not None
+            or rule_cfg.get("breakmag_max") is not None
+        ) and "BreakMag" not in available_columns:
+            required.append("BreakMag")
+        if (
+            rule_cfg.get("reentry_min") is not None
+            or rule_cfg.get("reentry_max") is not None
+        ) and "ReentryCount" not in available_columns:
+            required.append("ReentryCount")
+
+        if required:
+            missing_by_rule[allow_rule] = sorted(set(required))
+
+    if missing_by_rule:
+        missing_details = "; ".join(
+            f"{allow_rule} missing={cols}"
+            for allow_rule, cols in sorted(missing_by_rule.items())
+        )
+        raise ValueError(
+            "ALLOW context filters enabled but missing columns. "
+            f"{missing_details}. Available={sorted(available_columns)}"
+        )
+    logger.info("Phase D allow requirements OK | allows=%s", sorted(allow_cfg.keys()))
+
+
 def _validate_allow_columns(
     ctx_df: pd.DataFrame,
     active_allows: list[str],
@@ -123,6 +185,12 @@ def build_context_bundle(
         timeframe=context_tf,
     )
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
+    available_columns = set(features_for_gating.columns) | set(outputs.columns)
+    validate_allow_context_requirements(
+        symbol_cfg,
+        available_columns,
+        logger=logger,
+    )
     allows = gating_policy.apply(
         outputs,
         features=features_for_gating,
@@ -158,4 +226,8 @@ def build_context_bundle(
     )
 
 
-__all__ = ["ContextBundle", "build_context_bundle"]
+__all__ = [
+    "ContextBundle",
+    "build_context_bundle",
+    "validate_allow_context_requirements",
+]

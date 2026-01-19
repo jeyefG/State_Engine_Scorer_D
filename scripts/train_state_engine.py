@@ -31,6 +31,7 @@ from state_engine.gating import (
     GatingPolicy,
     build_transition_gating_thresholds,
 )
+from state_engine.pipeline_phase_d import validate_allow_context_requirements
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel, StateEngineModelConfig
 from state_engine.mt5_connector import MT5Connector
@@ -1272,6 +1273,11 @@ def main() -> None:
     logger.info("context_features_file=%s", getattr(context_mod, "__file__", None))
     gating_policy = GatingPolicy(gating_thresholds)
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
+    validate_allow_context_requirements(
+        gating_config_meta,
+        set(features_for_gating.columns) | set(outputs.columns),
+        logger=logger,
+    )
     gating = gating_policy.apply(
         outputs,
         features_for_gating,
@@ -1280,28 +1286,6 @@ def main() -> None:
         config_meta=gating_config_meta,
     )
     allow_cols = list(gating.columns)
-    allow_context_frame = gating.copy()
-    context_cols = {}
-    if "ctx_session_bucket" in ctx_features.columns:
-        context_cols["session_bucket"] = ctx_features["ctx_session_bucket"]
-    if "ctx_state_age" in ctx_features.columns:
-        context_cols["state_age"] = ctx_features["ctx_state_age"]
-    if "ctx_dist_vwap_atr" in ctx_features.columns:
-        context_cols["dist_vwap_atr"] = ctx_features["ctx_dist_vwap_atr"]
-    if context_cols:
-        allow_context_frame = allow_context_frame.join(
-            pd.DataFrame(context_cols, index=allow_context_frame.index)
-        )
-    feature_cols = [col for col in ["BreakMag", "ReentryCount"] if col in full_features.columns]
-    if feature_cols:
-        allow_context_frame = allow_context_frame.join(
-            full_features[feature_cols].reindex(allow_context_frame.index)
-        )
-    # Fase D: context filters are semantic filters, not signals.
-    if gating_config_meta.get("allow_context_filters"):
-        gating = gating[allow_cols]
-    else:
-        gating = apply_allow_context_filters(allow_context_frame, symbol_config, logger)[allow_cols]
     allow_any = gating.any(axis=1)
 
     # EV estructural (diagnóstico): ret_struct basado en rango direccional futuro
