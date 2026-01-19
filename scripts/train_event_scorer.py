@@ -48,6 +48,7 @@ from state_engine.research import (
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.session import SESSION_BUCKETS, get_session_bucket
 from state_engine.config_loader import deep_merge, load_config
+from state_engine.context_features import build_context_features
 from state_engine.vwap import compute_vwap_mt5_daily, mt5_day_id
 
 
@@ -266,13 +267,37 @@ def build_context(
     feature_engineer: FeatureEngineer,
     gating: GatingPolicy,
     symbol_cfg: dict | None,
+    symbol: str,
+    context_tf: str,
+    mode: str,
+    phase_e: bool,
     logger: logging.Logger,
 ) -> pd.DataFrame:
+    def _required_columns_for_filter(rule_cfg: dict) -> set[str]:
+        required: set[str] = set()
+        if rule_cfg.get("sessions_in") is not None:
+            required.add("session")
+        if rule_cfg.get("state_age_min") is not None or rule_cfg.get("state_age_max") is not None:
+            required.add("state_age")
+        if rule_cfg.get("dist_vwap_atr_min") is not None or rule_cfg.get("dist_vwap_atr_max") is not None:
+            required.add("dist_vwap_atr")
+        if rule_cfg.get("breakmag_min") is not None or rule_cfg.get("breakmag_max") is not None:
+            required.add("BreakMag")
+        if rule_cfg.get("reentry_min") is not None or rule_cfg.get("reentry_max") is not None:
+            required.add("ReentryCount")
+        return required
+
     full_features = feature_engineer.compute_features(ohlcv_ctx)
     features = feature_engineer.training_features(full_features)
     outputs = state_model.predict_outputs(features)
     allows = gating.apply(outputs, features=full_features)
     allow_context_frame = allows.copy()
+    ctx_features = build_context_features(
+        ohlcv_ctx,
+        outputs,
+        symbol=symbol,
+        timeframe=context_tf,
+    )
     feature_cols = [
         col
         for col in [
@@ -293,26 +318,81 @@ def build_context(
         allow_context_frame = allow_context_frame.join(
             full_features[feature_cols].reindex(allow_context_frame.index)
         )
+    if not ctx_features.empty:
+        allow_context_frame = allow_context_frame.join(ctx_features.reindex(allow_context_frame.index))
     if "session" not in allow_context_frame.columns:
-        for source in ("session_bucket", "pf_session_bucket"):
+        for source in ("ctx_session_bucket", "session_bucket", "pf_session_bucket"):
             if source in allow_context_frame.columns:
                 allow_context_frame["session"] = allow_context_frame[source]
                 break
     if "dist_vwap_atr" not in allow_context_frame.columns and "dist_vwap_atr_abs" in allow_context_frame.columns:
         allow_context_frame["dist_vwap_atr"] = allow_context_frame["dist_vwap_atr_abs"]
+    if "dist_vwap_atr" not in allow_context_frame.columns:
+        for source in ("ctx_dist_vwap_atr", "ctx_dist_vwap_atr_abs"):
+            if source in allow_context_frame.columns:
+                allow_context_frame["dist_vwap_atr"] = allow_context_frame[source]
+                break
     if "state_age" not in allow_context_frame.columns and "ctx_state_age" in allow_context_frame.columns:
         allow_context_frame["state_age"] = allow_context_frame["ctx_state_age"]
     allow_cols = list(allows.columns)
     non_allow_cols = [col for col in allow_context_frame.columns if col not in allow_cols]
     logger.info("ALLOW ctx columns available: %s", non_allow_cols)
+    logger.info(
+        "ALLOW ctx availability | has_session=%s has_state_age=%s has_dist_vwap_atr=%s",
+        "session" in allow_context_frame.columns,
+        "state_age" in allow_context_frame.columns,
+        "dist_vwap_atr" in allow_context_frame.columns,
+    )
+    allow_cfg = symbol_cfg.get("allow_context_filters") if isinstance(symbol_cfg, dict) else None
+    filtered_symbol_cfg = symbol_cfg
+    missing_by_rule: dict[str, list[str]] = {}
+    if isinstance(allow_cfg, dict):
+        for allow_rule, rule_cfg in allow_cfg.items():
+            if allow_rule == "ALLOW_transition_failure":
+                continue
+            if not isinstance(rule_cfg, dict) or not rule_cfg.get("enabled", False):
+                continue
+            required = _required_columns_for_filter(rule_cfg)
+            missing = sorted(required - set(allow_context_frame.columns))
+            if missing:
+                missing_by_rule[allow_rule] = missing
+    if missing_by_rule:
+        if phase_e or mode == "research":
+            raise ValueError(
+                f"ALLOW context filters enabled but missing columns: {missing_by_rule}"
+            )
+        logger.warning(
+            "ALLOW context filters missing columns (auto-disable in mode=%s): %s",
+            mode,
+            missing_by_rule,
+        )
+        if isinstance(symbol_cfg, dict) and isinstance(allow_cfg, dict):
+            filtered_symbol_cfg = dict(symbol_cfg)
+            allow_ctx = dict(allow_cfg)
+            for allow_rule in missing_by_rule:
+                rule_cfg = allow_ctx.get(allow_rule)
+                if isinstance(rule_cfg, dict):
+                    allow_ctx[allow_rule] = {**rule_cfg, "enabled": False}
+            filtered_symbol_cfg["allow_context_filters"] = allow_ctx
     pre_filter_sums = (
         allow_context_frame[allow_cols].fillna(0).sum().astype(int).to_dict() if allow_cols else {}
     )
-    allows = apply_allow_context_filters(allow_context_frame, symbol_cfg, logger)[allow_cols]
+    allows = apply_allow_context_filters(allow_context_frame, filtered_symbol_cfg, logger)[allow_cols]
     post_filter_sums = allows.fillna(0).sum().astype(int).to_dict() if allow_cols else {}
     logger.info("ALLOW sums pre_filter=%s post_filter=%s", pre_filter_sums, post_filter_sums)
     if allow_cols:
         allows = allows.fillna(0).astype(int)
+        allow_active_pct = float((allows.sum(axis=1) > 0).mean() * 100.0) if len(allows) else 0.0
+        allow_id = _build_allow_id(allows, allow_cols)
+        top_allow_id = allow_id.value_counts().head(3).to_dict()
+    else:
+        allow_active_pct = 0.0
+        top_allow_id = {}
+    logger.info(
+        "ALLOW post_filter stats | allow_active_pct=%.2f top_allow_id=%s",
+        allow_active_pct,
+        top_allow_id,
+    )
     ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
     ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], allows], axis=1)
     ctx = ctx.shift(1)
@@ -3818,7 +3898,18 @@ def main() -> None:
         logger=logger,
     )
     gating = GatingPolicy(gating_thresholds)
-    ctx_h1 = build_context(ohlcv_ctx, state_model, feature_engineer, gating, config_payload, logger)
+    ctx_h1 = build_context(
+        ohlcv_ctx,
+        state_model,
+        feature_engineer,
+        gating,
+        config_payload,
+        args.symbol,
+        context_tf,
+        effective_mode,
+        args.phase_e,
+        logger,
+    )
 
     df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score, context_tf=context_tf)
     if "atr_14" not in df_score_ctx.columns:
