@@ -61,7 +61,7 @@ class FeatureBuilder:
         relevant_cols = [
             col
             for col in df_m5_ctx.columns
-            if col.startswith("state_hat_") or col.startswith("margin_") or col.startswith("ALLOW_")
+            if col.startswith("state_hat_") or col.startswith("margin_") or col.startswith("LOOK_FOR_")
         ]
         expected = [
             state_col,
@@ -206,7 +206,7 @@ class FeatureBuilder:
             col = f"state_{state_name}"
             if col not in state_one_hot.columns:
                 state_one_hot[col] = 0.0
-        allow_cols = [col for col in df.columns if col.startswith("ALLOW_")]
+        allow_cols = [col for col in df.columns if col.startswith("LOOK_FOR_")]
         allow_features = df[allow_cols].astype(float) if allow_cols else pd.DataFrame(index=df.index)
 
         session_one_hot = pd.get_dummies(df["pf_session_bucket"], prefix="pf_session_bucket")

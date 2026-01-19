@@ -26,11 +26,8 @@ import pandas as pd
 from state_engine.features import FeatureConfig
 from state_engine.context_features import build_context_features
 from state_engine.config_loader import load_config
-from state_engine.gating import (
-    GatingPolicy,
-    build_transition_gating_thresholds,
-)
-from state_engine.pipeline_phase_d import validate_allow_context_requirements
+from state_engine.gating import GatingPolicy
+from state_engine.pipeline_phase_d import validate_look_for_context_requirements
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel, StateEngineModelConfig
 from state_engine.mt5_connector import MT5Connector
@@ -296,15 +293,15 @@ def _build_confidence_summary(outputs: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def _build_allow_coverage_table(
-    gating: pd.DataFrame,
+def _build_look_for_coverage_table(
+    look_for_df: pd.DataFrame,
     outputs: pd.DataFrame,
 ) -> pd.DataFrame:
-    allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
-    total_rows = len(gating)
+    look_for_cols = [col for col in look_for_df.columns if col.startswith("LOOK_FOR_")]
+    total_rows = len(look_for_df)
     rows: list[dict[str, Any]] = []
-    for allow_name in allow_cols:
-        mask = gating[allow_name].astype(bool)
+    for look_for_name in look_for_cols:
+        mask = look_for_df[look_for_name].astype(bool)
         n_allow = int(mask.sum())
         pct_total = (n_allow / total_rows * 100.0) if total_rows else 0.0
         state_counts = (
@@ -318,7 +315,7 @@ def _build_allow_coverage_table(
             quality_counts = outputs.loc[mask, "quality_label"].fillna("NA").astype(str).value_counts().to_dict()
         rows.append(
             {
-                "allow_rule": allow_name,
+                "look_for_rule": look_for_name,
                 "n": n_allow,
                 "pct_total": pct_total,
                 "state_counts": state_counts,
@@ -358,27 +355,30 @@ def _load_symbol_config(symbol: str, logger: logging.Logger) -> dict[str, Any]:
     return config
 
 
-def _allow_filter_config_rows(symbol_config: dict[str, Any], allow_rule: str) -> list[dict[str, str]]:
-    allow_cfg = symbol_config.get("allow_context_filters", {})
-    if not isinstance(allow_cfg, dict):
+def _look_for_filter_config_rows(symbol_config: dict[str, Any], look_for_rule: str) -> list[dict[str, str]]:
+    phase_d = symbol_config.get("phase_d", {})
+    if not isinstance(phase_d, dict):
         return []
-    rule_cfg = allow_cfg.get(allow_rule, {})
+    look_for_cfg = phase_d.get("look_fors", {})
+    if not isinstance(look_for_cfg, dict):
+        return []
+    rule_cfg = look_for_cfg.get(look_for_rule, {})
     if not isinstance(rule_cfg, dict):
         return []
-    return [{"key": f"{allow_rule}.{key}", "source": "symbol"} for key in sorted(rule_cfg.keys())]
+    return [{"key": f"{look_for_rule}.{key}", "source": "symbol"} for key in sorted(rule_cfg.keys())]
 
 
-def _allow_context_filter_counts(
-    allow_context_frame: pd.DataFrame,
-    allow_rule: str,
-    rule_cfg: dict[str, Any],
+def _look_for_context_filter_counts(
+    look_for_context_frame: pd.DataFrame,
+    look_for_rule: str,
+    filters_cfg: dict[str, Any],
     logger: logging.Logger,
 ) -> pd.DataFrame:
-    if allow_rule not in allow_context_frame.columns:
-        logger.warning("allow_context_filters.%s missing in gating_df; skipping counts.", allow_rule)
+    if look_for_rule not in look_for_context_frame.columns:
+        logger.warning("phase_d.look_fors.%s missing in look_for_df; skipping counts.", look_for_rule)
         return pd.DataFrame()
 
-    base_allow = allow_context_frame[allow_rule].astype(bool)
+    base_allow = look_for_context_frame[look_for_rule].astype(bool)
     total_base = int(base_allow.sum())
     if total_base == 0:
         return pd.DataFrame(
@@ -396,7 +396,7 @@ def _allow_context_filter_counts(
         )
 
     def _mask_from_col(col_name: str, mask_fn, label: str) -> dict[str, Any]:
-        if col_name not in allow_context_frame.columns:
+        if col_name not in look_for_context_frame.columns:
             return {
                 "filter": label,
                 "total_base": total_base,
@@ -406,7 +406,7 @@ def _allow_context_filter_counts(
                 "fail_pct": 100.0,
                 "notes": f"missing {col_name}",
             }
-        series = allow_context_frame[col_name]
+        series = look_for_context_frame[col_name]
         mask = mask_fn(series)
         pass_count = int((base_allow & mask).sum())
         fail_count = total_base - pass_count
@@ -423,18 +423,18 @@ def _allow_context_filter_counts(
         }
 
     rows: list[dict[str, Any]] = []
-    sessions_in = rule_cfg.get("sessions_in")
+    sessions_in = filters_cfg.get("sessions_in")
     if sessions_in is not None:
         allowed = {str(val) for val in sessions_in}
         rows.append(
             _mask_from_col(
-                "session_bucket",
+                "ctx_session_bucket",
                 lambda s: s.astype(str).isin(allowed),
                 f"sessions_in={sorted(allowed)}",
             )
         )
-    state_age_min = rule_cfg.get("state_age_min")
-    state_age_max = rule_cfg.get("state_age_max")
+    state_age_min = filters_cfg.get("state_age_min")
+    state_age_max = filters_cfg.get("state_age_max")
     if state_age_min is not None or state_age_max is not None:
         def _state_age_mask(series: pd.Series) -> pd.Series:
             numeric = pd.to_numeric(series, errors="coerce")
@@ -446,10 +446,10 @@ def _allow_context_filter_counts(
             return mask
 
         label = f"state_age[{state_age_min},{state_age_max}]"
-        rows.append(_mask_from_col("state_age", _state_age_mask, label))
+        rows.append(_mask_from_col("ctx_state_age", _state_age_mask, label))
 
-    dist_vwap_atr_min = rule_cfg.get("dist_vwap_atr_min")
-    dist_vwap_atr_max = rule_cfg.get("dist_vwap_atr_max")
+    dist_vwap_atr_min = filters_cfg.get("dist_vwap_atr_min")
+    dist_vwap_atr_max = filters_cfg.get("dist_vwap_atr_max")
     if dist_vwap_atr_min is not None or dist_vwap_atr_max is not None:
         def _dist_mask(series: pd.Series) -> pd.Series:
             numeric = pd.to_numeric(series, errors="coerce")
@@ -461,7 +461,52 @@ def _allow_context_filter_counts(
             return mask
 
         label = f"dist_vwap_atr[{dist_vwap_atr_min},{dist_vwap_atr_max}]"
-        rows.append(_mask_from_col("dist_vwap_atr", _dist_mask, label))
+        rows.append(_mask_from_col("ctx_dist_vwap_atr", _dist_mask, label))
+
+    breakmag_min = filters_cfg.get("breakmag_min")
+    breakmag_max = filters_cfg.get("breakmag_max")
+    if breakmag_min is not None or breakmag_max is not None:
+        def _breakmag_mask(series: pd.Series) -> pd.Series:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = pd.Series(True, index=series.index)
+            if breakmag_min is not None:
+                mask &= numeric >= float(breakmag_min)
+            if breakmag_max is not None:
+                mask &= numeric <= float(breakmag_max)
+            return mask
+
+        label = f"breakmag[{breakmag_min},{breakmag_max}]"
+        rows.append(_mask_from_col("BreakMag", _breakmag_mask, label))
+
+    reentry_min = filters_cfg.get("reentry_min")
+    reentry_max = filters_cfg.get("reentry_max")
+    if reentry_min is not None or reentry_max is not None:
+        def _reentry_mask(series: pd.Series) -> pd.Series:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = pd.Series(True, index=series.index)
+            if reentry_min is not None:
+                mask &= numeric >= float(reentry_min)
+            if reentry_max is not None:
+                mask &= numeric <= float(reentry_max)
+            return mask
+
+        label = f"reentry[{reentry_min},{reentry_max}]"
+        rows.append(_mask_from_col("ReentryCount", _reentry_mask, label))
+
+    margin_min = filters_cfg.get("margin_min")
+    margin_max = filters_cfg.get("margin_max")
+    if margin_min is not None or margin_max is not None:
+        def _margin_mask(series: pd.Series) -> pd.Series:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = pd.Series(True, index=series.index)
+            if margin_min is not None:
+                mask &= numeric >= float(margin_min)
+            if margin_max is not None:
+                mask &= numeric <= float(margin_max)
+            return mask
+
+        label = f"margin[{margin_min},{margin_max}]"
+        rows.append(_mask_from_col("margin", _margin_mask, label))
 
     return pd.DataFrame(rows)
 
@@ -674,37 +719,11 @@ def main() -> None:
     ctx_cols = [col for col in ctx_features.columns if col.startswith("ctx_")]
     if ctx_features.empty or not ctx_cols:
         logger.warning(
-            "ctx_features empty or missing ctx_* columns; context gating filters will be inactive."
+            "ctx_features empty or missing ctx_* columns; look_for filters will be inactive."
         )
 
     symbol_config = _load_symbol_config(args.symbol, logger)
-    gating_thresholds, _ = build_transition_gating_thresholds(
-        args.symbol,
-        symbol_config,
-        logger=logger,
-    )
-    gating_config_meta: dict[str, Any] = {}
-    if isinstance(symbol_config, dict):
-        allow_cfg = symbol_config.get("allow_context_filters")
-        if isinstance(allow_cfg, dict) and allow_cfg:
-            config_path = Path("configs") / "symbols" / f"{args.symbol}.yaml"
-            config_path_str = str(config_path) if config_path.exists() else "unknown"
-            allow_meta: dict[str, dict[str, Any]] = {}
-            for allow_name, rule_cfg in allow_cfg.items():
-                if not isinstance(rule_cfg, dict):
-                    continue
-                rule_meta = dict(rule_cfg)
-                rule_meta.update(
-                    {
-                        "source": "symbol",
-                        "selected_path": f"allow_context_filters.{allow_name}",
-                        "keys_present": sorted(rule_cfg.keys()),
-                        "config_path": config_path_str,
-                    }
-                )
-                allow_meta[allow_name] = rule_meta
-            if allow_meta:
-                gating_config_meta["allow_context_filters"] = allow_meta
+    gating_config_meta = symbol_config
 
     # Extra reporting helpers
     state_hat_dist = class_distribution(outputs["state_hat"].to_numpy(), label_order)
@@ -712,17 +731,17 @@ def main() -> None:
     breakmag_p = percentiles(full_features["BreakMag"], q_list) if "BreakMag" in full_features.columns else {str(q): None for q in q_list}
     reentry_p = percentiles(full_features["ReentryCount"], q_list) if "ReentryCount" in full_features.columns else {str(q): None for q in q_list}
 
-    stage_start = step("gating")
-    logger.info("gating_module=%s", GatingPolicy.__module__)
+    stage_start = step("phase_d")
+    logger.info("phase_d_module=%s", GatingPolicy.__module__)
     gating_mod = importlib.import_module(GatingPolicy.__module__)
-    logger.info("gating_file=%s", getattr(gating_mod, "__file__", None))
+    logger.info("phase_d_file=%s", getattr(gating_mod, "__file__", None))
     logger.info("context_features_module=%s", build_context_features.__module__)
     context_mod = importlib.import_module(build_context_features.__module__)
     logger.info("context_features_file=%s", getattr(context_mod, "__file__", None))
-    gating_policy = GatingPolicy(gating_thresholds)
+    gating_policy = GatingPolicy()
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
-    validate_allow_context_requirements(
-        gating_config_meta,
+    validate_look_for_context_requirements(
+        symbol_config,
         set(features_for_gating.columns) | set(outputs.columns),
         logger=logger,
     )
@@ -733,9 +752,9 @@ def main() -> None:
         symbol=args.symbol,
         config_meta=gating_config_meta,
     )
-    allow_cols = list(gating.columns)
-    allow_any = gating.any(axis=1)
-    allow_context_frame = pd.DataFrame(index=outputs.index).join(gating[allow_cols], how="left")
+    look_for_cols = list(gating.columns)
+    look_for_any = gating.any(axis=1) if look_for_cols else pd.Series(False, index=outputs.index)
+    look_for_context_frame = pd.DataFrame(index=outputs.index).join(gating[look_for_cols], how="left")
 
     def _attach_ctx_column(name: str, candidates: list[str]) -> None:
         series = None
@@ -750,11 +769,11 @@ def main() -> None:
                 series = full_features[candidate]
                 break
         if series is not None:
-            allow_context_frame[name] = series.reindex(outputs.index)
+            look_for_context_frame[name] = series.reindex(outputs.index)
 
-    _attach_ctx_column("session_bucket", ["ctx_session_bucket", "session_bucket", "session"])
-    _attach_ctx_column("state_age", ["ctx_state_age", "state_age"])
-    _attach_ctx_column("dist_vwap_atr", ["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"])
+    _attach_ctx_column("ctx_session_bucket", ["ctx_session_bucket"])
+    _attach_ctx_column("ctx_state_age", ["ctx_state_age"])
+    _attach_ctx_column("ctx_dist_vwap_atr", ["ctx_dist_vwap_atr"])
 
     phase_e_enabled = bool(args.enable_phase_e_metrics)
     if phase_e_enabled:
@@ -765,26 +784,12 @@ def main() -> None:
     # --- "Última vela" para reporting
     last_idx = outputs.index.max()
     
-    # ALLOW final (cualquier regla true)
-    last_allow = bool(allow_any.loc[last_idx]) if last_idx in allow_any.index else False
-    
-    gating_allow_rate = float(allow_any.mean()) if len(gating) else 0.0
-    gating_block_rate = 1.0 - gating_allow_rate
+    # LOOK_FOR final (cualquier regla true)
+    last_allow = bool(look_for_any.loc[last_idx]) if last_idx in look_for_any.index else False
+
+    look_for_coverage_rate = float(look_for_any.mean()) if len(gating) else 0.0
     elapsed_gating = step_done(stage_start)
-    logger.info("gating_allow_rate=%.2f%% elapsed=%.2fs", gating_allow_rate * 100, elapsed_gating)
-    gating_thresholds = asdict(gating_policy.thresholds)
-    logger.info("gating_thresholds=%s", gating_thresholds)
-    required_threshold_fields = {
-        "allowed_sessions",
-        "state_age_min",
-        "state_age_max",
-        "dist_vwap_atr_min",
-        "dist_vwap_atr_max",
-    }
-    if not required_threshold_fields.issubset(gating_thresholds.keys()):
-        logger.error(
-            "Loaded gating.py does not include context thresholds fields. Check PYTHONPATH / repo root."
-        )
+    logger.info("look_for_coverage_rate=%.2f%% elapsed=%.2fs", look_for_coverage_rate * 100, elapsed_gating)
 
     if is_debug:
         table_class = rich_modules["Table"] if use_rich and console else None
@@ -800,7 +805,7 @@ def main() -> None:
             )
 
         if ctx_cols:
-            allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
+            allow_cols = [col for col in gating.columns if col.startswith("LOOK_FOR_")]
             debug_frame = (
                 outputs[["state_hat", "margin"]]
                 .join(ctx_features[ctx_cols], how="left")
@@ -811,21 +816,22 @@ def main() -> None:
         else:
             logger.warning("ctx_features missing ctx_* columns; skipping ctx diagnostic table.")
 
-        allow_cfg = symbol_config.get("allow_context_filters", {}) if isinstance(symbol_config, dict) else {}
-        transition_cfg = allow_cfg.get("ALLOW_transition_failure", {}) if isinstance(allow_cfg, dict) else {}
-        allow_config_rows = _allow_filter_config_rows(symbol_config, "ALLOW_transition_failure")
-        if allow_config_rows:
-            allow_config_df = pd.DataFrame(allow_config_rows)
-            _emit_table_debug("GATING_CONFIG_EFFECTIVE", allow_config_df)
+        phase_d_cfg = symbol_config.get("phase_d", {}) if isinstance(symbol_config, dict) else {}
+        look_for_cfg = phase_d_cfg.get("look_fors", {}) if isinstance(phase_d_cfg, dict) else {}
+        transition_cfg = look_for_cfg.get("LOOK_FOR_transition_failure", {}) if isinstance(look_for_cfg, dict) else {}
+        look_for_config_rows = _look_for_filter_config_rows(symbol_config, "LOOK_FOR_transition_failure")
+        if look_for_config_rows:
+            look_for_config_df = pd.DataFrame(look_for_config_rows)
+            _emit_table_debug("LOOK_FOR_CONFIG_EFFECTIVE", look_for_config_df)
         if isinstance(transition_cfg, dict) and transition_cfg:
-            allow_filter_counts = _allow_context_filter_counts(
-                allow_context_frame,
-                "ALLOW_transition_failure",
-                transition_cfg,
+            look_for_filter_counts = _look_for_context_filter_counts(
+                look_for_context_frame,
+                "LOOK_FOR_transition_failure",
+                transition_cfg.get("filters", {}),
                 logger,
             )
-            if not allow_filter_counts.empty:
-                _emit_table_debug("ALLOW_transition_context_counts", allow_filter_counts)
+            if not look_for_filter_counts.empty:
+                _emit_table_debug("LOOK_FOR_transition_context_counts", look_for_filter_counts)
 
     stage_start = step("save_model")
     metadata = {
@@ -867,10 +873,19 @@ def main() -> None:
     importances = model.feature_importances().head(15)
 
     # Guardrail detail counts (kept as in your existing report)
-    gating_thresholds = gating_policy.thresholds
-    transition_rule = outputs["margin"] >= gating_thresholds.transition_margin_min
-    transition_break = full_features["BreakMag"] >= gating_thresholds.transition_breakmag_min
-    transition_reentry = full_features["ReentryCount"] >= gating_thresholds.transition_reentry_min
+    transition_filters = {}
+    if isinstance(symbol_config, dict):
+        phase_d_cfg = symbol_config.get("phase_d", {})
+        look_for_cfg = phase_d_cfg.get("look_fors", {}) if isinstance(phase_d_cfg, dict) else {}
+        transition_cfg = look_for_cfg.get("LOOK_FOR_transition_failure", {}) if isinstance(look_for_cfg, dict) else {}
+        if isinstance(transition_cfg, dict):
+            transition_filters = transition_cfg.get("filters", {}) if isinstance(transition_cfg.get("filters"), dict) else {}
+    margin_min = transition_filters.get("margin_min")
+    breakmag_min = transition_filters.get("breakmag_min")
+    reentry_min = transition_filters.get("reentry_min")
+    transition_rule = outputs["margin"] >= float(margin_min) if margin_min is not None else pd.Series(False, index=outputs.index)
+    transition_break = full_features["BreakMag"] >= float(breakmag_min) if breakmag_min is not None else pd.Series(False, index=outputs.index)
+    transition_reentry = full_features["ReentryCount"] >= float(reentry_min) if reentry_min is not None else pd.Series(False, index=outputs.index)
 
     table_class = rich_modules["Table"] if use_rich and console else None
 
@@ -897,7 +912,7 @@ def main() -> None:
 
     confidence_summary_df = _build_confidence_summary(outputs)
     context_audit_df = _build_context_features_audit(ctx_features)
-    allow_coverage_df = _build_allow_coverage_table(gating, outputs)
+    look_for_coverage_df = _build_look_for_coverage_table(gating, outputs)
 
     _emit_table("PHASE_D_COMPOSITION_STATE", composition_state_df)
     if not composition_quality_df.empty:
@@ -905,8 +920,8 @@ def main() -> None:
     if not confidence_summary_df.empty:
         _emit_table("PHASE_D_CONFIDENCE_SUMMARY", confidence_summary_df)
     _emit_table("PHASE_D_CONTEXT_FEATURES_AUDIT", context_audit_df)
-    if not allow_coverage_df.empty:
-        _emit_table("PHASE_D_ALLOW_COVERAGE", allow_coverage_df)
+    if not look_for_coverage_df.empty:
+        _emit_table("PHASE_D_LOOK_FOR_COVERAGE", look_for_coverage_df)
 
     if is_verbose or is_debug:
         summary_lines = [
@@ -916,7 +931,7 @@ def main() -> None:
             f"Window: {args.window_hours}h (~{derived_bars} bars)",
             f"Samples: {len(features)} (train={len(features_train)}, test={len(features_test)})",
             f"Baseline: {baseline_label} ({baseline_pct:.2f}%)",
-            f"Gating allow rate: {gating_allow_rate*100:.2f}%",
+            f"Look-for coverage rate: {look_for_coverage_rate*100:.2f}%",
         ]
 
         if console and use_rich:
@@ -1022,17 +1037,17 @@ def main() -> None:
         importances_df = importances.reset_index()
         importances_df.columns = ["feature", "importance"]
         _emit_table("Top features (importance)", importances_df)
-        gating_summary_df = pd.DataFrame(
+        look_for_summary_df = pd.DataFrame(
             [
                 {
-                    "allow_rule": col,
+                    "look_for_rule": col,
                     "count": int(gating[col].sum()),
                     "pct": float(gating[col].mean() * 100.0) if len(gating) else 0.0,
                 }
                 for col in gating.columns
             ]
         )
-        _emit_table("Resumen gating", gating_summary_df)
+        _emit_table("Resumen look_for", look_for_summary_df)
         transition_df = pd.DataFrame(
             [
                 {"condition": "margin>=min", "count": int(transition_rule.sum())},
@@ -1072,7 +1087,7 @@ def main() -> None:
             "composition_quality": composition_quality_df.to_dict(orient="records"),
             "confidence_summary": confidence_summary_df.to_dict(orient="records"),
             "context_features_audit": context_audit_df.to_dict(orient="records"),
-            "allow_coverage_table": allow_coverage_df.to_dict(orient="records"),
+            "look_for_coverage_table": look_for_coverage_df.to_dict(orient="records"),
         },
         "guardrail_percentiles": {
             "quantiles": q_list,
@@ -1080,10 +1095,8 @@ def main() -> None:
             "ReentryCount": reentry_p,
         },
         "feature_importances": importances.to_dict(),
-        "gating": {
-            "thresholds": asdict(gating_policy.thresholds),
-            "allow_rate": gating_allow_rate,
-            "block_rate": gating_block_rate,
+        "phase_d": {
+            "look_for_coverage_rate": look_for_coverage_rate,
         },
         "model_path": str(args.model_out),
         "metadata": metadata,

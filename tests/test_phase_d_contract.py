@@ -9,42 +9,45 @@ from scripts.train_event_scorer import (
     _required_allow_by_family,
 )
 from state_engine.pipeline_phase_d import (
-    validate_allow_columns,
-    validate_allow_context_requirements,
+    validate_look_for_columns,
+    validate_look_for_context_requirements,
 )
 
 
-def test_allow_context_filters_missing_dist_vwap_atr_raises() -> None:
+def test_look_for_filters_missing_dist_vwap_atr_raises() -> None:
     cfg = {
-        "allow_context_filters": {
-            "ALLOW_balance_vwap_proximity": {
-                "enabled": True,
-                "base_state": "balance",
-                "dist_vwap_atr_min": 0.1,
-            }
-        }
+        "phase_d": {
+            "enabled": True,
+            "look_fors": {
+                "LOOK_FOR_balance_vwap_proximity": {
+                    "enabled": True,
+                    "base_state": "balance",
+                    "filters": {"dist_vwap_atr_min": 0.1},
+                }
+            },
+        },
     }
     available = {"BreakMag", "ReentryCount"}
     with pytest.raises(ValueError, match="dist_vwap_atr"):
-        validate_allow_context_requirements(cfg, available, logger=logging.getLogger("test"))
+        validate_look_for_context_requirements(cfg, available, logger=logging.getLogger("test"))
 
 
-def test_validate_allow_columns_missing_required_allow_raises() -> None:
-    ctx_df = pd.DataFrame({"ALLOW_balance_fade": [1, 0]})
-    with pytest.raises(ValueError, match="Missing ALLOW columns"):
-        validate_allow_columns(
+def test_validate_look_for_columns_missing_required_raises() -> None:
+    ctx_df = pd.DataFrame({"LOOK_FOR_balance_fade": [1, 0]})
+    with pytest.raises(ValueError, match="Missing LOOK_FOR columns"):
+        validate_look_for_columns(
             ctx_df,
-            ["ALLOW_transition_failure"],
+            ["LOOK_FOR_transition_failure"],
             logger=logging.getLogger("test"),
         )
 
 
-def test_validate_allow_columns_non_binary_or_nan_raises() -> None:
-    ctx_df = pd.DataFrame({"ALLOW_balance_fade": [1, float("nan"), 2]})
-    with pytest.raises(ValueError, match="ALLOW column ALLOW_balance_fade"):
-        validate_allow_columns(
+def test_validate_look_for_columns_non_binary_or_nan_raises() -> None:
+    ctx_df = pd.DataFrame({"LOOK_FOR_balance_fade": [1, float("nan"), 2]})
+    with pytest.raises(ValueError, match="LOOK_FOR column LOOK_FOR_balance_fade"):
+        validate_look_for_columns(
             ctx_df,
-            ["ALLOW_balance_fade"],
+            ["LOOK_FOR_balance_fade"],
             logger=logging.getLogger("test"),
         )
 
@@ -59,10 +62,10 @@ def test_phase_e_allow_identity_matches_required_allow() -> None:
                 "E_TRANSITION_FAILURE",
                 "E_TREND_CONTINUATION",
             ],
-            "ALLOW_balance_fade": [1, 0, 0, 0],
-            "ALLOW_trend_pullback": [0, 1, 0, 0],
-            "ALLOW_transition_failure": [0, 0, 1, 0],
-            "ALLOW_trend_continuation": [0, 0, 0, 1],
+            "LOOK_FOR_balance_fade": [1, 0, 0, 0],
+            "LOOK_FOR_trend_pullback": [0, 1, 0, 0],
+            "LOOK_FOR_transition_failure": [0, 0, 1, 0],
+            "LOOK_FOR_trend_continuation": [0, 0, 0, 1],
         },
         index=pd.date_range("2024-01-01", periods=4, freq="5min"),
     )

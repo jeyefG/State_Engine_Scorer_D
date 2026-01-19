@@ -51,7 +51,7 @@ class CallMeBotWhatsApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Watchdog for State Engine ALLOW_* signals with WhatsApp notifications."
+        description="Watchdog for State Engine LOOK_FOR_* signals with WhatsApp notifications."
     )
     parser.add_argument(
         "--symbols",
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-tf",
         default=None,
-        help="Timeframe del contexto State/ALLOW (default: metadata del State Engine).",
+        help="Timeframe del contexto State/LOOK_FOR (default: metadata del State Engine).",
     )
     parser.add_argument(
         "--phase-e",
@@ -263,8 +263,7 @@ def build_summary(
     server_now: pd.Timestamp,
 ) -> str:
     allow_any = gating.any(axis=1)
-    gating_allow_rate = float(allow_any.mean()) if len(gating) else 0.0
-    gating_block_rate = 1.0 - gating_allow_rate
+    look_for_coverage_rate = float(allow_any.mean()) if len(gating) else 0.0
 
     last_idx = outputs.index.max()
     last_allow = bool(allow_any.loc[last_idx]) if last_idx in allow_any.index else False
@@ -300,14 +299,14 @@ def build_summary(
         lines.append(f"Samples: {n_samples} (train={n_train}, test={n_test})")
     lines.append(f"Baseline: {baseline_label} ({baseline_pct:.2f}%)")
     lines.append(
-        f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)"
+        f"Look-for coverage rate: {look_for_coverage_rate*100:.2f}%"
     )
     lines.append(f"Last H1 bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
     lines.append(
         f"Server now (tick): {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}"
     )
     lines.append(
-        f"Last bar decision: ALLOW={last_allow} | state_hat={state_label} | margin={margin_value}"
+        f"Last bar look_for: any={last_allow} | state_hat={state_label} | margin={margin_value}"
     )
     lines.append(f"Last bar rules fired: {last_rules if last_rules else '[]'}")
     lines.append(f"Model saved: {model_path}")

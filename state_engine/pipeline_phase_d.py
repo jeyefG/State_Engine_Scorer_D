@@ -49,22 +49,27 @@ def audit_phase_d_contamination(*, logger: logging.Logger) -> None:
         logger.info("AUDIT_OK Phase D gating/context_features clean.")
 
 
-def _active_allow_filters(symbol_cfg: dict | None) -> list[str]:
+def _active_look_for_filters(symbol_cfg: dict | None) -> list[str]:
     if not isinstance(symbol_cfg, dict):
         return []
-    allow_cfg = symbol_cfg.get("allow_context_filters")
-    if not isinstance(allow_cfg, dict):
+    phase_d = symbol_cfg.get("phase_d")
+    if not isinstance(phase_d, dict):
+        return []
+    if not phase_d.get("enabled", False):
+        return []
+    look_for_cfg = phase_d.get("look_fors")
+    if not isinstance(look_for_cfg, dict):
         return []
     return sorted(
         [
-            allow_name
-            for allow_name, rule_cfg in allow_cfg.items()
+            look_for_name
+            for look_for_name, rule_cfg in look_for_cfg.items()
             if isinstance(rule_cfg, dict) and rule_cfg.get("enabled", False)
         ]
     )
 
 
-def validate_allow_context_requirements(
+def validate_look_for_context_requirements(
     symbol_cfg: dict | None,
     available_columns: set[str],
     *,
@@ -73,9 +78,16 @@ def validate_allow_context_requirements(
     audit_phase_d_contamination(logger=logger)
     if not isinstance(symbol_cfg, dict):
         return
-    allow_cfg = symbol_cfg.get("allow_context_filters")
-    if not isinstance(allow_cfg, dict):
+    phase_d = symbol_cfg.get("phase_d")
+    if not isinstance(phase_d, dict):
+        logger.info("Phase D disabled: no phase_d config.")
         return
+    if not phase_d.get("enabled", False):
+        logger.info("Phase D disabled: phase_d.enabled=false.")
+        return
+    look_for_cfg = phase_d.get("look_fors")
+    if not isinstance(look_for_cfg, dict):
+        raise ValueError("phase_d.look_fors must be a mapping when phase_d.enabled=true.")
 
     def _has_any(candidates: list[str]) -> bool:
         return any(col in available_columns for col in candidates)
@@ -83,99 +95,107 @@ def validate_allow_context_requirements(
     missing_by_rule: dict[str, list[str]] = {}
     missing_base_state: dict[str, str] = {}
     allowed_base_states = {"balance", "transition", "trend", "any"}
-    for allow_rule, rule_cfg in allow_cfg.items():
+    for look_for_rule, rule_cfg in look_for_cfg.items():
         if not isinstance(rule_cfg, dict):
             continue
         base_state = rule_cfg.get("base_state") or rule_cfg.get("anchor_state")
         if base_state is None:
-            missing_base_state[allow_rule] = "missing"
+            missing_base_state[look_for_rule] = "missing"
         else:
             base_state_norm = str(base_state).strip().lower()
             if base_state_norm not in allowed_base_states:
-                missing_base_state[allow_rule] = f"invalid:{base_state}"
+                missing_base_state[look_for_rule] = f"invalid:{base_state}"
         if not rule_cfg.get("enabled", False):
             continue
+        filters_cfg = rule_cfg.get("filters", {})
+        if filters_cfg is None:
+            filters_cfg = {}
+        if not isinstance(filters_cfg, dict):
+            raise ValueError(f"phase_d.look_fors.{look_for_rule}.filters must be a mapping.")
         required: list[str] = []
-        if rule_cfg.get("sessions_in") is not None and not _has_any(
-            ["ctx_session_bucket", "session", "session_bucket"]
+        if filters_cfg.get("sessions_in") is not None and not _has_any(
+            ["ctx_session_bucket"]
         ):
-            required.append("session")
+            required.append("ctx_session_bucket")
         if (
-            rule_cfg.get("state_age_min") is not None
-            or rule_cfg.get("state_age_max") is not None
-        ) and not _has_any(["ctx_state_age", "state_age"]):
-            required.append("state_age")
+            filters_cfg.get("state_age_min") is not None
+            or filters_cfg.get("state_age_max") is not None
+        ) and not _has_any(["ctx_state_age"]):
+            required.append("ctx_state_age")
         if (
-            rule_cfg.get("dist_vwap_atr_min") is not None
-            or rule_cfg.get("dist_vwap_atr_max") is not None
-        ) and not _has_any(
-            ["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"]
-        ):
-            required.append("dist_vwap_atr")
+            filters_cfg.get("dist_vwap_atr_min") is not None
+            or filters_cfg.get("dist_vwap_atr_max") is not None
+        ) and not _has_any(["ctx_dist_vwap_atr"]):
+            required.append("ctx_dist_vwap_atr")
         if (
-            rule_cfg.get("breakmag_min") is not None
-            or rule_cfg.get("breakmag_max") is not None
+            filters_cfg.get("breakmag_min") is not None
+            or filters_cfg.get("breakmag_max") is not None
         ) and "BreakMag" not in available_columns:
             required.append("BreakMag")
         if (
-            rule_cfg.get("reentry_min") is not None
-            or rule_cfg.get("reentry_max") is not None
+            filters_cfg.get("reentry_min") is not None
+            or filters_cfg.get("reentry_max") is not None
         ) and "ReentryCount" not in available_columns:
             required.append("ReentryCount")
+        if (
+            filters_cfg.get("margin_min") is not None
+            or filters_cfg.get("margin_max") is not None
+        ) and "margin" not in available_columns:
+            required.append("margin")
 
         if required:
-            missing_by_rule[allow_rule] = sorted(set(required))
+            missing_by_rule[look_for_rule] = sorted(set(required))
 
     if missing_by_rule:
         missing_details = "; ".join(
-            f"{allow_rule} missing={cols}"
-            for allow_rule, cols in sorted(missing_by_rule.items())
+            f"{look_for_rule} missing={cols}"
+            for look_for_rule, cols in sorted(missing_by_rule.items())
         )
         raise ValueError(
-            "ALLOW context filters enabled but missing columns. "
+            "LOOK_FOR filters enabled but missing columns. "
             f"{missing_details}. Available={sorted(available_columns)}"
         )
     if missing_base_state:
         missing_details = "; ".join(
-            f"{allow_rule} base_state={detail}"
-            for allow_rule, detail in sorted(missing_base_state.items())
+            f"{look_for_rule} base_state={detail}"
+            for look_for_rule, detail in sorted(missing_base_state.items())
         )
         raise ValueError(
-            "ALLOW context filters missing required base_state. "
+            "LOOK_FOR filters missing required base_state. "
             f"{missing_details}. Allowed={sorted(allowed_base_states)}"
         )
-    logger.info("Phase D allow requirements OK | allows=%s", sorted(allow_cfg.keys()))
+    logger.info("Phase D look_for requirements OK | look_fors=%s", sorted(look_for_cfg.keys()))
 
 
-def validate_allow_columns(
+def validate_look_for_columns(
     ctx_df: pd.DataFrame,
-    active_allows: list[str],
+    active_look_fors: list[str],
     *,
     logger: logging.Logger,
 ) -> dict[str, float]:
-    if not active_allows:
-        logger.info("Phase D context contract OK | allows=[] allow_rates={}")
+    if not active_look_fors:
+        logger.info("Phase D context contract OK | look_fors=[] look_for_rates={}")
         return {}
-    missing = sorted(set(active_allows) - set(ctx_df.columns))
+    missing = sorted(set(active_look_fors) - set(ctx_df.columns))
     if missing:
-        raise ValueError(f"Missing ALLOW columns in Phase D context: {missing}")
-    allow_rates: dict[str, float] = {}
-    for allow_name in active_allows:
-        series = pd.to_numeric(ctx_df[allow_name], errors="coerce")
+        raise ValueError(f"Missing LOOK_FOR columns in Phase D context: {missing}")
+    look_for_rates: dict[str, float] = {}
+    for look_for_name in active_look_fors:
+        series = pd.to_numeric(ctx_df[look_for_name], errors="coerce")
         if series.isna().any():
-            raise ValueError(f"ALLOW column {allow_name} has NaN values in Phase D context.")
+            raise ValueError(f"LOOK_FOR column {look_for_name} has NaN values in Phase D context.")
         unique_vals = set(series.unique())
         if not unique_vals.issubset({0, 1}):
             raise ValueError(
-                f"ALLOW column {allow_name} must be binary (0/1). Observed={sorted(unique_vals)}"
+                f"LOOK_FOR column {look_for_name} must be binary (0/1). Observed={sorted(unique_vals)}"
             )
-        allow_rates[allow_name] = float(series.mean() * 100.0) if len(series) else 0.0
+        look_for_rates[look_for_name] = float(series.mean() * 100.0) if len(series) else 0.0
     logger.info(
-        "Phase D context contract OK | allows=%s allow_rates=%s",
-        active_allows,
-        {k: round(v, 2) for k, v in allow_rates.items()},
+        "Phase D context contract OK | look_fors=%s look_for_rates=%s",
+        active_look_fors,
+        {k: round(v, 2) for k, v in look_for_rates.items()},
     )
-    return allow_rates
+    return look_for_rates
 
 
 def _merge_context_score(
@@ -199,34 +219,34 @@ def _merge_context_score(
     state_col = f"state_hat_{context_tf_norm}"
     margin_col = f"margin_{context_tf_norm}"
     merged = merged.rename(columns={"state_hat": state_col, "margin": margin_col})
-    allow_cols = [col for col in merged.columns if col.startswith("ALLOW_")]
-    if allow_cols:
-        merged[allow_cols] = merged[allow_cols].fillna(0).astype(int)
+    look_for_cols = [col for col in merged.columns if col.startswith("LOOK_FOR_")]
+    if look_for_cols:
+        merged[look_for_cols] = merged[look_for_cols].fillna(0).astype(int)
     missing_ctx = merged[[state_col, margin_col]].isna().mean()
     if (missing_ctx > 0.25).any():
         logger.warning("High missing context after merge: %s", missing_ctx.to_dict())
     return merged
 
 
-def _log_allow_session_coverage(
+def _log_look_for_session_coverage(
     ctx_df: pd.DataFrame,
-    allow_names: Iterable[str],
+    look_for_names: Iterable[str],
     *,
     logger: logging.Logger,
 ) -> None:
-    allow_names = [name for name in allow_names if name in ctx_df.columns]
-    if not allow_names:
+    look_for_names = [name for name in look_for_names if name in ctx_df.columns]
+    if not look_for_names:
         return
     if "ctx_session_bucket" not in ctx_df.columns:
         return
     coverage = (
-        ctx_df.groupby("ctx_session_bucket")[allow_names]
+        ctx_df.groupby("ctx_session_bucket")[look_for_names]
         .mean()
         .mul(100.0)
         .round(2)
         .reset_index()
     )
-    logger.info("ALLOW session coverage:\n%s", coverage.to_string(index=False))
+    logger.info("LOOK_FOR session coverage:\n%s", coverage.to_string(index=False))
 
 
 def build_context_bundle(
@@ -255,7 +275,7 @@ def build_context_bundle(
     )
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
     available_columns = set(features_for_gating.columns) | set(outputs.columns)
-    validate_allow_context_requirements(
+    validate_look_for_context_requirements(
         symbol_cfg,
         available_columns,
         logger=logger,
@@ -270,18 +290,18 @@ def build_context_bundle(
     ctx_features = ctx_features.loc[:, ~ctx_features.columns.duplicated()]
     ctx_df = pd.concat([outputs[["state_hat", "margin"]], ctx_features, allows], axis=1)
     ctx_df = ctx_df.loc[:, ~ctx_df.columns.duplicated()].shift(1)
-    allow_cols = [col for col in ctx_df.columns if col.startswith("ALLOW_")]
-    if allow_cols:
-        ctx_df[allow_cols] = ctx_df[allow_cols].fillna(0).astype(int)
+    look_for_cols = [col for col in ctx_df.columns if col.startswith("LOOK_FOR_")]
+    if look_for_cols:
+        ctx_df[look_for_cols] = ctx_df[look_for_cols].fillna(0).astype(int)
 
-    active_allows = _active_allow_filters(symbol_cfg)
-    allow_rates = validate_allow_columns(ctx_df, active_allows, logger=logger)
+    active_look_fors = _active_look_for_filters(symbol_cfg)
+    look_for_rates = validate_look_for_columns(ctx_df, active_look_fors, logger=logger)
     logger.info(
-        "Phase D allow summary | required_allows=%s produced_allows=%s",
-        active_allows,
-        sorted(allow_cols),
+        "Phase D look_for summary | required_look_fors=%s produced_look_fors=%s",
+        active_look_fors,
+        sorted(look_for_cols),
     )
-    _log_allow_session_coverage(ctx_df, active_allows, logger=logger)
+    _log_look_for_session_coverage(ctx_df, active_look_fors, logger=logger)
     logger.info("Phase D ctx_df tail:\n%s", ctx_df.tail(3).to_string())
     if phase_e:
         logger.info("Phase D context bundle ready for Phase E consumer.")
@@ -291,8 +311,8 @@ def build_context_bundle(
         "symbol": symbol,
         "context_tf": context_tf,
         "score_tf": score_tf,
-        "active_allows": active_allows,
-        "allow_rates": allow_rates,
+        "active_look_fors": active_look_fors,
+        "look_for_rates": look_for_rates,
     }
     return ContextBundle(
         ctx_df=ctx_df,
@@ -305,7 +325,7 @@ def build_context_bundle(
 __all__ = [
     "ContextBundle",
     "build_context_bundle",
-    "validate_allow_columns",
-    "validate_allow_context_requirements",
+    "validate_look_for_columns",
+    "validate_look_for_context_requirements",
     "audit_phase_d_contamination",
 ]

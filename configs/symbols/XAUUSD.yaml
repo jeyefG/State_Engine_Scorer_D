@@ -76,13 +76,17 @@ event_scorer:
         max_score_tail_slope: 2.5
         min_calib_samples: 80
 
-allow_context_filters:
-  ALLOW_transition_failure:
-    enabled: true
-    base_state: transition
-    require_all: true
-    sessions_in: ["LONDON", "NY"]
-    state_age_max: 5
-    dist_vwap_atr_max: 1.5
-    breakmag_min: 0.25
-    reentry_min: 1.0
+phase_d:
+  enabled: true
+  look_fors:
+    LOOK_FOR_transition_failure:
+      enabled: true
+      base_state: transition
+      require_all: true
+      filters:
+        margin_min: 0.10
+        sessions_in: ["LONDON", "NY"]
+        state_age_max: 5
+        dist_vwap_atr_max: 1.5
+        breakmag_min: 0.25
+        reentry_min: 1.0

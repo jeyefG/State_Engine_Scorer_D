@@ -24,7 +24,7 @@ def test_diagnostic_report_determinism_seeded() -> None:
         {
             "state_hat_H1": rng.choice(["BALANCE", "TREND", "TRANSITION"], size=n),
             "allow_id": rng.choice(
-                ["ALLOW_balance_fade", "ALLOW_trend_pullback", "ALLOW_transition_failure"], size=n
+                ["LOOK_FOR_balance_fade", "LOOK_FOR_trend_pullback", "LOOK_FOR_transition_failure"], size=n
             ),
             "margin": rng.uniform(0.05, 0.95, size=n),
             "r": rng.normal(0.0, 0.5, size=n),
@@ -61,7 +61,7 @@ def test_causality_merge_asof_shift_unchanged() -> None:
         {
             "state_hat": np.arange(len(h1_idx)),
             "margin": np.linspace(0.1, 0.9, len(h1_idx)),
-            "ALLOW_trend_pullback": 1,
+            "LOOK_FOR_trend_pullback": 1,
         },
         index=h1_idx,
     )
@@ -102,7 +102,7 @@ def test_coverage_sanity_index_match_and_atr() -> None:
     events_diag = pd.DataFrame(
         {
             "state_hat_H1": ["BALANCE"] * len(events_idx),
-            "allow_id": ["ALLOW_balance_fade"] * len(events_idx),
+            "allow_id": ["LOOK_FOR_balance_fade"] * len(events_idx),
             "margin": np.linspace(0.1, 0.9, len(events_idx)),
             "r": np.linspace(-0.2, 0.3, len(events_idx)),
             "win": np.ones(len(events_idx)),

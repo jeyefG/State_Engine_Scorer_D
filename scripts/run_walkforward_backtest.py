@@ -21,17 +21,14 @@ import pandas as pd
 from state_engine.backtest import BacktestConfig, Signal, run_backtest
 from state_engine.events import EventFamily, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
-from state_engine.gating import (
-    GatingPolicy,
-    build_transition_gating_thresholds,
-)
+from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.scoring import EventScorer, EventScorerBundle, EventScorerConfig, FeatureBuilder
 from state_engine.walkforward import WalkForwardSplit, apply_edge_ablation, generate_walkforward_splits
 from state_engine.config_loader import load_config
 from state_engine.context_features import build_context_features
-from state_engine.pipeline_phase_d import validate_allow_context_requirements
+from state_engine.pipeline_phase_d import validate_look_for_context_requirements
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +118,7 @@ def build_h1_context(
         timeframe="H1",
     )
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
-    validate_allow_context_requirements(
+    validate_look_for_context_requirements(
         symbol_cfg,
         set(features_for_gating.columns) | set(outputs.columns),
         logger=logger,
@@ -343,12 +340,7 @@ def run_walkforward(symbol: str, args: argparse.Namespace, logger: logging.Logge
 
     feature_engineer = FeatureEngineer(FeatureConfig())
     symbol_cfg = load_symbol_config(symbol, logger)
-    gating_thresholds, _ = build_transition_gating_thresholds(
-        symbol,
-        symbol_cfg,
-        logger=logger,
-    )
-    gating = GatingPolicy(gating_thresholds)
+    gating = GatingPolicy()
     ctx_h1 = build_h1_context(
         ohlcv_h1,
         state_model,

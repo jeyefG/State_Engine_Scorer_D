@@ -36,10 +36,7 @@ from state_engine.events import (
     label_events,
 )
 from state_engine.features import FeatureConfig, FeatureEngineer
-from state_engine.gating import (
-    GatingPolicy,
-    build_transition_gating_thresholds,
-)
+from state_engine.gating import GatingPolicy
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
 from state_engine.labels import StateLabels
@@ -68,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-tf",
         default=None,
-        help="Timeframe del contexto State/ALLOW (ej. H2). Default: metadata del State Engine o allow-tf.",
+        help="Timeframe del contexto State/LOOK_FOR (ej. H2). Default: metadata del State Engine o allow-tf.",
     )
     parser.add_argument("--state-model", type=Path, default=None, help="Ruta del modelo State Engine (pkl)")
     parser.add_argument("--model-out", type=Path, default=None, help="Ruta de salida para Event Scorer")
@@ -267,10 +264,10 @@ def setup_logging(level: str) -> logging.Logger:
 
 def _required_allow_by_family() -> dict[str, str]:
     return {
-        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
-        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
-        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
-        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
+        EventFamily.BALANCE_FADE.value: "LOOK_FOR_balance_fade",
+        EventFamily.TRANSITION_FAILURE.value: "LOOK_FOR_transition_failure",
+        EventFamily.TREND_PULLBACK.value: "LOOK_FOR_trend_pullback",
+        EventFamily.TREND_CONTINUATION.value: "LOOK_FOR_trend_continuation",
     }
 
 def _apply_event_allow_gates(
@@ -296,7 +293,7 @@ def _apply_event_allow_gates(
     required_allow_values = sorted(set(required_allow_by_family.values()))
     missing_cols = sorted(set(required_allow_values) - set(events_df.columns))
     if missing_cols:
-        raise ValueError(f"Missing required ALLOW columns for Phase E gating: {missing_cols}")
+        raise ValueError(f"Missing required LOOK_FOR columns for Phase E gating: {missing_cols}")
     events = events_df.copy()
     events["required_allow"] = required_allow
     allow_values = pd.Series(0, index=events.index)
@@ -352,9 +349,9 @@ def _force_phase_e_allow_identity(
         raise ValueError(f"Phase E allow identity: unexpected allow_id values={invalid_allow}")
     if events["allow_id"].astype(str).str.contains(",", na=False).any():
         raise ValueError("Phase E allow identity: allow_id contains comma-separated combos.")
-    if (events["allow_id"] == "ALLOW_none").any():
-        raise ValueError("Phase E allow identity: ALLOW_none is not permitted.")
-    allow_cols = [col for col in events.columns if col.startswith("ALLOW_")]
+    if (events["allow_id"] == "LOOK_FOR_none").any():
+        raise ValueError("Phase E allow identity: LOOK_FOR_none is not permitted.")
+    allow_cols = [col for col in events.columns if col.startswith("LOOK_FOR_")]
     if allow_cols:
         multi_allow_count = int((events[allow_cols].fillna(0).sum(axis=1) >= 2).sum())
         logger.info(
@@ -1451,10 +1448,10 @@ def _save_model_if_ready(
 
 def _build_allow_id(events_df: pd.DataFrame, allow_cols: list[str]) -> pd.Series:
     if not allow_cols:
-        return pd.Series("ALLOW_none", index=events_df.index)
+        return pd.Series("LOOK_FOR_none", index=events_df.index)
     allow_active = events_df[allow_cols].fillna(0).astype(int)
     allow_id = allow_active.apply(
-        lambda row: ",".join(sorted([col for col, val in row.items() if val == 1])) or "ALLOW_none",
+        lambda row: ",".join(sorted([col for col, val in row.items() if val == 1])) or "LOOK_FOR_none",
         axis=1,
     )
     return allow_id
@@ -2402,9 +2399,9 @@ def _run_training_for_k(
     logger.info("Labeled events by type:\n%s", events["event_type"].value_counts().to_string())
 
     events_all = events.copy()
-    allow_cols = [col for col in events_all.columns if col.startswith("ALLOW_")]
+    allow_cols = [col for col in events_all.columns if col.startswith("LOOK_FOR_")]
     if not allow_cols:
-        logger.warning("No ALLOW_* columns found on events; meta policy will be empty.")
+        logger.warning("No LOOK_FOR_* columns found on events; meta policy will be empty.")
     margin_bins = _margin_bins(events_all[args.context_margin_col], q=3)
     margin_bin_label = margin_bins.map(_format_interval)
     state_label = events_all[args.context_state_col].map(_state_label)
@@ -3849,12 +3846,7 @@ def main() -> None:
     logger.info("Rows: %s=%s %s=%s", context_tf, len(ohlcv_ctx), args.score_tf, len(ohlcv_score))
 
     feature_engineer = FeatureEngineer(FeatureConfig())
-    gating_thresholds, _ = build_transition_gating_thresholds(
-        args.symbol,
-        config_payload,
-        logger=logger,
-    )
-    gating = GatingPolicy(gating_thresholds)
+    gating = GatingPolicy()
     context_bundle = build_context_bundle(
         symbol=args.symbol,
         context_tf=context_tf,
@@ -3872,7 +3864,7 @@ def main() -> None:
     if "atr_14" not in df_score_ctx.columns:
         df_score_ctx["atr_14"] = _ensure_atr_14(df_score_ctx)
     ctx_cols = [col for col in df_score_ctx.columns if col.startswith("ctx_")]
-    allow_cols = [col for col in df_score_ctx.columns if col.startswith("ALLOW_")]
+    allow_cols = [col for col in df_score_ctx.columns if col.startswith("LOOK_FOR_")]
     context_columns = [state_col, margin_col, *ctx_cols, *allow_cols]
     logger.info(
         "context_tf=%s context_columns=%s",
@@ -3945,7 +3937,7 @@ def main() -> None:
         )
         if not detected_events.empty:
             assert detected_events["allow_id"].astype(str).str.contains(",", na=False).sum() == 0
-            assert (detected_events["allow_id"] == "ALLOW_none").sum() == 0
+            assert (detected_events["allow_id"] == "LOOK_FOR_none").sum() == 0
     vwap_valid_pct = detected_events.attrs.get("vwap_valid_pct")
     vwap_invalid_reason = detected_events.attrs.get("vwap_invalid_reason")
     vwap_invalid_bars = detected_events.attrs.get("vwap_invalid_bars")

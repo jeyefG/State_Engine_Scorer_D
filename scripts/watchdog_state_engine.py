@@ -65,7 +65,7 @@ def try_import_rich() -> dict[str, Any] | None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Watchdog for State Engine ALLOW_* signals.")
+    parser = argparse.ArgumentParser(description="Watchdog for State Engine LOOK_FOR_* signals.")
     parser.add_argument(
         "--symbols",
         required=True,
@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-tf",
         default=None,
-        help="Timeframe del contexto State/ALLOW (default: metadata del State Engine).",
+        help="Timeframe del contexto State/LOOK_FOR (default: metadata del State Engine).",
     )
     parser.add_argument(
         "--phase-e",
@@ -276,8 +276,7 @@ def render_summary(
     console: Any | None,
 ) -> None:
     allow_any = gating.any(axis=1)
-    gating_allow_rate = float(allow_any.mean()) if len(gating) else 0.0
-    gating_block_rate = 1.0 - gating_allow_rate
+    look_for_coverage_rate = float(allow_any.mean()) if len(gating) else 0.0
 
     last_idx = outputs.index.max()
     last_allow = bool(allow_any.loc[last_idx]) if last_idx in allow_any.index else False
@@ -312,8 +311,7 @@ def render_summary(
             console.print(f"[cyan]Samples:[/cyan] {n_samples} (train={n_train}, test={n_test})")
         console.print(f"[cyan]Baseline:[/cyan] {baseline_label} ({baseline_pct:.2f}%)")
         console.print(
-            f"[cyan]Gating allow rate:[/cyan] {gating_allow_rate*100:.2f}% "
-            f"(block {gating_block_rate*100:.2f}%)"
+            f"[cyan]Look-for coverage:[/cyan] {look_for_coverage_rate*100:.2f}%"
         )
         console.print(
             f"[cyan]Last {context_tf} bar used:[/cyan] {last_bar_ts} | age_min={bar_age_minutes:.2f}"
@@ -322,7 +320,7 @@ def render_summary(
             f"[cyan]Server now (tick):[/cyan] {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}"
         )
         console.print(
-            f"[cyan]Last bar decision:[/cyan] ALLOW={last_allow} | state_hat={state_label} | margin={margin_value}"
+            f"[cyan]Last bar look_for:[/cyan] any={last_allow} | state_hat={state_label} | margin={margin_value}"
         )
         console.print(f"[cyan]Last bar rules fired:[/cyan] {last_rules if last_rules else '[]'}")
         console.print(f"[cyan]Model saved:[/cyan] {model_path}")
@@ -336,10 +334,10 @@ def render_summary(
     if n_samples is not None and n_train is not None and n_test is not None:
         print(f"Samples: {n_samples} (train={n_train}, test={n_test})")
     print(f"Baseline: {baseline_label} ({baseline_pct:.2f}%)")
-    print(f"Gating allow rate: {gating_allow_rate*100:.2f}% (block {gating_block_rate*100:.2f}%)")
+    print(f"Look-for coverage rate: {look_for_coverage_rate*100:.2f}%")
     print(f"Last {context_tf} bar used: {last_bar_ts} | age_min={bar_age_minutes:.2f}")
     print(f"Server now (tick): {server_now} | tick_age_min_vs_utc={tick_age_min_utc:.2f}")
-    print(f"Last bar decision: ALLOW={last_allow} | state_hat={state_label} | margin={margin_value}")
+    print(f"Last bar look_for: any={last_allow} | state_hat={state_label} | margin={margin_value}")
     print(f"Last bar rules fired: {last_rules if last_rules else '[]'}")
     print(f"Model saved: {model_path}")
 

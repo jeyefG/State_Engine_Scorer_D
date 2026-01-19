@@ -1,11 +1,9 @@
-"""Deterministic gating logic for PA State Engine outputs."""
+"""Phase D LOOK_FOR tagging logic for State Engine outputs."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-
-from pathlib import Path
-from typing import Any, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 import pandas as pd
 
@@ -13,130 +11,46 @@ from .labels import StateLabels
 
 
 @dataclass(frozen=True)
-class GatingThresholds:
-    trend_margin_min: float = 0.15
-    balance_margin_min: float = 0.10
-    transition_margin_min: float = 0.10
-    transition_breakmag_min: float = 0.25
-    transition_reentry_min: float = 1.0
-    allowed_sessions: Iterable[str] | None = None
-    state_age_min: int | None = None
-    state_age_max: int | None = None
-    dist_vwap_atr_min: float | None = None
-    dist_vwap_atr_max: float | None = None
-    transition_ctx_enabled: bool = True
-    transition_ctx_require_all: bool = True
+class PhaseDConfig:
+    enabled: bool = False
+    look_fors: dict[str, dict[str, Any]] | None = None
 
 
-def get_transition_ctx_cfg(
-    cfg: dict[str, Any] | None,
-    allow_name: str,
-) -> tuple[dict[str, Any], str, list[str], list[str]]:
-    tried_paths = [
-        f"allow_context_filters.{allow_name}",
-        f"gating.allow_context_filters.{allow_name}",
-        f"gating.allows.{allow_name}",
-    ]
-    if not isinstance(cfg, dict):
-        return {}, "missing", [], tried_paths
-
-    candidates = [
-        cfg.get("allow_context_filters", {}).get(allow_name),
-        cfg.get("gating", {}).get("allow_context_filters", {}).get(allow_name),
-        cfg.get("gating", {}).get("allows", {}).get(allow_name),
-    ]
-    selected_path = "missing"
-    rule_cfg: dict[str, Any] = {}
-    for path, candidate in zip(tried_paths, candidates):
-        if isinstance(candidate, dict):
-            rule_cfg = dict(candidate)
-            selected_path = path
-            break
-    keys_present = sorted(rule_cfg.keys()) if rule_cfg else []
-    return rule_cfg, selected_path, keys_present, tried_paths
+def _parse_phase_d_config(symbol_cfg: dict | None) -> PhaseDConfig:
+    if not isinstance(symbol_cfg, dict):
+        return PhaseDConfig(enabled=False, look_fors=None)
+    phase_d = symbol_cfg.get("phase_d")
+    if not isinstance(phase_d, dict):
+        return PhaseDConfig(enabled=False, look_fors=None)
+    enabled = bool(phase_d.get("enabled", False))
+    look_fors = phase_d.get("look_fors")
+    if look_fors is not None and not isinstance(look_fors, dict):
+        raise ValueError("phase_d.look_fors must be a mapping when provided.")
+    return PhaseDConfig(enabled=enabled, look_fors=look_fors)
 
 
-def build_transition_gating_thresholds(
-    symbol: str | None,
-    symbol_config: dict[str, Any] | None,
-    *,
-    allow_name: str = "ALLOW_transition_failure",
-    logger=None,
-) -> tuple[GatingThresholds, dict[str, Any]]:
-    if logger is not None:
-        top_keys = list(symbol_config.keys()) if isinstance(symbol_config, dict) else []
-        allow_keys = []
-        if isinstance(symbol_config, dict):
-            allow_ctx = symbol_config.get("allow_context_filters", {})
-            if isinstance(allow_ctx, dict):
-                allow_keys = list(allow_ctx.keys())
-        logger.info("GATING_CFG_TOP_KEYS symbol=%s top_keys=%s", symbol, top_keys)
-        logger.info(
-            "GATING_CFG_ALLOWCTX_KEYS symbol=%s allow_context_filters_keys=%s",
-            symbol,
-            allow_keys,
+def _base_state_mask(state_hat: pd.Series, base_state: str, index: pd.Index) -> pd.Series:
+    base_state_norm = str(base_state).strip().lower()
+    if base_state_norm == "trend":
+        mask = state_hat == StateLabels.TREND
+    elif base_state_norm == "balance":
+        mask = state_hat == StateLabels.BALANCE
+    elif base_state_norm == "transition":
+        mask = state_hat == StateLabels.TRANSITION
+    elif base_state_norm == "any":
+        mask = pd.Series(True, index=index)
+    else:
+        raise ValueError(
+            f"Invalid base_state={base_state}. Expected one of ['balance', 'transition', 'trend', 'any']."
         )
-
-    rule_cfg, selected_path, keys_present, tried_paths = get_transition_ctx_cfg(
-        symbol_config,
-        allow_name,
-    )
-    if logger is not None:
-        logger.info(
-            "GATING_CFG_LOOKUP symbol=%s allow_name=%s tried_paths=%s selected_path=%s keys_present=%s",
-            symbol,
-            allow_name,
-            tried_paths,
-            selected_path,
-            keys_present,
-        )
-
-    enabled = bool(rule_cfg.get("enabled", False)) if rule_cfg else False
-    require_all = bool(rule_cfg.get("require_all", True)) if rule_cfg else True
-
-    active_cfg = rule_cfg if enabled else {}
-    overrides: dict[str, Any] = {
-        "transition_ctx_enabled": enabled,
-        "transition_ctx_require_all": require_all,
-    }
-    if active_cfg.get("sessions_in") is not None:
-        overrides["allowed_sessions"] = active_cfg.get("sessions_in")
-    if active_cfg.get("state_age_min") is not None:
-        overrides["state_age_min"] = int(active_cfg["state_age_min"])
-    if active_cfg.get("state_age_max") is not None:
-        overrides["state_age_max"] = int(active_cfg["state_age_max"])
-    if active_cfg.get("dist_vwap_atr_min") is not None:
-        overrides["dist_vwap_atr_min"] = float(active_cfg["dist_vwap_atr_min"])
-    if active_cfg.get("dist_vwap_atr_max") is not None:
-        overrides["dist_vwap_atr_max"] = float(active_cfg["dist_vwap_atr_max"])
-    if active_cfg.get("breakmag_min") is not None:
-        overrides["transition_breakmag_min"] = float(active_cfg["breakmag_min"])
-    if active_cfg.get("reentry_min") is not None:
-        overrides["transition_reentry_min"] = float(active_cfg["reentry_min"])
-
-    thresholds = GatingThresholds(**{**asdict(GatingThresholds()), **overrides})
-    config_path = Path("configs") / "symbols" / f"{symbol}.yaml" if symbol else None
-    return thresholds, {
-        "keys_present": keys_present,
-        "source": "symbol" if rule_cfg else "missing",
-        "config_path": str(config_path) if config_path and config_path.exists() else "unknown",
-        "selected_path": selected_path,
-        "tried_paths": tried_paths,
-        "enabled": enabled,
-        "require_all": require_all,
-        "sessions_in": rule_cfg.get("sessions_in") if rule_cfg else None,
-        "state_age_max": rule_cfg.get("state_age_max") if rule_cfg else None,
-        "dist_vwap_atr_max": rule_cfg.get("dist_vwap_atr_max") if rule_cfg else None,
-        "breakmag_min": rule_cfg.get("breakmag_min") if rule_cfg else None,
-        "reentry_min": rule_cfg.get("reentry_min") if rule_cfg else None,
-    }
+    return mask.reindex(index).fillna(False).astype(bool)
 
 
 class GatingPolicy:
-    """Apply ALLOW_* rules based on StateEngine state and margin."""
+    """Apply LOOK_FOR_* tags based on StateEngine outputs and context."""
 
-    def __init__(self, thresholds: GatingThresholds | None = None) -> None:
-        self.thresholds = thresholds or GatingThresholds()
+    def __init__(self, config: PhaseDConfig | None = None) -> None:
+        self.config = config or PhaseDConfig()
 
     def apply(
         self,
@@ -147,167 +61,93 @@ class GatingPolicy:
         symbol: str | None = None,
         config_meta: dict | None = None,
     ) -> pd.DataFrame:
-        """Return DataFrame with ALLOW_* columns."""
+        """Return DataFrame with LOOK_FOR_* columns."""
         required = {"state_hat", "margin"}
         missing = required - set(outputs.columns)
         if missing:
             raise ValueError(f"Missing required output columns: {sorted(missing)}")
 
-        th = self.thresholds
-        state_hat = outputs["state_hat"]
-        margin = outputs["margin"]
         # --- HARD ALIGN: features must follow outputs index (outputs is post-clean) ---
         if features is not None and not features.index.equals(outputs.index):
             if logger is not None:
                 logger.info(
-                    "GATING_ALIGN symbol=%s outputs_len=%s features_len_before=%s idx_equal_before=%s",
-                    symbol, len(outputs), len(features), features.index.equals(outputs.index)
+                    "LOOK_FOR_ALIGN symbol=%s outputs_len=%s features_len_before=%s idx_equal_before=%s",
+                    symbol,
+                    len(outputs),
+                    len(features),
+                    features.index.equals(outputs.index),
                 )
             features = features.reindex(outputs.index)
             if logger is not None:
                 logger.info(
-                    "GATING_ALIGN_DONE symbol=%s outputs_len=%s features_len_after=%s idx_equal_after=%s",
+                    "LOOK_FOR_ALIGN_DONE symbol=%s outputs_len=%s features_len_after=%s idx_equal_after=%s",
                     symbol,
                     len(outputs.index),
                     len(features.index),
                     features.index.equals(outputs.index),
                 )
         # ---------------------------------------------------------------------------
-        allow_trend_pullback = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
-        allow_trend_continuation = (state_hat == StateLabels.TREND) & (margin >= th.trend_margin_min)
-        allow_balance_fade = (state_hat == StateLabels.BALANCE) & (margin >= th.balance_margin_min)
 
-        transition_candidates = (state_hat == StateLabels.TRANSITION)
-        guardrails_breakmag_min = th.transition_breakmag_min
-        guardrails_reentry_min = th.transition_reentry_min
-        guardrails_ok = transition_candidates & (margin >= th.transition_margin_min)
-        if features is not None:
-            required_features = {"BreakMag", "ReentryCount"}
-            missing_features = required_features - set(features.columns)
-            if missing_features:
-                raise ValueError(f"Missing required features for gating: {sorted(missing_features)}")
-            guardrails_ok &= (
-                (features["BreakMag"] >= guardrails_breakmag_min)
-                & (features["ReentryCount"] >= guardrails_reentry_min)
-            )
-        allow_transition_failure = guardrails_ok
+        phase_d = _parse_phase_d_config(config_meta)
+        if not phase_d.enabled:
+            if logger is not None:
+                logger.info("PHASE_D_DISABLED symbol=%s reason=no phase_d config", symbol)
+            return pd.DataFrame(index=outputs.index)
 
-        # Fase D: context filters are semantic filters, not signals.
-        base_allow_names = [
-            "ALLOW_trend_pullback",
-            "ALLOW_trend_continuation",
-            "ALLOW_balance_fade",
-            "ALLOW_transition_failure",
-        ]
-        allow_map = {
-            "ALLOW_trend_pullback": allow_trend_pullback,
-            "ALLOW_trend_continuation": allow_trend_continuation,
-            "ALLOW_balance_fade": allow_balance_fade,
-            "ALLOW_transition_failure": allow_transition_failure,
-        }
+        look_fors = phase_d.look_fors or {}
+        if not look_fors:
+            if logger is not None:
+                logger.info("PHASE_D_DISABLED symbol=%s reason=empty look_fors", symbol)
+            return pd.DataFrame(index=outputs.index)
 
-        ctx_allows = {}
-        if isinstance(config_meta, dict):
-            ctx_allows = config_meta.get("allow_context_filters", {})
-            if not isinstance(ctx_allows, dict):
-                ctx_allows = {}
-
-        extra_allow_names = sorted(
-            [name for name in ctx_allows.keys() if name not in allow_map],
-        )
-        enabled_extras = [
-            name
-            for name in extra_allow_names
-            if isinstance(ctx_allows.get(name), dict) and ctx_allows[name].get("enabled", False)
-        ]
-        if logger is not None:
-            logger.info(
-                "GATING_ALLOWS_BUILT base=%s extras=%s enabled_extras=%s",
-                base_allow_names,
-                extra_allow_names,
-                enabled_extras,
-            )
-
-        base_masks = {
-            "balance": allow_balance_fade,
-            "transition": allow_transition_failure,
-            "trend": allow_trend_pullback,
-            "any": pd.Series(True, index=outputs.index),
-        }
-        allowed_base_states = set(base_masks.keys())
-
-        for allow_name in extra_allow_names:
-            ctx_meta = ctx_allows.get(allow_name) if isinstance(ctx_allows, dict) else None
-            if not isinstance(ctx_meta, dict):
-                raise ValueError(f"ALLOW {allow_name} missing config block for base_state.")
-            base_state = ctx_meta.get("base_state") or ctx_meta.get("anchor_state")
+        state_hat = outputs["state_hat"]
+        look_for_payload: dict[str, pd.Series] = {}
+        for look_for_name, rule_cfg in look_fors.items():
+            if not isinstance(rule_cfg, dict):
+                raise ValueError(f"LOOK_FOR {look_for_name} config must be a mapping.")
+            if not rule_cfg.get("enabled", False):
+                continue
+            base_state = rule_cfg.get("base_state") or rule_cfg.get("anchor_state")
             if base_state is None:
-                raise ValueError(f"ALLOW {allow_name} missing required base_state.")
-            base_state_norm = str(base_state).strip().lower()
-            if base_state_norm not in allowed_base_states:
-                raise ValueError(
-                    f"ALLOW {allow_name} has invalid base_state={base_state}. "
-                    f"Expected one of {sorted(allowed_base_states)}."
-                )
-            allow_map[allow_name] = base_masks[base_state_norm]
-
-        allow_names = base_allow_names + extra_allow_names
-        for allow_name in allow_names:
-            ctx_meta = None
-            if isinstance(config_meta, dict):
-                ctx_all = config_meta.get("allow_context_filters")
-                if isinstance(ctx_all, dict):
-                    ctx_meta = ctx_all.get(allow_name)
-            if ctx_meta is None and allow_name in {
-                "ALLOW_trend_pullback",
-                "ALLOW_trend_continuation",
-                "ALLOW_balance_fade",
-                "ALLOW_transition_failure",
-            }:
-                default_base_state = {
-                    "ALLOW_trend_pullback": "trend",
-                    "ALLOW_trend_continuation": "trend",
-                    "ALLOW_balance_fade": "balance",
-                    "ALLOW_transition_failure": "transition",
-                }[allow_name]
-                ctx_meta = {"enabled": False, "base_state": default_base_state}
-            filtered_mask, counts, _ = self._apply_allow_context_filter(
-                allow_name,
-                allow_map[allow_name],
+                raise ValueError(f"LOOK_FOR {look_for_name} missing required base_state.")
+            base_mask = _base_state_mask(state_hat, base_state, outputs.index)
+            filtered_mask, counts, _ = self._apply_look_for_filters(
+                look_for_name,
+                base_mask,
                 outputs,
                 features,
-                ctx_meta,
+                rule_cfg,
                 logger,
                 symbol,
             )
-            allow_map[allow_name] = filtered_mask
+            look_for_payload[look_for_name] = filtered_mask.astype(int)
             if logger is not None and counts is not None:
+                total_rows = max(int(counts.get("total_rows", 0)), 1)
                 n_before = int(counts.get("n_base", 0))
                 n_after = int(counts.get("n_pass", 0))
-                total_rows = max(int(counts.get("total_rows", 0)), 1)
-                allow_rate = (n_after / total_rows) * 100.0 if total_rows else 0.0
+                coverage = (n_after / total_rows) * 100.0 if total_rows else 0.0
                 logger.info(
-                    "ALLOW_AUDIT symbol=%s allow_name=%s base_state=%s filters=%s missing_cols=%s "
-                    "n_before=%s n_after=%s allow_rate=%.2f%%",
+                    "LOOK_FOR_AUDIT symbol=%s look_for=%s base_state=%s filters=%s missing_cols=%s "
+                    "n_before=%s n_after=%s coverage=%.2f%%",
                     symbol,
-                    allow_name,
+                    look_for_name,
                     counts.get("base_state"),
                     counts.get("active_filters"),
                     counts.get("missing_columns"),
                     n_before,
                     n_after,
-                    allow_rate,
+                    coverage,
                 )
-        allow_payload = {allow_name: allow_map[allow_name].astype(int) for allow_name in allow_names}
-        return pd.DataFrame(allow_payload, index=outputs.index)
 
-    def _apply_allow_context_filter(
+        return pd.DataFrame(look_for_payload, index=outputs.index)
+
+    def _apply_look_for_filters(
         self,
-        allow_name: str,
+        look_for_name: str,
         base_mask: pd.Series,
         outputs: pd.DataFrame,
         features: pd.DataFrame | None,
-        ctx_meta: dict[str, Any] | None,
+        rule_cfg: dict[str, Any],
         logger,
         symbol: str | None,
     ) -> tuple[pd.Series, dict[str, Any], pd.DataFrame | None]:
@@ -330,15 +170,15 @@ class GatingPolicy:
         if features is not None and not features.index.equals(idx):
             features = features.reindex(idx)
 
-        ctx_meta = ctx_meta if isinstance(ctx_meta, dict) else None
-        enabled = bool(ctx_meta.get("enabled", False)) if ctx_meta else False
-        require_all = bool(ctx_meta.get("require_all", True)) if ctx_meta else True
+        filters_cfg = rule_cfg.get("filters", {}) if isinstance(rule_cfg.get("filters"), dict) else {}
+        require_all = bool(rule_cfg.get("require_all", True))
 
-        session_series = _resolve_col(["ctx_session_bucket", "session", "session_bucket"])
-        state_age_series = _resolve_col(["ctx_state_age", "state_age"])
-        dist_series = _resolve_col(["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"])
+        session_series = _resolve_col(["ctx_session_bucket"])
+        state_age_series = _resolve_col(["ctx_state_age"])
+        dist_series = _resolve_col(["ctx_dist_vwap_atr"])
         breakmag_series = _resolve_col(["BreakMag"])
         reentry_series = _resolve_col(["ReentryCount"])
+        margin_series = _resolve_col(["margin"])
 
         masks: list[pd.Series] = []
         mask_map: dict[str, pd.Series] = {}
@@ -346,9 +186,9 @@ class GatingPolicy:
         missing_columns: list[str] = []
         active_filters: list[str] = []
 
-        sessions_in = ctx_meta.get("sessions_in") if ctx_meta else None
-        if enabled and sessions_in is not None and session_series is None:
-            missing_columns.append("session")
+        sessions_in = filters_cfg.get("sessions_in")
+        if sessions_in is not None and session_series is None:
+            missing_columns.append("ctx_session_bucket")
         if sessions_in is not None and session_series is not None:
             allowed = {str(val) for val in sessions_in}
             mask = session_series.astype(str).isin(allowed)
@@ -357,10 +197,10 @@ class GatingPolicy:
             applied.add("session")
             active_filters.append("sessions_in")
 
-        state_age_min = ctx_meta.get("state_age_min") if ctx_meta else None
-        state_age_max = ctx_meta.get("state_age_max") if ctx_meta else None
-        if enabled and (state_age_min is not None or state_age_max is not None) and state_age_series is None:
-            missing_columns.append("state_age")
+        state_age_min = filters_cfg.get("state_age_min")
+        state_age_max = filters_cfg.get("state_age_max")
+        if (state_age_min is not None or state_age_max is not None) and state_age_series is None:
+            missing_columns.append("ctx_state_age")
         if (state_age_min is not None or state_age_max is not None) and state_age_series is not None:
             series = pd.to_numeric(state_age_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -373,10 +213,10 @@ class GatingPolicy:
             applied.add("state_age")
             active_filters.append("state_age")
 
-        dist_min = ctx_meta.get("dist_vwap_atr_min") if ctx_meta else None
-        dist_max = ctx_meta.get("dist_vwap_atr_max") if ctx_meta else None
-        if enabled and (dist_min is not None or dist_max is not None) and dist_series is None:
-            missing_columns.append("dist_vwap_atr")
+        dist_min = filters_cfg.get("dist_vwap_atr_min")
+        dist_max = filters_cfg.get("dist_vwap_atr_max")
+        if (dist_min is not None or dist_max is not None) and dist_series is None:
+            missing_columns.append("ctx_dist_vwap_atr")
         if (dist_min is not None or dist_max is not None) and dist_series is not None:
             series = pd.to_numeric(dist_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -389,9 +229,9 @@ class GatingPolicy:
             applied.add("dist_vwap_atr")
             active_filters.append("dist_vwap_atr")
 
-        breakmag_min = ctx_meta.get("breakmag_min") if ctx_meta else None
-        breakmag_max = ctx_meta.get("breakmag_max") if ctx_meta else None
-        if enabled and (breakmag_min is not None or breakmag_max is not None) and breakmag_series is None:
+        breakmag_min = filters_cfg.get("breakmag_min")
+        breakmag_max = filters_cfg.get("breakmag_max")
+        if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is None:
             missing_columns.append("BreakMag")
         if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is not None:
             series = pd.to_numeric(breakmag_series, errors="coerce")
@@ -405,9 +245,9 @@ class GatingPolicy:
             applied.add("breakmag")
             active_filters.append("breakmag")
 
-        reentry_min = ctx_meta.get("reentry_min") if ctx_meta else None
-        reentry_max = ctx_meta.get("reentry_max") if ctx_meta else None
-        if enabled and (reentry_min is not None or reentry_max is not None) and reentry_series is None:
+        reentry_min = filters_cfg.get("reentry_min")
+        reentry_max = filters_cfg.get("reentry_max")
+        if (reentry_min is not None or reentry_max is not None) and reentry_series is None:
             missing_columns.append("ReentryCount")
         if (reentry_min is not None or reentry_max is not None) and reentry_series is not None:
             series = pd.to_numeric(reentry_series, errors="coerce")
@@ -421,37 +261,36 @@ class GatingPolicy:
             applied.add("reentry")
             active_filters.append("reentry")
 
-        if enabled and missing_columns:
-            raise ValueError(
-                f"ALLOW {allow_name} missing required columns: {sorted(set(missing_columns))}."
-            )
+        margin_min = filters_cfg.get("margin_min")
+        margin_max = filters_cfg.get("margin_max")
+        if (margin_min is not None or margin_max is not None) and margin_series is None:
+            missing_columns.append("margin")
+        if (margin_min is not None or margin_max is not None) and margin_series is not None:
+            series = pd.to_numeric(margin_series, errors="coerce")
+            mask = pd.Series(True, index=idx)
+            if margin_min is not None:
+                mask &= series >= float(margin_min)
+            if margin_max is not None:
+                mask &= series <= float(margin_max)
+            masks.append(mask)
+            mask_map["margin"] = mask
+            applied.add("margin")
+            active_filters.append("margin")
 
-        if not enabled:
-            counts = {
-                "total_rows": int(len(idx)),
-                "n_base": int(base_mask.sum()),
-                "n_pass": int(base_mask.sum()),
-                "n_fail": 0,
-                "status": "disabled",
-                "active_filters": active_filters,
-                "missing_columns": sorted(set(missing_columns)),
-                "base_state": ctx_meta.get("base_state") if ctx_meta else None,
-            }
-            return base_mask, counts, None
+        if missing_columns:
+            raise ValueError(
+                f"LOOK_FOR {look_for_name} missing required columns: {sorted(set(missing_columns))}."
+            )
 
         if logger is not None:
             logger.info(
-                "GATING_CONFIG_EFFECTIVE symbol=%s allow_name=%s config_path=%s source=%s selected_path=%s "
-                "keys_present=%s enabled=%s require_all=%s sessions_in=%s state_age_min=%s state_age_max=%s "
-                "dist_vwap_atr_min=%s dist_vwap_atr_max=%s breakmag_min=%s breakmag_max=%s reentry_min=%s "
-                "reentry_max=%s",
+                "LOOK_FOR_CONFIG_EFFECTIVE symbol=%s look_for=%s enabled=%s require_all=%s "
+                "sessions_in=%s state_age_min=%s state_age_max=%s dist_vwap_atr_min=%s "
+                "dist_vwap_atr_max=%s breakmag_min=%s breakmag_max=%s reentry_min=%s "
+                "reentry_max=%s margin_min=%s margin_max=%s",
                 symbol,
-                allow_name,
-                ctx_meta.get("config_path") if ctx_meta else None,
-                ctx_meta.get("source") if ctx_meta else None,
-                ctx_meta.get("selected_path") if ctx_meta else None,
-                ctx_meta.get("keys_present") if ctx_meta else None,
-                enabled,
+                look_for_name,
+                True,
                 require_all,
                 sessions_in,
                 state_age_min,
@@ -462,14 +301,16 @@ class GatingPolicy:
                 breakmag_max,
                 reentry_min,
                 reentry_max,
+                margin_min,
+                margin_max,
             )
 
         if not masks:
             if logger is not None:
                 logger.info(
-                    "NO_EFFECTIVE_CONDITIONS symbol=%s allow_name=%s",
+                    "NO_EFFECTIVE_CONDITIONS symbol=%s look_for=%s",
                     symbol,
-                    allow_name,
+                    look_for_name,
                 )
             counts = {
                 "total_rows": int(len(idx)),
@@ -479,7 +320,7 @@ class GatingPolicy:
                 "status": "no_effective_conditions",
                 "active_filters": active_filters,
                 "missing_columns": sorted(set(missing_columns)),
-                "base_state": ctx_meta.get("base_state") if ctx_meta else None,
+                "base_state": rule_cfg.get("base_state"),
             }
             return base_mask, counts, None
 
@@ -514,17 +355,18 @@ class GatingPolicy:
             "pass_dist": _pass_count("dist_vwap_atr"),
             "pass_breakmag": _pass_count("breakmag"),
             "pass_reentry": _pass_count("reentry"),
+            "pass_margin": _pass_count("margin"),
             "active_filters": active_filters,
             "missing_columns": sorted(set(missing_columns)),
-            "base_state": ctx_meta.get("base_state") if ctx_meta else None,
+            "base_state": rule_cfg.get("base_state"),
         }
 
         if logger is not None:
             logger.info(
-                "ALLOW_CTX_FILTER_COUNTS symbol=%s allow_name=%s n_base=%s n_pass=%s n_fail=%s "
-                "pass_session=%s pass_state_age=%s pass_dist=%s pass_breakmag=%s pass_reentry=%s",
+                "LOOK_FOR_FILTER_COUNTS symbol=%s look_for=%s n_base=%s n_pass=%s n_fail=%s "
+                "pass_session=%s pass_state_age=%s pass_dist=%s pass_breakmag=%s pass_reentry=%s pass_margin=%s",
                 symbol,
-                allow_name,
+                look_for_name,
                 counts["n_base"],
                 counts["n_pass"],
                 counts["n_fail"],
@@ -533,14 +375,15 @@ class GatingPolicy:
                 counts.get("pass_dist"),
                 counts.get("pass_breakmag"),
                 counts.get("pass_reentry"),
+                counts.get("pass_margin"),
             )
             total_rows = max(total_rows, 1)
             before_pct = 100.0 * n_base / total_rows
             after_pct = 100.0 * n_pass / total_rows
             logger.info(
-                "ALLOW_RATE symbol=%s allow_name=%s total=%s before=%.2f%% after=%.2f%% delta=%.2f%%",
+                "LOOK_FOR_RATE symbol=%s look_for=%s total=%s before=%.2f%% after=%.2f%% delta=%.2f%%",
                 symbol,
-                allow_name,
+                look_for_name,
                 total_rows,
                 before_pct,
                 after_pct,
@@ -572,6 +415,7 @@ class GatingPolicy:
                     ("dist_vwap_atr", "dist_vwap_atr"),
                     ("breakmag", "breakmag"),
                     ("reentry", "reentry"),
+                    ("margin", "margin"),
                 ]:
                     if key in applied and not bool(mask_map[key].reindex(idx).fillna(False).loc[row_idx]):
                         parts.append(label)
@@ -580,9 +424,9 @@ class GatingPolicy:
             fail_samples = failure_rows
             if logger is not None:
                 logger.info(
-                    "ALLOW_CTX_FILTER_FAIL_SAMPLES symbol=%s allow_name=%s\n%s",
+                    "LOOK_FOR_FILTER_FAIL_SAMPLES symbol=%s look_for=%s\n%s",
                     symbol,
-                    allow_name,
+                    look_for_name,
                     fail_samples.to_string(index=False),
                 )
 
@@ -590,7 +434,6 @@ class GatingPolicy:
 
 
 __all__ = [
-    "GatingThresholds",
+    "PhaseDConfig",
     "GatingPolicy",
-    "build_transition_gating_thresholds",
 ]
