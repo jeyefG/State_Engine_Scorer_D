@@ -111,7 +111,7 @@
 
 > **Ningún filtro contextual puede ejecutarse si no existe su columna.**
 
-- En `research` o `--phase-e`: **si `allow_context_filters.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` / abort explícito**.
+- En `research` o cuando `phase_e=true`: **si `allow_context_filters.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` / abort explícito**.
 - En `baseline/production`: **warning + auto-disable con telemetría**.
 
 ---
@@ -122,7 +122,7 @@
 **Objetivo**: “plumbing correcto” del ContextBuilder y allow_context_filters sin refactor masivo.
 
 Checklist:
-- [ ] **Las columnas `session`, `state_age`, `dist_vwap_atr` deben provenir de la misma fuente de verdad que usa `train_state_engine.py`** (reusar builder/módulo compartido o factorizar uno común). **No se permite calcular estas columnas “a mano” en el scorer**.
+- [ ] **Las columnas `session`, `state_age`, `dist_vwap_atr` deben provenir de la misma fuente de verdad que usa `train_state_engine.py`** (reusar builder/módulo compartido o factorizar uno común; idealmente importando el builder desde `state_engine/context_features.py` o módulo equivalente). **No se permite calcular estas columnas “a mano” en el scorer**.
 - [ ] Inyectar `ctx_features` correctos en `allow_context_frame` (session/state_age/dist_vwap_atr) y **alias explícitos** (p. ej. `ctx_dist_vwap_atr_abs → dist_vwap_atr`, `ctx_session_bucket → session`).
 - [ ] Aplicar la política de validación estricta:
   - `research` o `--phase-e`: si `allow_context_filters.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` (abort explícito).
