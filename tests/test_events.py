@@ -118,12 +118,12 @@ def test_vwap_daily_reset() -> None:
             "high": [101, 101, 201, 201],
             "low": [99, 99, 199, 199],
             "close": [100, 100, 200, 200],
-            "volume": [10, 10, 10, 10],
+            "tick_volume": [10, 10, 10, 10],
         },
         index=idx,
     )
     vwap = _compute_vwap(df_m5, vwap_col="vwap", reset_mode="daily", vwap_window=50)
-    assert vwap.iloc[2] == 200
+    assert vwap["vwap"].iloc[2] == 200
 
 
 def test_family_id_from_allow() -> None:

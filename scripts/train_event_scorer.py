@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from state_engine.events import EventDetectionConfig, detect_events, label_events
+from state_engine.events import EventDetectionConfig, _compute_vwap, _resolve_vwap_reset_mode, detect_events, label_events
 from state_engine.features import FeatureConfig, FeatureEngineer
 from state_engine.gating import (
     GatingPolicy,
@@ -73,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train-ratio", type=float, default=0.8, help="Ratio train/calibración")
     parser.add_argument("--k-bars", type=int, default=24, help="Ventana futura K para etiquetas")
+    parser.add_argument(
+        "--horizon-min",
+        type=float,
+        default=None,
+        help="Horizonte temporal (minutos). Si se define, k_bars = horizon_min / score_tf_minutes.",
+    )
     parser.add_argument("--reward-r", type=float, default=1.0, help="R múltiplo para TP proxy")
     parser.add_argument("--sl-mult", type=float, default=1.0, help="Multiplicador de ATR para SL proxy")
     parser.add_argument("--r-thr", type=float, default=0.0, help="Umbral para label binario basado en r_outcome")
@@ -241,6 +248,8 @@ def build_context(
         )
     allow_cols = list(allows.columns)
     allows = apply_allow_context_filters(allow_context_frame, symbol_cfg, logger)[allow_cols]
+    if allow_cols:
+        allows = allows.fillna(0).astype(int)
     ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
     ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], allows], axis=1)
     ctx = ctx.shift(1)
@@ -263,6 +272,9 @@ def merge_allow_score(ctx_h1: pd.DataFrame, ohlcv_score: pd.DataFrame, *, contex
     state_col = f"state_hat_{context_tf_norm}"
     margin_col = f"margin_{context_tf_norm}"
     merged = merged.rename(columns={"state_hat": state_col, "margin": margin_col})
+    allow_cols = [col for col in merged.columns if col.startswith("ALLOW_")]
+    if allow_cols:
+        merged[allow_cols] = merged[allow_cols].fillna(0).astype(int)
     missing_ctx = merged[[state_col, margin_col]].isna().mean()
     if (missing_ctx > 0.25).any():
         logger.warning("High missing context after merge: %s", missing_ctx.to_dict())
@@ -352,19 +364,25 @@ def _normalize_timeframe(timeframe: str) -> str:
 def _resolve_context_tf(
     *,
     requested: str | None,
-    allow_tf: str | None,
     model_metadata: dict[str, object],
     logger: logging.Logger,
 ) -> str:
-    meta_tf = model_metadata.get("timeframe") if isinstance(model_metadata, dict) else None
-    candidates = [requested, meta_tf, allow_tf]
+    meta_tf = None
+    if isinstance(model_metadata, dict):
+        meta_tf = model_metadata.get("context_tf") or model_metadata.get("timeframe")
+    candidates = [requested, meta_tf]
     for candidate in candidates:
         if candidate:
             resolved = _normalize_timeframe(str(candidate))
-            logger.info("context_tf resolved to %s (requested=%s meta=%s allow_tf=%s)", resolved, requested, meta_tf, allow_tf)
+            logger.info(
+                "context_tf resolved to %s (requested=%s meta=%s)",
+                resolved,
+                requested,
+                meta_tf,
+            )
             return resolved
     resolved = "H1"
-    logger.info("context_tf fallback=%s (requested=%s meta=%s allow_tf=%s)", resolved, requested, meta_tf, allow_tf)
+    logger.info("context_tf fallback=%s (requested=%s meta=%s)", resolved, requested, meta_tf)
     return resolved
 
 
@@ -398,6 +416,21 @@ def _timeframe_floor_freq(timeframe: str) -> str:
     if tf not in _TIMEFRAME_FLOOR_MAP:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
     return _TIMEFRAME_FLOOR_MAP[tf]
+
+
+def _timeframe_to_minutes(timeframe: str) -> int:
+    tf = _normalize_timeframe(timeframe)
+    if tf.startswith("M") and tf[1:].isdigit():
+        return int(tf[1:])
+    if tf.startswith("H") and tf[1:].isdigit():
+        return int(tf[1:]) * 60
+    if tf.startswith("D") and tf[1:].isdigit():
+        return int(tf[1:]) * 24 * 60
+    if tf.startswith("W") and tf[1:].isdigit():
+        return int(tf[1:]) * 7 * 24 * 60
+    if tf.startswith("MN") and tf[2:].isdigit():
+        return int(tf[2:]) * 30 * 24 * 60
+    raise ValueError(f"Unsupported timeframe for horizon conversion: {timeframe}")
 
 
 def _resolve_k_bars_by_tf(event_cfg: dict, score_tf: str, fallback: int) -> int:
@@ -516,6 +549,83 @@ def _resolve_vwap_report_mode(
         else ("session" if any(col in df_score_ctx.columns for col in ("session_id", "session")) else "daily")
     )
     return f"config_{config_mode} (no metadata)"
+
+
+def _write_vwap_diagnostic_plot(
+    ohlcv_score: pd.DataFrame,
+    symbol: str,
+    event_config: EventDetectionConfig,
+    logger: logging.Logger,
+) -> Path | None:
+    if ohlcv_score.empty:
+        logger.warning("VWAP diagnostic plot skipped: empty OHLCV input.")
+        return None
+    df = ohlcv_score.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.set_index(pd.to_datetime(df.index))
+    reset_mode = _resolve_vwap_reset_mode(df, event_config.vwap_reset_mode)
+    created_session_id = False
+    if reset_mode == "session" and not any(col in df.columns for col in ("session_id", "session")):
+        cut_hour = int(event_config.vwap_session_cut_hour)
+        session_day = df.index - pd.to_timedelta((df.index.hour < cut_hour).astype(int), unit="D")
+        df["session_id"] = session_day.date.astype(str)
+        created_session_id = True
+    vwap_result = _compute_vwap(
+        df,
+        vwap_col="vwap",
+        reset_mode=reset_mode,
+        vwap_window=event_config.vwap_window,
+    )
+    df["vwap"] = vwap_result["vwap"]
+    if reset_mode == "session":
+        session_key = df["session_id"] if "session_id" in df.columns else df["session"]
+    else:
+        session_key = df.index.date
+    if session_key.empty:
+        logger.warning("VWAP diagnostic plot skipped: no session key available.")
+        return None
+    last_session = session_key.iloc[-1]
+    session_mask = session_key == last_session
+    session_df = df.loc[session_mask]
+    if session_df.empty:
+        logger.warning("VWAP diagnostic plot skipped: last session empty.")
+        return None
+    diagnostics_dir = PROJECT_ROOT / "diagnostics" / "vwap_check"
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    session_label = str(last_session).replace("/", "-").replace(" ", "_")
+    output_path = diagnostics_dir / f"{_safe_symbol(symbol)}_{session_label}.png"
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        logger.warning("VWAP diagnostic plot skipped (matplotlib missing): %s", exc)
+        return None
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(session_df.index, session_df["close"], label="Close", color="#1f77b4")
+    if "vwap" in session_df.columns:
+        ax.plot(session_df.index, session_df["vwap"], label="VWAP", color="#ff7f0e")
+    if {"high", "low"} <= set(session_df.columns):
+        ax.fill_between(
+            session_df.index,
+            session_df["low"],
+            session_df["high"],
+            color="#1f77b4",
+            alpha=0.1,
+            label="High/Low",
+        )
+    ax.set_title(f"{symbol} VWAP check | session={last_session} | mode={reset_mode}")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Price")
+    ax.legend()
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    if created_session_id:
+        df.drop(columns=["session_id"], inplace=True)
+    logger.info("VWAP diagnostic plot saved: %s", output_path)
+    return output_path
 
 def _value_state(
     overlap_ratio: pd.Series,
@@ -1154,7 +1264,7 @@ def _print_research_summary_block(
         )
     print("\n=== SYMBOL SPECIALIZATION RESEARCH SUMMARY ===")
     if phase_e:
-        print("phase_e=ON (telemetry only; no qualification thresholds)")
+        print("phase_e=ON (telemetry only; no decision / gating)")
     else:
         print(
             "qualified_session_buckets={count} (n>={n_min}, r_mean>={r_min}, winrate>={w_min})".format(
@@ -1581,7 +1691,7 @@ def _build_training_diagnostic_report(
         conditional_regime = _conditional_edge_regime_table(
             events_diag,
             pseudo_col,
-            min_n=thresholds.decision_n_min,
+            min_n=0 if phase_e else thresholds.decision_n_min,
             state_col=state_col,
         )
         report[f"conditional_edge_regime_{pseudo_col}"] = conditional_regime
@@ -1718,6 +1828,7 @@ def _run_training_for_k(
     )
 
     def _base_summary_payload(verdict: str) -> dict[str, object]:
+        meta_policy_effective = (args.meta_policy == "on") and (not args.phase_e)
         return {
             "run_id": run_id,
             "symbol": args.symbol,
@@ -1738,6 +1849,7 @@ def _run_training_for_k(
             "m5_cutoff": score_cutoff,
             "score_cutoff": score_cutoff,
             "k_bars": k_bars,
+            "horizon_min": args.horizon_min,
             "reward_r": args.reward_r,
             "sl_mult": args.sl_mult,
             "r_thr": args.r_thr,
@@ -1747,6 +1859,7 @@ def _run_training_for_k(
                 "meta_margin_min": args.meta_margin_min,
                 "meta_margin_max": args.meta_margin_max,
             },
+            "meta_policy_effective": meta_policy_effective,
             "phase_e": args.phase_e,
             "verdict": verdict,
             "event_counts": event_counts,
@@ -1932,6 +2045,9 @@ def _run_training_for_k(
         )
 
     meta_policy_on = args.meta_policy == "on"
+    if args.phase_e and meta_policy_on:
+        logger.info("phase_e=ON -> meta_policy disabled (telemetry only)")
+        meta_policy_on = False
     allow_active_series = (
         events_state_filtered[allow_cols].fillna(0).sum(axis=1) > 0
         if allow_cols
@@ -2708,6 +2824,8 @@ def _run_training_for_k(
         win_mask = regime_df["flag"].str.contains("WIN") & (regime_df["samples_calib"] >= 300)
         if win_mask.any():
             recommendation = "EDGE_FOUND_META"
+    if args.phase_e:
+        recommendation = "TELEMETRY_ONLY"
     logger.info(
         "INFO | SUMMARY | BEST_REGIME=%s WORST_REGIME=%s",
         best_regime,
@@ -2729,6 +2847,7 @@ def _run_training_for_k(
         "context_tf": args.context_tf,
         "train_ratio": args.train_ratio,
         "k_bars": k_bars,
+        "horizon_min": args.horizon_min,
         "reward_r": args.reward_r,
         "sl_mult": args.sl_mult,
         "r_thr": args.r_thr,
@@ -2737,6 +2856,7 @@ def _run_training_for_k(
         "meta_policy": args.meta_policy,
         "meta_margin_min": args.meta_margin_min,
         "meta_margin_max": args.meta_margin_max,
+        "meta_policy_effective": (args.meta_policy == "on") and (not args.phase_e),
         "config_hash": config_hash,
         "prompt_version": prompt_version,
         "decision_thresholds": {
@@ -2854,6 +2974,30 @@ def _run_training_for_k(
         )
         logger.info("Split warning summary:\n%s", warning_summary.to_string(index=False))
     coverage_global = diagnostic_report.get("coverage_global", pd.DataFrame())
+    score_shape = pd.DataFrame()
+    if preds_meta is not None and not y_calib.empty:
+        score_shape = _score_shape_diagnostics(preds_meta, fam_calib, y_calib.index, [10, 20, 50])
+        if args.phase_e:
+            score_shape["verdict"] = "TELEMETRY_ONLY"
+        score_shape_path = _with_suffix(
+            args.model_dir
+            / f"score_shape_{output_prefix}_event_scorer{mode_suffix}.csv",
+            output_suffix,
+        )
+        score_shape_output = _attach_output_metadata(
+            score_shape,
+            run_id=run_id,
+            symbol=args.symbol,
+            allow_tf=args.allow_tf,
+            score_tf=args.score_tf,
+            context_tf=args.context_tf,
+            config_path=config_path,
+            mode=mode_effective,
+            config_hash=config_hash,
+            prompt_version=prompt_version,
+        )
+        score_shape_output.to_csv(score_shape_path, index=False)
+        logger.info("score_shape_out=%s", score_shape_path)
 
     def _scorer_metric(table: pd.DataFrame, metric: str) -> float | None:
         if table.empty:
@@ -2915,6 +3059,7 @@ def _run_training_for_k(
         "feature_count": event_features_all.shape[1],
         "min_samples_train": min_samples_train,
         "k_bars": k_bars,
+        "horizon_min": args.horizon_min,
         "reward_r": args.reward_r,
         "sl_mult": args.sl_mult,
         "r_thr": args.r_thr,
@@ -2924,8 +3069,11 @@ def _run_training_for_k(
             "meta_margin_min": args.meta_margin_min,
             "meta_margin_max": args.meta_margin_max,
         },
+        "meta_policy_effective": (args.meta_policy == "on") and (not args.phase_e),
         "phase_e": args.phase_e,
         "verdict": "TELEMETRY_ONLY" if args.phase_e else "SCORER_READY",
+        "score_shape_verdict": "TELEMETRY_ONLY" if args.phase_e else "DIAGNOSTIC_ONLY",
+        "score_shape_diagnostics": score_shape.to_dict(orient="records") if not score_shape.empty else [],
         "event_counts": event_counts,
         "context_columns": {
             "state_col": args.context_state_col,
@@ -2935,10 +3083,8 @@ def _run_training_for_k(
     }
 
     research_summary_payload = None
-    score_shape = pd.DataFrame()
     if research_enabled and preds_meta is not None and not y_calib.empty:
         diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
-        score_shape = _score_shape_diagnostics(preds_meta, fam_calib, y_calib.index, [10, 20, 50])
         train_scores = scorer.predict_proba(X_train, fam_train)
         train_metrics = summarize_metrics("TRAIN", train_scores, y_train, r_train, seed=seed)
         calib_metrics = summarize_metrics("CALIB", preds_meta, y_calib, r_calib, seed=seed)
@@ -3048,6 +3194,8 @@ def _resolve_baseline_thresholds(
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.log_level)
+    if args.phase_e:
+        logger.info("phase_e=ON (telemetry only; no decision / gating)")
     min_samples_train = 200
     seed = 7
     research_cfg: dict[str, object] = {
@@ -3130,6 +3278,17 @@ def main() -> None:
         if "context_tf" in event_cfg:
             args.context_tf = event_cfg.get("context_tf")
         args.k_bars = _resolve_k_bars_by_tf(event_cfg, args.score_tf, args.k_bars)
+    if args.horizon_min is not None:
+        score_minutes = _timeframe_to_minutes(args.score_tf)
+        derived_k_bars = max(1, int(math.ceil(args.horizon_min / score_minutes)))
+        logger.info(
+            "horizon_min=%.2f score_tf=%s score_tf_minutes=%s derived_k_bars=%s",
+            args.horizon_min,
+            args.score_tf,
+            score_minutes,
+            derived_k_bars,
+        )
+        args.k_bars = derived_k_bars
 
     logger.info(
         "Run init | symbol=%s config_path=%s allow_tf=%s score_tf=%s mode=%s run_id=%s",
@@ -3187,7 +3346,6 @@ def main() -> None:
     state_model.load(model_path)
     context_tf = _resolve_context_tf(
         requested=args.context_tf,
-        allow_tf=args.allow_tf,
         model_metadata=state_model.metadata,
         logger=logger,
     )
@@ -3196,7 +3354,7 @@ def main() -> None:
     margin_col = f"margin_{context_tf}"
     args.context_state_col = state_col
     args.context_margin_col = margin_col
-    logger.info("context_tf=%s context_columns=%s/%s", context_tf, state_col, margin_col)
+    logger.info("context_tf=%s context_state_col=%s context_margin_col=%s", context_tf, state_col, margin_col)
 
     ohlcv_ctx = connector.obtener_ohlcv(args.symbol, context_tf, fecha_inicio, fecha_fin)
     allow_cutoff = server_now.floor(_timeframe_floor_freq(context_tf))
@@ -3223,18 +3381,21 @@ def main() -> None:
     df_score_ctx = merge_allow_score(ctx_h1, ohlcv_score, context_tf=context_tf)
     if "atr_14" not in df_score_ctx.columns:
         df_score_ctx["atr_14"] = _ensure_atr_14(df_score_ctx)
+    ctx_cols = [col for col in df_score_ctx.columns if col.startswith("ctx_")]
+    allow_cols = [col for col in df_score_ctx.columns if col.startswith("ALLOW_")]
+    context_columns = [state_col, margin_col, *ctx_cols, *allow_cols]
+    logger.info(
+        "context_tf=%s context_columns=%s",
+        context_tf,
+        context_columns,
+    )
     logger.info("Rows after merge: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_merged = len(df_score_ctx)
-    ctx_nan_cols = [state_col, margin_col]
+    ctx_nan_cols = [col for col in context_columns if col in df_score_ctx.columns]
     if "atr_short" in df_score_ctx.columns:
         ctx_nan_cols.append("atr_short")
     ctx_nan = df_score_ctx[ctx_nan_cols].isna().mean().mul(100).round(2)
-    ctx_nan_table = pd.DataFrame(
-        {
-            "column": ctx_nan.index,
-            "nan_pct": ctx_nan.values,
-        }
-    )
+    ctx_nan_table = pd.DataFrame({"column": ctx_nan.index, "nan_pct": ctx_nan.values})
     logger.info("Context NaN rates:\n%s", ctx_nan_table.to_string(index=False))
     context_nan_pct = dict(zip(ctx_nan_table["column"], ctx_nan_table["nan_pct"]))
     df_score_ctx = df_score_ctx.dropna(subset=[state_col, margin_col])
@@ -3271,7 +3432,21 @@ def main() -> None:
     score_total = len(ohlcv_score)
 
     event_config = EventDetectionConfig().for_timeframe(args.score_tf)
+    vwap_plot_path = _write_vwap_diagnostic_plot(ohlcv_score, args.symbol, event_config, logger)
+    if vwap_plot_path is not None:
+        logger.info("VWAP diagnostic plot path=%s", vwap_plot_path)
     detected_events = detect_events(df_score_ctx, config=event_config)
+    vwap_valid_pct = detected_events.attrs.get("vwap_valid_pct")
+    vwap_invalid_reason = detected_events.attrs.get("vwap_invalid_reason")
+    vwap_invalid_bars = detected_events.attrs.get("vwap_invalid_bars")
+    logger.info(
+        "VWAP validity (events): valid_pct=%s invalid_reason=%s invalid_bars=%s",
+        vwap_valid_pct,
+        vwap_invalid_reason,
+        vwap_invalid_bars,
+    )
+    if vwap_invalid_bars:
+        logger.info("VWAP events excluded on invalid bars=%s", vwap_invalid_bars)
     event_counts = {
         "by_family": detected_events["family_id"].value_counts().to_dict() if not detected_events.empty else {},
         "by_type": detected_events["event_type"].value_counts().to_dict() if not detected_events.empty else {},

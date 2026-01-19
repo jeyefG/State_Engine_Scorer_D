@@ -179,9 +179,10 @@ class EventExtractor:
                 reset_mode=reset_mode,
                 vwap_window=self.config.vwap_window,
             )
-            df_sorted[vwap_col] = vwap_sorted
+            df_sorted[vwap_col] = vwap_sorted["vwap"]
             df[vwap_col] = df_sorted.sort_values("_sort_order")[vwap_col].to_numpy()
             df_sorted = df_sorted.drop(columns=["_sort_ts", "_sort_order"])
+            vwap_metadata.update(vwap_sorted["metadata"])
             vwap_nan_pct = float(df[vwap_col].isna().mean() * 100)
             self.logger.info(
                 "VWAP fallback computed: effective_mode=%s cut_hour=%s created_session_id=%s",
@@ -192,10 +193,9 @@ class EventExtractor:
             self.logger.info("VWAP fallback nan_pct=%.2f%%", vwap_nan_pct)
             if created_session_id:
                 df = df.drop(columns=["session_id"])
-            if df[vwap_col].isna().all():
-                raise ValueError(f"Missing VWAP column '{vwap_col}' required for event detection")
         else:
             vwap_metadata["vwap_reset_mode_effective"] = "provided"
+            vwap_metadata["vwap_volume_source"] = "provided"
 
         required = {"open", "high", "low", "close"}
         missing = required - set(df.columns)
@@ -212,6 +212,24 @@ class EventExtractor:
         low = df["low"]
         close = df["close"]
         vwap = df[vwap_col]
+        vwap_valid_mask = vwap.notna()
+        vwap_valid_pct = float(vwap_valid_mask.mean() * 100.0) if len(vwap_valid_mask) else 0.0
+        vwap_invalid_reason = vwap_metadata.get("vwap_invalid_reason")
+        if vwap_invalid_reason is None and not vwap_valid_mask.any():
+            vwap_invalid_reason = "vwap_all_nan"
+        vwap_metadata["vwap_valid_pct"] = vwap_valid_pct
+        if vwap_invalid_reason is not None:
+            vwap_metadata["vwap_invalid_reason"] = vwap_invalid_reason
+        self.logger.info(
+            "VWAP validity: valid_pct=%.2f%% invalid_reason=%s volume_source=%s",
+            vwap_valid_pct,
+            vwap_metadata.get("vwap_invalid_reason"),
+            vwap_metadata.get("vwap_volume_source"),
+        )
+        if not vwap_valid_mask.all():
+            invalid_bars = int((~vwap_valid_mask).sum())
+            self.logger.info("VWAP invalid bars=%s (excluded from VWAP event checks)", invalid_bars)
+            vwap_metadata["vwap_invalid_bars"] = invalid_bars
 
         dist_to_vwap = close - vwap
         abs_dist_to_vwap = dist_to_vwap.abs()
@@ -303,6 +321,7 @@ class EventExtractor:
             if col.startswith("ALLOW_")
             or col.startswith("state_hat_")
             or col.startswith("margin_")
+            or col.startswith("ctx_")
             or col in {"state_hat_ctx", "margin_ctx"}
         ]
         context = df[context_cols] if context_cols else None
@@ -363,16 +382,17 @@ class EventExtractor:
         return events_df
 
 
-def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str, vwap_window: int) -> pd.Series:
+def _compute_vwap(
+    df: pd.DataFrame,
+    *,
+    vwap_col: str,
+    reset_mode: str,
+    vwap_window: int,
+) -> dict[str, object]:
     """
-    VWAP fallback usando el método "validado" (pivot_price + HV con tick_volume).
-
-    Método:
-      - HH = rolling max(high, vwap_win)
-      - LL = rolling min(low, vwap_win)
-      - HV = rolling max(tick_volume, vwap_win)
-      - pivot_price = (HH + LL + close) / 3
-      - vwap = cumsum(pivot_price * HV) / cumsum(HV)
+    VWAP fallback usando el método estándar por sesión:
+      - price = (high + low + close) / 3
+      - vwap = sum(price * volume) / sum(volume)
 
     reset_mode:
       - "cumulative": una sola acumulación en todo el DF
@@ -384,34 +404,49 @@ def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str, vwap_wind
     if missing:
         raise ValueError(f"Missing required OHLC columns for VWAP: {sorted(missing)}")
 
-    # Exigir tick_volume (como pediste). Si no está, no hacemos fallback con volume.
-    if "tick_volume" not in df.columns:
-        raise ValueError(
-            f"Missing VWAP column '{vwap_col}' and no tick_volume available to compute it"
-        )
-
     if reset_mode not in {"daily", "session", "cumulative"}:
         raise ValueError("vwap_reset_mode must be 'daily', 'session', or 'cumulative'")
 
-    vwap_win = max(int(vwap_window), 1)
+    metadata: dict[str, object] = {
+        "vwap_volume_source": None,
+        "vwap_invalid_reason": None,
+    }
+
+    volume_col = None
+    if "real_volume" in df.columns and pd.to_numeric(df["real_volume"], errors="coerce").notna().any():
+        volume_col = "real_volume"
+    elif "tick_volume" in df.columns and pd.to_numeric(df["tick_volume"], errors="coerce").notna().any():
+        volume_col = "tick_volume"
+
+    if volume_col is None:
+        metadata["vwap_invalid_reason"] = "missing_volume_column"
+        return {
+            "vwap": pd.Series(np.nan, index=df.index, name=vwap_col),
+            "metadata": metadata,
+        }
+
+    volume = pd.to_numeric(df[volume_col], errors="coerce").astype(float)
+    if (volume > 0).sum() == 0:
+        metadata["vwap_volume_source"] = volume_col
+        metadata["vwap_invalid_reason"] = "no_positive_volume"
+        return {
+            "vwap": pd.Series(np.nan, index=df.index, name=vwap_col),
+            "metadata": metadata,
+        }
+    metadata["vwap_volume_source"] = volume_col
 
     def _compute_group(g: pd.DataFrame) -> pd.Series:
-        hh = g["high"].rolling(vwap_win, min_periods=1).max()
-        ll = g["low"].rolling(vwap_win, min_periods=1).min()
-        hv = g["tick_volume"].rolling(vwap_win, min_periods=1).max()
-
-        pivot_price = (hh + ll + g["close"]) / 3.0
-        pivot_vol = hv.astype(float)
-
-        cum_vol = pivot_vol.cumsum().replace(0, np.nan)
-        cum_pv = (pivot_price * pivot_vol).cumsum()
-
-        vwap = cum_pv / cum_vol
+        price = (g["high"] + g["low"] + g["close"]) / 3.0
+        vol = pd.to_numeric(g[volume_col], errors="coerce").astype(float)
+        pv = (price * vol).where(vol > 0, 0.0)
+        cum_pv = pv.cumsum()
+        cum_vol = vol.where(vol > 0, 0.0).cumsum()
+        vwap = cum_pv / cum_vol.replace(0, np.nan)
         vwap.name = vwap_col
         return vwap
 
     if reset_mode == "cumulative":
-        return _compute_group(df)
+        return {"vwap": _compute_group(df), "metadata": metadata}
 
     if reset_mode == "session":
         session_col = None
@@ -429,7 +464,7 @@ def _compute_vwap(df: pd.DataFrame, *, vwap_col: str, reset_mode: str, vwap_wind
     # groupby con sort=False para respetar el orden original
     vwap = df.groupby(group_key, sort=False, group_keys=False).apply(_compute_group)
     vwap.name = vwap_col
-    return vwap
+    return {"vwap": vwap, "metadata": metadata}
 
 
 def detect_events(df_m5_ctx: pd.DataFrame, config: EventDetectionConfig | None = None) -> pd.DataFrame:
