@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import pandas as pd
 
+from .config_loader import normalize_phase_d_config
 from .labels import StateLabels
 
 
@@ -19,7 +21,8 @@ class PhaseDConfig:
 def _parse_phase_d_config(symbol_cfg: dict | None) -> PhaseDConfig:
     if not isinstance(symbol_cfg, dict):
         return PhaseDConfig(enabled=False, look_fors=None)
-    phase_d = symbol_cfg.get("phase_d")
+    normalized_cfg = normalize_phase_d_config(deepcopy(symbol_cfg))
+    phase_d = normalized_cfg.get("phase_d")
     if not isinstance(phase_d, dict):
         return PhaseDConfig(enabled=False, look_fors=None)
     enabled = bool(phase_d.get("enabled", False))
@@ -283,26 +286,31 @@ class GatingPolicy:
             )
 
         if logger is not None:
+            def _typed(value: Any) -> dict[str, Any]:
+                return {"value": value, "type": type(value).__name__}
+
+            typed_filters = {
+                "sessions_in": _typed(sessions_in),
+                "state_age_min": _typed(state_age_min),
+                "state_age_max": _typed(state_age_max),
+                "dist_vwap_atr_min": _typed(dist_min),
+                "dist_vwap_atr_max": _typed(dist_max),
+                "breakmag_min": _typed(breakmag_min),
+                "breakmag_max": _typed(breakmag_max),
+                "reentry_min": _typed(reentry_min),
+                "reentry_max": _typed(reentry_max),
+                "margin_min": _typed(margin_min),
+                "margin_max": _typed(margin_max),
+            }
             logger.info(
-                "LOOK_FOR_CONFIG_EFFECTIVE symbol=%s look_for=%s enabled=%s require_all=%s "
-                "sessions_in=%s state_age_min=%s state_age_max=%s dist_vwap_atr_min=%s "
-                "dist_vwap_atr_max=%s breakmag_min=%s breakmag_max=%s reentry_min=%s "
-                "reentry_max=%s margin_min=%s margin_max=%s",
+                "LOOK_FOR_CONFIG_EFFECTIVE symbol=%s look_for=%s base_state=%s enabled=%s "
+                "require_all=%s filters=%s",
                 symbol,
                 look_for_name,
+                rule_cfg.get("base_state"),
                 True,
                 require_all,
-                sessions_in,
-                state_age_min,
-                state_age_max,
-                dist_min,
-                dist_max,
-                breakmag_min,
-                breakmag_max,
-                reentry_min,
-                reentry_max,
-                margin_min,
-                margin_max,
+                typed_filters,
             )
 
         if not masks:

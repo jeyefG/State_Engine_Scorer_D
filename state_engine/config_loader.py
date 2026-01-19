@@ -8,6 +8,20 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+PHASE_D_FILTER_FIELDS = (
+    "sessions_in",
+    "state_age_min",
+    "state_age_max",
+    "dist_vwap_atr_min",
+    "dist_vwap_atr_max",
+    "breakmag_min",
+    "breakmag_max",
+    "reentry_min",
+    "reentry_max",
+    "margin_min",
+    "margin_max",
+)
+
 
 def deep_merge(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge overrides onto defaults."""
@@ -43,11 +57,15 @@ def load_config(path: str | Path) -> dict[str, Any]:
 
     if suffix in {".yaml", ".yml"}:
         if not has_yaml:
-            raise RuntimeError(
-                "PyYAML not installed; use a .json config or install PyYAML."
-            )
-        import yaml
-        data = yaml.safe_load(raw_text) or {}
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "PyYAML not installed; use a .json config or install PyYAML."
+                ) from exc
+        else:
+            import yaml
+            data = yaml.safe_load(raw_text) or {}
 
     elif suffix == ".json":
         data = json.loads(raw_text)
@@ -64,7 +82,35 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("Config root must be a mapping.")
 
     _validate_config(data)
+    normalize_phase_d_config(data)
     return data
+
+
+def normalize_phase_d_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Phase D look_for configs so filters are always populated."""
+    phase_d = config.get("phase_d")
+    if not isinstance(phase_d, dict):
+        return config
+    look_fors = phase_d.get("look_fors")
+    if not isinstance(look_fors, dict):
+        return config
+
+    normalized: dict[str, Any] = {}
+    for look_for_name, rule_cfg in look_fors.items():
+        if not isinstance(rule_cfg, dict):
+            normalized[look_for_name] = rule_cfg
+            continue
+        filters_cfg = rule_cfg.get("filters")
+        filters: dict[str, Any] = deepcopy(filters_cfg) if isinstance(filters_cfg, dict) else {}
+        for key in PHASE_D_FILTER_FIELDS:
+            if key in rule_cfg and rule_cfg[key] is not None:
+                filters[key] = rule_cfg[key]
+        rule_copy = deepcopy(rule_cfg)
+        rule_copy["filters"] = filters
+        normalized[look_for_name] = rule_copy
+
+    phase_d["look_fors"] = normalized
+    return config
 
 def _validate_config(config: dict[str, Any]) -> None:
     if "symbol" in config:
