@@ -587,8 +587,10 @@ def _write_vwap_diagnostic_plot(
     if reset_mode == "session":
         session_key = df["session_id"] if "session_id" in df.columns else df["session"]
     else:
-        session_key = pd.Series(df.index.date, index=df.index)
-    if len(session_key) == 0:
+        session_key = df.index.date
+    if not isinstance(session_key, pd.Series):
+        session_key = pd.Series(session_key, index=df.index)
+    if session_key.empty:
         logger.warning("VWAP diagnostic plot skipped: no session key available.")
         return None
     last_session = session_key.iloc[-1]
