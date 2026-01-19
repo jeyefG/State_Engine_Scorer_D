@@ -43,6 +43,58 @@ Notas:
 - También se guarda un CSV opcional en `state_engine/models/metrics_{symbol}_event_scorer.csv`.
 ```
 
+### Telemetría Event Scorer (screen/triage/files)
+
+El trainer ahora permite elegir el nivel de telemetría de consola (y manda el detalle a CSV/JSON):
+
+```bash
+python scripts/train_event_scorer.py \
+  --symbol XAUUSD \
+  --start 2024-01-01 \
+  --end 2025-12-31 \
+  --telemetry screen
+```
+
+Ejemplo `--telemetry=screen` (máximo ~25 líneas):
+
+```
+RUN 20250712T120000Z_ab12cd34 | symbol=XAUUSD mode=production score_tf=M5 context_tf=H1 k_bars=24 start=2024-01-01 end=2025-12-31 cutoffs:ctx=2025-12-31 23:00:00 score=2025-12-31 23:55:00
+Funnel: score_total=198720 after_merge=198702 after_ctx_dropna=198690 events_detected=8421 events_labeled=8210 events_post_state_filter=8012 events_post_meta=6420
+VWAP validity: valid_pct_all=99.82% valid_pct_last_session=94.50% WARN
+Baseline r_mean (post-filter): BALANCE n=3120 r_mean=0.0123 | TREND n=4010 r_mean=0.0189 | TRANSITION n=882 r_mean=-0.0041
+Scorer vs baseline: delta_r_mean@20=0.0214 lift@20_ratio=1.18 spearman=0.0831 verdict=EDGE
+Best regime: BALANCE|m0|ALLOW_none|FAM1|E_NEAR_VWAP n=420 delta_r_mean@20=0.1123 flag=WIN
+Worst regime: TREND|m2|ALLOW_none|FAM3|E_REJECTION_VWAP n=260 delta_r_mean@20=-0.0542 flag=LOSE|RANK_INVERTED
+```
+
+Ejemplo `--telemetry=triage` (máximo ~60 líneas):
+
+```
+RUN 20250712T120000Z_ab12cd34 | symbol=XAUUSD mode=production score_tf=M5 context_tf=H1 k_bars=24 start=2024-01-01 end=2025-12-31 cutoffs:ctx=2025-12-31 23:00:00 score=2025-12-31 23:55:00
+Top 5 regimes by delta_r_mean@20:
++ BALANCE|m0|ALLOW_none|FAM1|E_NEAR_VWAP n=420 delta_r_mean@20=0.1123 flag=WIN
++ TREND|m1|ALLOW_trend_pullback|FAM2|E_TOUCH_VWAP n=310 delta_r_mean@20=0.0844 flag=WIN
++ TRANSITION|m2|ALLOW_none|FAM4|E_NEAR_VWAP n=220 delta_r_mean@20=0.0660 flag=WIN
++ BALANCE|m1|ALLOW_balance_fade|FAM1|E_REJECTION_VWAP n=190 delta_r_mean@20=0.0552 flag=MIXED
++ TREND|m0|ALLOW_none|FAM2|E_NEAR_VWAP n=175 delta_r_mean@20=0.0410 flag=MIXED
+Bottom 5 regimes by delta_r_mean@20:
+- TREND|m2|ALLOW_none|FAM3|E_REJECTION_VWAP n=260 delta_r_mean@20=-0.0542 flag=LOSE|RANK_INVERTED
+- BALANCE|m2|ALLOW_balance_fade|FAM1|E_TOUCH_VWAP n=210 delta_r_mean@20=-0.0419 flag=LOSE
+- TRANSITION|m1|ALLOW_none|FAM5|E_NEAR_VWAP n=180 delta_r_mean@20=-0.0320 flag=LOSE
+- BALANCE|m0|ALLOW_none|FAM4|E_REJECTION_VWAP n=150 delta_r_mean@20=-0.0267 flag=LOSE
+- TREND|m1|ALLOW_trend_pullback|FAM2|E_REJECTION_VWAP n=140 delta_r_mean@20=-0.0188 flag=LOSE
+Inverted ranks: 1/28
+Stability (top 5 regimes):
+* BALANCE|m0|ALLOW_none|FAM1|E_NEAR_VWAP | 2025H1 n=150 r_mean@20=0.0981 | 2025H2 n=170 r_mean@20=0.1066 | 2026YTD n=100 r_mean@20=0.1210
+* TREND|m1|ALLOW_trend_pullback|FAM2|E_TOUCH_VWAP | 2025H1 n=110 r_mean@20=0.0701 | 2025H2 n=120 r_mean@20=0.0812 | 2026YTD n=80 r_mean@20=0.0884
+* TRANSITION|m2|ALLOW_none|FAM4|E_NEAR_VWAP | 2025H1 n=80 r_mean@20=0.0590 | 2025H2 n=90 r_mean@20=0.0623 | 2026YTD n=50 r_mean@20=0.0681
+* BALANCE|m1|ALLOW_balance_fade|FAM1|E_REJECTION_VWAP | 2025H1 n=70 r_mean@20=0.0449 | 2025H2 n=65 r_mean@20=0.0495 | 2026YTD n=55 r_mean@20=0.0512
+* TREND|m0|ALLOW_none|FAM2|E_NEAR_VWAP | 2025H1 n=60 r_mean@20=0.0380 | 2025H2 n=58 r_mean@20=0.0401 | 2026YTD n=40 r_mean@20=0.0433
+Family training status: TRAINED=5 | SKIP_FAMILY_LOW_SAMPLES=2 | SKIP_FAMILY_SINGLE_CLASS=1
+```
+
+`--telemetry=files` no imprime extra en consola; todo el detalle se guarda en CSV + `summary_*.json`.
+
 ### Configuración por símbolo (Event Scorer)
 
 Puedes definir overrides por símbolo en YAML/JSON sin romper la CLI actual. Si no pasas `--config`,

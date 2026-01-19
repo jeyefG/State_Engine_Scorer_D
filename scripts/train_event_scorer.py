@@ -116,6 +116,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Habilitar modo Fase E (telemetría sin decisiones ni thresholds).",
     )
+    parser.add_argument(
+        "--telemetry",
+        default="screen",
+        choices=["screen", "triage", "files"],
+        help="Nivel de telemetría (screen, triage, files).",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (INFO, DEBUG, WARNING)")
     parser.add_argument(
         "--vwap-check-date",
@@ -757,6 +763,47 @@ def _format_metric(value: float) -> str:
         return "nan"
     return f"{value:.4f}"
 
+
+def _format_pct(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "nan"
+    return f"{value:.2f}%"
+
+
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float:
+    if numerator is None or denominator in (None, 0) or pd.isna(denominator):
+        return float("nan")
+    return float(numerator) / float(denominator)
+
+
+def _vwap_validity_summary(
+    ohlcv_score: pd.DataFrame,
+    event_config: EventDetectionConfig,
+) -> dict[str, float]:
+    if ohlcv_score.empty:
+        return {"valid_pct_all": float("nan"), "valid_pct_last_session": float("nan")}
+    df = ohlcv_score.copy()
+    vwap_series = compute_vwap_mt5_daily(
+        df,
+        high_col="high",
+        low_col="low",
+        close_col="close",
+        real_vol_col="volume",
+        tick_vol_col="tick_volume",
+        tz_server=event_config.vwap_tz_server,
+    )
+    if vwap_series is None or vwap_series.empty:
+        return {"valid_pct_all": float("nan"), "valid_pct_last_session": float("nan")}
+    vwap_valid_mask = vwap_series.notna()
+    valid_pct_all = float(vwap_valid_mask.mean() * 100.0) if len(vwap_valid_mask) else float("nan")
+    day_id = mt5_day_id(df, tz_server=event_config.vwap_tz_server)
+    if day_id.empty:
+        return {"valid_pct_all": valid_pct_all, "valid_pct_last_session": float("nan")}
+    last_session = day_id.iloc[-1]
+    session_mask = day_id == last_session
+    valid_pct_last = float(vwap_valid_mask[session_mask].mean() * 100.0) if session_mask.any() else float("nan")
+    return {"valid_pct_all": valid_pct_all, "valid_pct_last_session": valid_pct_last}
+
 def _conditional_edge_regime_table(
     events_diag: pd.DataFrame,
     pseudo_col: str,
@@ -1260,7 +1307,7 @@ def _print_research_summary_block(
     *,
     state_col: str,
     phase_e: bool,
-) -> None:
+) -> dict[str, object]:
     min_n = 150
     min_r_mean = 0.05
     min_winrate = 0.55
@@ -1284,34 +1331,16 @@ def _print_research_summary_block(
             .head(5)
             .reset_index(drop=True)
         )
-    print("\n=== SYMBOL SPECIALIZATION RESEARCH SUMMARY ===")
-    if phase_e:
-        print("phase_e=ON (telemetry only; no decision / gating)")
-    else:
-        print(
-            "qualified_session_buckets={count} (n>={n_min}, r_mean>={r_min}, winrate>={w_min})".format(
-                count=qualifying_count,
-                n_min=min_n,
-                r_min=min_r_mean,
-                w_min=min_winrate,
-            )
-        )
-    print("top_5_cells_by_r_mean:")
-    if top_rows.empty:
-        print("(no candidates)")
-    else:
-        for _, row in top_rows.iterrows():
-            cell = f"{row['family_id']} | {row[state_col]} | {row['margin_bin']} | {row['pf_session_bucket']}"
-            print(cell)
-    if phase_e:
-        print("verdict=TELEMETRY_ONLY")
-    else:
-        verdict = (
-            "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
-            if qualifying_count > 0
-            else "NO LOCAL EDGE DETECTED"
-        )
-        print(f"verdict={verdict}")
+    verdict = "TELEMETRY_ONLY" if phase_e else (
+        "LOCAL EDGE DETECTED — CANDIDATE FOR PROD SPECIALIZATION"
+        if qualifying_count > 0
+        else "NO LOCAL EDGE DETECTED"
+    )
+    return {
+        "qualified_session_buckets": qualifying_count,
+        "top_5_cells_by_r_mean": top_rows.to_dict(orient="records"),
+        "verdict": verdict,
+    }
 
 
 def _save_model_if_ready(
@@ -1725,24 +1754,8 @@ def _build_training_diagnostic_report(
     for frame in base_frames:
         numeric_cols = frame.select_dtypes(include=[np.number]).columns
         frame[numeric_cols] = frame[numeric_cols].round(4)
-    print("=== TRAINING DIAGNOSTIC REPORT ===")
-    print(_format_table_block("Coverage (global)", coverage_global))
-    print(_format_table_block("Coverage (by state x margin_bin)", coverage_by))
-    print(_format_table_block("Regime Edge (full)", regime_full))
-    print(_format_table_block("Regime Edge (top 10 / bottom 10 by r_mean)", regime_ranked))
-    print(_format_table_block("Stability temporal (regime edge por split)", stability))
-    if not phase_e:
-        print(_format_table_block("Decision", decision))
-    print(_format_table_block("Session-Conditional Edge", session_edge))
-    for pseudo_col in PSEUDO_FEATURES.keys():
-        print(_format_table_block(f"Redistribution (family x {pseudo_col})", report[f"redistribution_{pseudo_col}"]))
-        print(_format_table_block(f"Conditional Edge (family x {pseudo_col})", report[f"conditional_edge_{pseudo_col}"]))
-        print(_format_table_block(f"Stability temporal (family x {pseudo_col})", report[f"stability_{pseudo_col}"]))
-        print(_format_table_block(f"Conditional Edge REGIME (state x margin x allow x family x {pseudo_col})", report[f"conditional_edge_regime_{pseudo_col}"]))
     if df_score_ctx is not None:
-        session_table = _session_bucket_distribution(df_score_ctx)
-        score_tf_label = getattr(thresholds, "score_tf", "UNKNOWN")
-        print(_format_table_block(f"Session Bucket Distribution ({score_tf_label})", session_table))
+        report["session_bucket_distribution"] = _session_bucket_distribution(df_score_ctx)
     return report
 
 
@@ -1773,6 +1786,7 @@ def _persist_diagnostic_tables(
         "regime_edge_ranked": diagnostic_report.get("regime_edge_ranked", pd.DataFrame()),
         "stability": diagnostic_report.get("stability", pd.DataFrame()),
         "session_conditional_edge": diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
+        "session_bucket_distribution": diagnostic_report.get("session_bucket_distribution", pd.DataFrame()),
         "supply_funnel": supply_funnel,
     }
     for name, frame in tables.items():
@@ -1796,6 +1810,205 @@ def _persist_diagnostic_tables(
         logger.info("%s_out=%s", name, output_path)
 
 
+def _baseline_state_summary(events_df: pd.DataFrame) -> dict[str, dict[str, float | int]]:
+    summary: dict[str, dict[str, float | int]] = {}
+    for state_name in ["BALANCE", "TREND", "TRANSITION"]:
+        state_mask = events_df["state_label"] == state_name if "state_label" in events_df.columns else []
+        state_events = events_df.loc[state_mask] if len(state_mask) else pd.DataFrame()
+        n_events = int(len(state_events))
+        r_mean = float(state_events["r_outcome"].mean()) if n_events else float("nan")
+        summary[state_name] = {"n": n_events, "r_mean": r_mean}
+    return summary
+
+
+def _scorer_vs_baseline_summary(metrics_df: pd.DataFrame, *, phase_e: bool) -> dict[str, float | str]:
+    if metrics_df.empty or "model" not in metrics_df.columns:
+        return {
+            "delta_r_mean@20": float("nan"),
+            "lift@20_ratio": float("nan"),
+            "spearman": float("nan"),
+            "verdict": "NO_DATA",
+        }
+    scorer_row = metrics_df.loc[metrics_df["model"] == "SCORER"]
+    baseline_row = metrics_df.loc[metrics_df["model"] == "BASELINE"]
+    scorer = scorer_row.iloc[0] if not scorer_row.empty else metrics_df.iloc[0]
+    baseline = baseline_row.iloc[0] if not baseline_row.empty else None
+    delta_r = float(scorer.get("r_mean@20", float("nan")))
+    if baseline is not None:
+        delta_r = float(scorer.get("r_mean@20", float("nan"))) - float(baseline.get("r_mean@20", float("nan")))
+    lift_ratio = _safe_ratio(
+        float(scorer.get("lift@20", float("nan"))),
+        float(baseline.get("lift@20", float("nan"))) if baseline is not None else None,
+    )
+    spearman = float(scorer.get("spearman", float("nan")))
+    if phase_e:
+        verdict = "TELEMETRY_ONLY"
+    elif pd.notna(delta_r) and pd.notna(lift_ratio) and pd.notna(spearman):
+        verdict = "EDGE" if (delta_r > 0 and lift_ratio >= 1.0 and spearman > 0) else "NO_EDGE"
+    else:
+        verdict = "NO_DATA"
+    return {
+        "delta_r_mean@20": delta_r,
+        "lift@20_ratio": lift_ratio,
+        "spearman": spearman,
+        "verdict": verdict,
+    }
+
+
+def _best_worst_regimes(regime_df: pd.DataFrame) -> tuple[dict[str, object], dict[str, object]]:
+    empty = {"regime_id": "NA", "n": 0, "delta_r_mean@20": float("nan"), "flag": "NA"}
+    if regime_df.empty:
+        return empty, empty
+    best_idx = regime_df["delta_r_mean@20"].idxmax()
+    worst_idx = regime_df["delta_r_mean@20"].idxmin()
+    best_row = regime_df.loc[best_idx]
+    worst_row = regime_df.loc[worst_idx]
+    best = {
+        "regime_id": best_row["regime_id"],
+        "n": int(best_row.get("samples_calib", 0)),
+        "delta_r_mean@20": float(best_row.get("delta_r_mean@20", float("nan"))),
+        "flag": best_row.get("flag", "NA"),
+    }
+    worst = {
+        "regime_id": worst_row["regime_id"],
+        "n": int(worst_row.get("samples_calib", 0)),
+        "delta_r_mean@20": float(worst_row.get("delta_r_mean@20", float("nan"))),
+        "flag": worst_row.get("flag", "NA"),
+    }
+    return best, worst
+
+
+def _emit_screen_telemetry(
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    mode: str,
+    k_bars: int,
+    allow_cutoff: pd.Timestamp,
+    score_cutoff: pd.Timestamp,
+    supply_funnel: dict[str, int],
+    vwap_summary: dict[str, float],
+    baseline_summary: dict[str, dict[str, float | int]],
+    scorer_summary: dict[str, float | str],
+    best_regime: dict[str, object],
+    worst_regime: dict[str, object],
+) -> None:
+    header = (
+        f"RUN {run_id} | symbol={args.symbol} mode={mode} "
+        f"score_tf={args.score_tf} context_tf={args.context_tf} k_bars={k_bars} "
+        f"start={args.start} end={args.end} "
+        f"cutoffs:ctx={allow_cutoff} score={score_cutoff}"
+    )
+    print(header)
+    funnel_line = (
+        "Funnel: score_total={score_total} after_merge={after_merge} after_ctx_dropna={after_ctx_dropna} "
+        "events_detected={events_detected} events_labeled={events_labeled} "
+        "events_post_state_filter={events_post_state_filter} events_post_meta={events_post_meta}"
+    ).format(**supply_funnel)
+    print(funnel_line)
+    vwap_valid_all = vwap_summary.get("valid_pct_all")
+    vwap_valid_last = vwap_summary.get("valid_pct_last_session")
+    warn_flag = " WARN" if pd.notna(vwap_valid_last) and vwap_valid_last < 95 else ""
+    print(
+        "VWAP validity: valid_pct_all={all_pct} valid_pct_last_session={last_pct}{warn}".format(
+            all_pct=_format_pct(vwap_valid_all),
+            last_pct=_format_pct(vwap_valid_last),
+            warn=warn_flag,
+        )
+    )
+    baseline_line = "Baseline r_mean (post-filter): "
+    parts = []
+    for state_name in ["BALANCE", "TREND", "TRANSITION"]:
+        stats = baseline_summary.get(state_name, {"n": 0, "r_mean": float("nan")})
+        parts.append(
+            f"{state_name} n={stats['n']} r_mean={_format_metric(float(stats['r_mean']))}"
+        )
+    print(baseline_line + " | ".join(parts))
+    print(
+        "Scorer vs baseline: delta_r_mean@20={delta} lift@20_ratio={lift} spearman={spear} verdict={verdict}".format(
+            delta=_format_metric(float(scorer_summary.get("delta_r_mean@20", float("nan")))),
+            lift=_format_metric(float(scorer_summary.get("lift@20_ratio", float("nan")))),
+            spear=_format_metric(float(scorer_summary.get("spearman", float("nan")))),
+            verdict=scorer_summary.get("verdict", "NA"),
+        )
+    )
+    print(
+        "Best regime: {regime} n={n} delta_r_mean@20={delta} flag={flag}".format(
+            regime=best_regime.get("regime_id", "NA"),
+            n=best_regime.get("n", 0),
+            delta=_format_metric(float(best_regime.get("delta_r_mean@20", float("nan")))),
+            flag=best_regime.get("flag", "NA"),
+        )
+    )
+    print(
+        "Worst regime: {regime} n={n} delta_r_mean@20={delta} flag={flag}".format(
+            regime=worst_regime.get("regime_id", "NA"),
+            n=worst_regime.get("n", 0),
+            delta=_format_metric(float(worst_regime.get("delta_r_mean@20", float("nan")))),
+            flag=worst_regime.get("flag", "NA"),
+        )
+    )
+
+
+def _emit_triage_telemetry(
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    mode: str,
+    k_bars: int,
+    allow_cutoff: pd.Timestamp,
+    score_cutoff: pd.Timestamp,
+    top_regimes: pd.DataFrame,
+    bottom_regimes: pd.DataFrame,
+    inverted_count: int,
+    evaluated_regimes: int,
+    stability_summary: dict[str, dict[str, dict[str, float | int]]],
+    family_status_counts: dict[str, int],
+) -> None:
+    header = (
+        f"RUN {run_id} | symbol={args.symbol} mode={mode} "
+        f"score_tf={args.score_tf} context_tf={args.context_tf} k_bars={k_bars} "
+        f"start={args.start} end={args.end} "
+        f"cutoffs:ctx={allow_cutoff} score={score_cutoff}"
+    )
+    print(header)
+    print("Top 5 regimes by delta_r_mean@20:")
+    if top_regimes.empty:
+        print("(no regimes)")
+    else:
+        for _, row in top_regimes.iterrows():
+            print(
+                f"+ {row['regime_id']} n={int(row['samples_calib'])} "
+                f"delta_r_mean@20={_format_metric(float(row['delta_r_mean@20']))} flag={row['flag']}"
+            )
+    print("Bottom 5 regimes by delta_r_mean@20:")
+    if bottom_regimes.empty:
+        print("(no regimes)")
+    else:
+        for _, row in bottom_regimes.iterrows():
+            print(
+                f"- {row['regime_id']} n={int(row['samples_calib'])} "
+                f"delta_r_mean@20={_format_metric(float(row['delta_r_mean@20']))} flag={row['flag']}"
+            )
+    print(f"Inverted ranks: {inverted_count}/{evaluated_regimes}")
+    print("Stability (top 5 regimes):")
+    if not stability_summary:
+        print("(no stability data)")
+    else:
+        for regime_id, splits in stability_summary.items():
+            parts = []
+            for split_name in ["2025H1", "2025H2", "2026YTD"]:
+                split_stats = splits.get(split_name, {})
+                n_val = int(split_stats.get("n", 0))
+                r_mean = _format_metric(float(split_stats.get("r_mean@20", float("nan"))))
+                parts.append(f"{split_name} n={n_val} r_mean@20={r_mean}")
+            print(f"* {regime_id} | " + " | ".join(parts))
+    status_line = "Family training status: " + " | ".join(
+        f"{status}={count}" for status, count in family_status_counts.items()
+    )
+    print(status_line)
+
+
 def _run_training_for_k(
     args: argparse.Namespace,
     k_bars: int,
@@ -1815,6 +2028,7 @@ def _run_training_for_k(
     score_ctx_dropna: int,
     allow_cutoff: pd.Timestamp,
     score_cutoff: pd.Timestamp,
+    vwap_summary: dict[str, float],
     min_samples_train: int,
     seed: int,
     scorer_out_base: Path,
@@ -1834,19 +2048,17 @@ def _run_training_for_k(
 ) -> tuple[pd.DataFrame, pd.DataFrame | None] | None:
     logger = logging.getLogger("event_scorer")
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
-    print(
-        "symbol={symbol} start={start} end={end} k_bars={k} reward_r={reward} sl_mult={sl} r_thr={thr} "
-        "meta_policy={meta} include_transition={include_transition}".format(
-            symbol=args.symbol,
-            start=args.start,
-            end=args.end,
-            k=k_bars,
-            reward=args.reward_r,
-            sl=args.sl_mult,
-            thr=args.r_thr,
-            meta=args.meta_policy,
-            include_transition=args.include_transition,
-        )
+    logger.debug(
+        "Train config | symbol=%s start=%s end=%s k_bars=%s reward_r=%s sl_mult=%s r_thr=%s meta_policy=%s include_transition=%s",
+        args.symbol,
+        args.start,
+        args.end,
+        k_bars,
+        args.reward_r,
+        args.sl_mult,
+        args.r_thr,
+        args.meta_policy,
+        args.include_transition,
     )
 
     def _base_summary_payload(verdict: str) -> dict[str, object]:
@@ -1892,6 +2104,80 @@ def _run_training_for_k(
             "context_nan_pct": context_nan_pct,
         }
 
+    def _emit_telemetry(
+        *,
+        supply_funnel_payload: dict[str, int],
+        baseline_summary: dict[str, dict[str, float | int]],
+        scorer_summary: dict[str, float | str],
+        regime_df: pd.DataFrame,
+        family_summary: pd.DataFrame,
+        scores: pd.Series | None = None,
+        r_outcome: pd.Series | None = None,
+        regime_series: pd.Series | None = None,
+    ) -> None:
+        if args.telemetry == "files":
+            return
+        best_regime, worst_regime = _best_worst_regimes(regime_df)
+        if args.telemetry == "screen":
+            _emit_screen_telemetry(
+                args=args,
+                run_id=run_id,
+                mode=mode_effective,
+                k_bars=k_bars,
+                allow_cutoff=allow_cutoff,
+                score_cutoff=score_cutoff,
+                supply_funnel=supply_funnel_payload,
+                vwap_summary=vwap_summary,
+                baseline_summary=baseline_summary,
+                scorer_summary=scorer_summary,
+                best_regime=best_regime,
+                worst_regime=worst_regime,
+            )
+            return
+        top_regimes = (
+            regime_df.sort_values("delta_r_mean@20", ascending=False).head(5)
+            if not regime_df.empty
+            else pd.DataFrame()
+        )
+        bottom_regimes = (
+            regime_df.sort_values("delta_r_mean@20", ascending=True).head(5)
+            if not regime_df.empty
+            else pd.DataFrame()
+        )
+        inverted_count = int(regime_df["flag"].str.contains("RANK_INVERTED", na=False).sum()) if not regime_df.empty else 0
+        evaluated_regimes = int(len(regime_df))
+        stability_summary: dict[str, dict[str, dict[str, float | int]]] = {}
+        if scores is not None and r_outcome is not None and regime_series is not None and not top_regimes.empty:
+            for regime_id in top_regimes["regime_id"]:
+                split_stats: dict[str, dict[str, float | int]] = {}
+                for split_name, start_ts, end_ts in _pseudo_temporal_splits():
+                    split_mask = (scores.index >= start_ts) & (scores.index <= end_ts)
+                    regime_mask = regime_series == regime_id
+                    idx = scores.index[split_mask & regime_mask]
+                    n_samples = int(len(idx))
+                    r_mean_20 = mean_r_topk(scores.loc[idx], r_outcome.loc[idx], 20) if n_samples else float("nan")
+                    split_stats[split_name] = {"n": n_samples, "r_mean@20": r_mean_20}
+                stability_summary[str(regime_id)] = split_stats
+        status_counts = (
+            family_summary["status"].value_counts().to_dict()
+            if "status" in family_summary.columns and not family_summary.empty
+            else {}
+        )
+        _emit_triage_telemetry(
+            args=args,
+            run_id=run_id,
+            mode=mode_effective,
+            k_bars=k_bars,
+            allow_cutoff=allow_cutoff,
+            score_cutoff=score_cutoff,
+            top_regimes=top_regimes,
+            bottom_regimes=bottom_regimes,
+            inverted_count=inverted_count,
+            evaluated_regimes=evaluated_regimes,
+            stability_summary=stability_summary,
+            family_status_counts=status_counts,
+        )
+
     events = label_events(
         detected_events.copy(),
         ohlcv_score,
@@ -1916,9 +2202,9 @@ def _run_training_for_k(
         events_diag.index = pd.DatetimeIndex([])
         is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
         if is_fallback:
-            print(
-                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
-                f"{args.fallback_min_samples} ==="
+            logger.warning(
+                "Fallback diagnostics: events_total_post_meta=0 < fallback_min_samples=%s",
+                args.fallback_min_samples,
             )
         diagnostic_report = _build_training_diagnostic_report(
             events_diag,
@@ -1940,6 +2226,15 @@ def _run_training_for_k(
                 }
             ]
         )
+        supply_funnel_payload = {
+            "score_total": score_total,
+            "after_merge": score_ctx_merged,
+            "after_ctx_dropna": score_ctx_dropna,
+            "events_detected": len(detected_events),
+            "events_labeled": labeled_total,
+            "events_post_state_filter": 0,
+            "events_post_meta": 0,
+        }
         _persist_diagnostic_tables(
             diagnostic_report=diagnostic_report,
             supply_funnel=supply_funnel,
@@ -1968,6 +2263,13 @@ def _run_training_for_k(
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary_payload, handle, indent=2, default=str)
         logger.info("summary_out=%s", summary_path)
+        _emit_telemetry(
+            supply_funnel_payload=supply_funnel_payload,
+            baseline_summary=_baseline_state_summary(pd.DataFrame()),
+            scorer_summary=_scorer_vs_baseline_summary(pd.DataFrame(), phase_e=args.phase_e),
+            regime_df=pd.DataFrame(),
+            family_summary=pd.DataFrame(),
+        )
         if research_mode:
             _print_research_summary_block(
                 diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
@@ -2040,10 +2342,8 @@ def _run_training_for_k(
     pseudo_encoded = _encode_pseudo_features(pseudo_features)
     event_features_all = pd.concat([event_features_all, pseudo_encoded], axis=1)
 
-    print("\n[STATE MIX | EVENTS POST FILTER]")
     state_counts_events = events_state_filtered["state_label"].value_counts()
-    for line in _format_state_mix(state_counts_events, ["BALANCE", "TREND", "TRANSITION"]):
-        print(line)
+    logger.debug("State mix (post filter): %s", state_counts_events.to_dict())
 
     vwap_mode = _resolve_vwap_report_mode(detected_events, df_score_ctx, event_config)
     vwap_real_col = detected_events.attrs.get("vwap_real_volume_col")
@@ -2051,27 +2351,15 @@ def _run_training_for_k(
     vwap_price_cols = detected_events.attrs.get("vwap_price_columns")
     dist_abs = events_all["dist_to_vwap_atr"].abs()
     vwap_quantiles = dist_abs.quantile([0.1, 0.5, 0.9, 0.99]).to_dict() if not dist_abs.empty else {}
-    print("\n[VWAP SANITY]")
-    print(
-        "vwap_mode="
-        f"{vwap_mode} near_vwap_atr={event_config.near_vwap_atr} "
-        f"price_cols={vwap_price_cols} real_vol_col={vwap_real_col} tick_vol_col={vwap_tick_col}"
+    logger.debug(
+        "VWAP sanity | mode=%s near_vwap_atr=%s price_cols=%s real_vol_col=%s tick_vol_col=%s dist_q=%s",
+        vwap_mode,
+        event_config.near_vwap_atr,
+        vwap_price_cols,
+        vwap_real_col,
+        vwap_tick_col,
+        {k: round(v, 4) for k, v in vwap_quantiles.items()} if vwap_quantiles else {},
     )
-    if vwap_quantiles:
-        print("dist_to_vwap_atr_abs_q=" + str({k: round(v, 4) for k, v in vwap_quantiles.items()}))
-
-    print("\n[BASELINE BY STATE | POST FILTER]")
-    for state_name in ["BALANCE", "TREND", "TRANSITION"]:
-        state_mask = events_state_filtered["state_label"] == state_name
-        state_events = events_state_filtered.loc[state_mask]
-        trades = len(state_events)
-        winrate = float(state_events["label"].mean()) if trades else float("nan")
-        avg_pnl = float(state_events["r_outcome"].mean()) if trades else float("nan")
-        total_pnl = float(state_events["r_outcome"].sum()) if trades else float("nan")
-        print(
-            f"{state_name}: trades={trades}, winrate={_format_metric(winrate)}, "
-            f"avg_pnl={_format_metric(avg_pnl)}, total_pnl={_format_metric(total_pnl)}"
-        )
 
     meta_policy_on = args.meta_policy == "on"
     if args.phase_e and meta_policy_on:
@@ -2084,10 +2372,7 @@ def _run_training_for_k(
     )
     allow_active_pct = float(allow_active_series.mean() * 100) if len(allow_active_series) else 0.0
     allow_id_top = events_state_filtered["allow_id"].value_counts().head(10)
-    print("\n[ALLOW SANITY]")
-    print(f"allow_active_pct={allow_active_pct:.2f}%")
-    if not allow_id_top.empty:
-        print("allow_id_top:\n" + allow_id_top.to_string())
+    logger.debug("Allow sanity | allow_active_pct=%.2f allow_id_top=%s", allow_active_pct, allow_id_top.to_dict())
     margin_ok_series = events_state_filtered[args.context_margin_col].between(
         args.meta_margin_min,
         args.meta_margin_max,
@@ -2143,14 +2428,17 @@ def _run_training_for_k(
 
     events_for_training = events_meta if meta_policy_on else events_state_filtered
     events = events_for_training
-    print("\n[SUPPLY FUNNEL]")
-    print(f"score_total={score_total}")
-    print(f"after_merge={score_ctx_merged}")
-    print(f"after_ctx_dropna={score_ctx_dropna}")
-    print(f"events_detected={len(detected_events)}")
-    print(f"events_labeled={labeled_total}")
-    print(f"events_post_state_filter={len(events_state_filtered)}")
-    print(f"events_post_meta={len(events_for_training)}")
+    logger.debug(
+        "Supply funnel | score_total=%s after_merge=%s after_ctx_dropna=%s events_detected=%s "
+        "events_labeled=%s events_post_state_filter=%s events_post_meta=%s",
+        score_total,
+        score_ctx_merged,
+        score_ctx_dropna,
+        len(detected_events),
+        labeled_total,
+        len(events_state_filtered),
+        len(events_for_training),
+    )
     required_columns = {"state_label", "allow_id", args.context_margin_col, "r_outcome", "label"}
     missing_columns = sorted(required_columns - set(events_for_training.columns))
     if missing_columns:
@@ -2185,9 +2473,10 @@ def _run_training_for_k(
         fallback_reasons.append("single_class_labels")
     is_fallback = bool(fallback_reasons)
     if is_fallback:
-        print(
-            "=== FALLBACK DIAGNÓSTICO: events_total_post_meta="
-            f"{events_total_post_meta} reasons={','.join(fallback_reasons)} ==="
+        logger.warning(
+            "Fallback diagnostics: events_total_post_meta=%s reasons=%s",
+            events_total_post_meta,
+            ",".join(fallback_reasons),
         )
     diagnostic_report = _build_training_diagnostic_report(
         events_diag,
@@ -2275,8 +2564,7 @@ def _run_training_for_k(
                 "p10": float(r_values.quantile(0.1)),
                 "p90": float(r_values.quantile(0.9)),
             }
-            print("\n[FALLBACK METRICS]")
-            print(pd.DataFrame([summary]).to_string(index=False))
+            logger.debug("Fallback metrics: %s", summary)
         summary_payload = _base_summary_payload(
             "TELEMETRY_ONLY" if args.phase_e else "FALLBACK_DIAGNOSTIC"
         )
@@ -2287,6 +2575,22 @@ def _run_training_for_k(
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary_payload, handle, indent=2, default=str)
         logger.info("summary_out=%s", summary_path)
+        supply_funnel_payload = {
+            "score_total": score_total,
+            "after_merge": score_ctx_merged,
+            "after_ctx_dropna": score_ctx_dropna,
+            "events_detected": len(detected_events),
+            "events_labeled": labeled_total,
+            "events_post_state_filter": len(events_state_filtered),
+            "events_post_meta": len(events_for_training),
+        }
+        _emit_telemetry(
+            supply_funnel_payload=supply_funnel_payload,
+            baseline_summary=_baseline_state_summary(events_state_filtered),
+            scorer_summary=_scorer_vs_baseline_summary(pd.DataFrame(), phase_e=args.phase_e),
+            regime_df=pd.DataFrame(),
+            family_summary=pd.DataFrame(),
+        )
         if research_mode and research_variants:
             diagnostics_cfg = research_cfg.get("diagnostics", {}) if isinstance(research_cfg.get("diagnostics"), dict) else {}
             report = evaluate_research_variants(
@@ -2364,7 +2668,7 @@ def _run_training_for_k(
     family_summary["samples_calib"] = family_summary["family_id"].map(fam_calib.value_counts()).fillna(0).astype(int)
     family_summary["base_rate_train"] = family_summary["family_id"].map(y_train.groupby(fam_train).mean())
     family_summary["base_rate_calib"] = family_summary["family_id"].map(y_calib.groupby(fam_calib).mean())
-    logger.info("Family counts:\n%s", family_summary.to_string(index=False))
+    logger.debug("Family counts:\n%s", family_summary.to_string(index=False))
 
     if y_train.nunique() < 2:
         logger.error("Global training labels have a single class; cannot train scorer.")
@@ -2414,8 +2718,7 @@ def _run_training_for_k(
                 "p10": float(r_values.quantile(0.1)),
                 "p90": float(r_values.quantile(0.9)),
             }
-            print("\n[FALLBACK METRICS]")
-            print(pd.DataFrame([summary]).to_string(index=False))
+            logger.debug("Fallback metrics: %s", summary)
         summary_payload = _base_summary_payload(
             "TELEMETRY_ONLY" if args.phase_e else "SINGLE_CLASS_FALLBACK"
         )
@@ -2426,6 +2729,22 @@ def _run_training_for_k(
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary_payload, handle, indent=2, default=str)
         logger.info("summary_out=%s", summary_path)
+        supply_funnel_payload = {
+            "score_total": score_total,
+            "after_merge": score_ctx_merged,
+            "after_ctx_dropna": score_ctx_dropna,
+            "events_detected": len(detected_events),
+            "events_labeled": labeled_total,
+            "events_post_state_filter": len(events_state_filtered),
+            "events_post_meta": len(events_for_training),
+        }
+        _emit_telemetry(
+            supply_funnel_payload=supply_funnel_payload,
+            baseline_summary=_baseline_state_summary(events_state_filtered),
+            scorer_summary=_scorer_vs_baseline_summary(pd.DataFrame(), phase_e=args.phase_e),
+            regime_df=pd.DataFrame(),
+            family_summary=pd.DataFrame(),
+        )
         return
 
     warning_summary_rows: list[dict[str, int | str | float]] = []
@@ -2498,7 +2817,7 @@ def _run_training_for_k(
         )
         scorer.scorers[str(family_id)] = scorer_family
 
-    logger.info("Family training status:\n%s", family_summary.to_string(index=False))
+    logger.debug("Family training status:\n%s", family_summary.to_string(index=False))
 
     def _topk_indices(scores: pd.Series, labels_: pd.Series, k: int, seed: int = 7) -> pd.Index:
         if scores.empty:
@@ -2622,7 +2941,7 @@ def _run_training_for_k(
                 _global_metrics_table("BASELINE", baseline_scores, y_block, r_block, seed=seed),
             ]
         )
-        logger.info("INFO | GLOBAL | METRICS (%s)\n%s", block_name, table.to_string(index=False))
+        logger.debug("INFO | GLOBAL | METRICS (%s)\n%s", block_name, table.to_string(index=False))
         return table, scores_block, baseline_scores, y_block
 
     if not is_fallback:
@@ -2653,33 +2972,33 @@ def _run_training_for_k(
         baseline_no_meta = None
         baseline_meta = None
 
-    def _print_global_metrics(title: str, table: pd.DataFrame) -> None:
+    def _log_global_metrics(title: str, table: pd.DataFrame) -> None:
         if table.empty:
-            print(f"\n{title}")
-            print("AUC=nan, lift@10=nan, lift@20=nan, r_mean@20=nan, spearman=nan")
+            logger.debug("%s | AUC=nan lift@10=nan lift@20=nan r_mean@20=nan spearman=nan", title)
             return
         scorer_row = table.loc[table["model"] == "SCORER"]
         if scorer_row.empty:
             scorer_row = table.iloc[[0]]
         row = scorer_row.iloc[0]
-        print(f"\n{title}")
-        print(
-            "AUC={auc}, lift@10={lift10}, lift@20={lift20}, r_mean@20={rmean20}, spearman={spear}".format(
-                auc=_format_metric(row["auc"]),
-                lift10=_format_metric(row["lift@10"]),
-                lift20=_format_metric(row["lift@20"]),
-                rmean20=_format_metric(row["r_mean@20"]),
-                spear=_format_metric(row["spearman"]),
-            )
+        logger.debug(
+            "%s | AUC=%s lift@10=%s lift@20=%s r_mean@20=%s spearman=%s",
+            title,
+            _format_metric(row["auc"]),
+            _format_metric(row["lift@10"]),
+            _format_metric(row["lift@20"]),
+            _format_metric(row["r_mean@20"]),
+            _format_metric(row["spearman"]),
         )
 
     if not is_fallback:
-        _print_global_metrics("[GLOBAL METRICS | NO_META | POST FILTER]", table_no_meta)
-        _print_global_metrics("[GLOBAL METRICS | META | POST FILTER]", table_meta)
-    print("\n[SANITY]")
-    print(f"transition_events_present={transition_events_present}")
-    print(f"transition_samples_train={transition_samples_train}")
-    print(f"transition_samples_calib={transition_samples_calib}")
+        _log_global_metrics("[GLOBAL METRICS | NO_META | POST FILTER]", table_no_meta)
+        _log_global_metrics("[GLOBAL METRICS | META | POST FILTER]", table_meta)
+    logger.debug(
+        "Transition sanity | present=%s train=%s calib=%s",
+        transition_events_present,
+        transition_samples_train,
+        transition_samples_calib,
+    )
 
     metrics_df = table_meta.copy()
     report_header = {
@@ -2840,7 +3159,7 @@ def _run_training_for_k(
         regime_df = _regime_breakdown(preds_meta, y_calib, r_calib, regime_calib, seed=seed)
         if not regime_df.empty:
             regime_top = regime_df.sort_values("samples_calib", ascending=False).head(8)
-            logger.info("INFO | REGIME | TOP regimes (calib)\n%s", regime_top.to_string(index=False))
+            logger.debug("INFO | REGIME | TOP regimes (calib)\n%s", regime_top.to_string(index=False))
 
     best_regime = "NA"
     worst_regime = "NA"
@@ -2861,6 +3180,26 @@ def _run_training_for_k(
         worst_regime,
     )
     logger.info("INFO | SUMMARY | RECOMMENDATION=%s", recommendation)
+
+    supply_funnel_payload = {
+        "score_total": score_total,
+        "after_merge": score_ctx_merged,
+        "after_ctx_dropna": score_ctx_dropna,
+        "events_detected": len(detected_events),
+        "events_labeled": labeled_total,
+        "events_post_state_filter": len(events_state_filtered),
+        "events_post_meta": len(events_for_training),
+    }
+    _emit_telemetry(
+        supply_funnel_payload=supply_funnel_payload,
+        baseline_summary=_baseline_state_summary(events_state_filtered),
+        scorer_summary=_scorer_vs_baseline_summary(table_meta, phase_e=args.phase_e),
+        regime_df=regime_df,
+        family_summary=family_summary,
+        scores=preds_meta,
+        r_outcome=r_calib,
+        regime_series=regime_calib,
+    )
 
     metrics_summary = {}
     if not metrics_df.empty:
@@ -3128,9 +3467,8 @@ def _run_training_for_k(
             "score_shape": score_shape.to_dict(orient="records"),
             "guardrails": guardrails.to_dict(orient="records"),
         }
-        print("\n=== RESEARCH DIAGNOSTICS ===")
-        print(_format_table_block("Score shape diagnostics", score_shape))
-        print(_format_table_block("Research guardrails", guardrails))
+        logger.debug("Research diagnostics | score_shape=%s", score_shape.to_dict(orient="records"))
+        logger.debug("Research guardrails=%s", guardrails.to_dict(orient="records"))
 
     if research_summary_payload is not None:
         summary_payload["research"] = research_summary_payload
@@ -3223,6 +3561,8 @@ def _resolve_baseline_thresholds(
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.log_level)
+    if args.telemetry in {"screen", "triage"} and args.log_level.upper() == "INFO":
+        logger.setLevel(logging.WARNING)
     if args.phase_e:
         logger.info("phase_e=ON (telemetry only; no decision / gating)")
     min_samples_train = 200
@@ -3366,7 +3706,7 @@ def main() -> None:
     score_cutoff = server_now.floor(_timeframe_floor_freq(args.score_tf))
     ohlcv_score = ohlcv_score[ohlcv_score.index < score_cutoff]
     score_dupes = int(ohlcv_score.index.duplicated().sum())
-    print("\n=== EVENT SCORER TRAINING ===")
+    logger.debug("Event scorer training started.")
 
     if not model_path.exists():
         raise FileNotFoundError(f"State model not found: {model_path}")
@@ -3454,13 +3794,12 @@ def main() -> None:
 
     state_labels_before = df_score_ctx[state_col].map(_state_label)
     state_counts_before = state_labels_before.value_counts()
-    print(f"[STATE MIX | {args.score_tf}_CTX]")
-    for line in _format_state_mix(state_counts_before, ["BALANCE", "TREND", "TRANSITION"]):
-        print(line)
+    logger.debug("State mix (%s_ctx): %s", args.score_tf, state_counts_before.to_dict())
 
     score_total = len(ohlcv_score)
 
     event_config = EventDetectionConfig(vwap_tz_server=args.vwap_tz_server).for_timeframe(args.score_tf)
+    vwap_summary = _vwap_validity_summary(ohlcv_score, event_config)
     vwap_plot_path = _write_vwap_diagnostic_plot(
         ohlcv_score,
         args.symbol,
@@ -3494,9 +3833,9 @@ def main() -> None:
         events_diag.index = pd.DatetimeIndex([])
         is_fallback = _apply_fallback_guardrails(0, args.fallback_min_samples)
         if is_fallback:
-            print(
-                "=== FALLBACK DIAGNÓSTICO: events_total_post_meta=0 < fallback_min_samples="
-                f"{args.fallback_min_samples} ==="
+            logger.warning(
+                "Fallback diagnostics: events_total_post_meta=0 < fallback_min_samples=%s",
+                args.fallback_min_samples,
             )
         diagnostic_report = _build_training_diagnostic_report(
             events_diag,
@@ -3578,6 +3917,45 @@ def main() -> None:
         with summary_path.open("w", encoding="utf-8") as handle:
             json.dump(summary_payload, handle, indent=2, default=str)
         logger.info("summary_out=%s", summary_path)
+        supply_funnel_payload = {
+            "score_total": score_total,
+            "after_merge": score_ctx_merged,
+            "after_ctx_dropna": score_ctx_dropna,
+            "events_detected": 0,
+            "events_labeled": 0,
+            "events_post_state_filter": 0,
+            "events_post_meta": 0,
+        }
+        if args.telemetry == "screen":
+            _emit_screen_telemetry(
+                args=args,
+                run_id=run_id,
+                mode=effective_mode,
+                k_bars=args.k_bars,
+                allow_cutoff=allow_cutoff,
+                score_cutoff=score_cutoff,
+                supply_funnel=supply_funnel_payload,
+                vwap_summary=vwap_summary,
+                baseline_summary=_baseline_state_summary(pd.DataFrame()),
+                scorer_summary=_scorer_vs_baseline_summary(pd.DataFrame(), phase_e=args.phase_e),
+                best_regime={"regime_id": "NA", "n": 0, "delta_r_mean@20": float("nan"), "flag": "NA"},
+                worst_regime={"regime_id": "NA", "n": 0, "delta_r_mean@20": float("nan"), "flag": "NA"},
+            )
+        elif args.telemetry == "triage":
+            _emit_triage_telemetry(
+                args=args,
+                run_id=run_id,
+                mode=effective_mode,
+                k_bars=args.k_bars,
+                allow_cutoff=allow_cutoff,
+                score_cutoff=score_cutoff,
+                top_regimes=pd.DataFrame(),
+                bottom_regimes=pd.DataFrame(),
+                inverted_count=0,
+                evaluated_regimes=0,
+                stability_summary={},
+                family_status_counts={},
+            )
         if research_mode:
             _print_research_summary_block(
                 diagnostic_report.get("session_conditional_edge", pd.DataFrame()),
@@ -3679,6 +4057,7 @@ def main() -> None:
             score_ctx_dropna=score_ctx_dropna,
             allow_cutoff=allow_cutoff,
             score_cutoff=score_cutoff,
+            vwap_summary=vwap_summary,
             min_samples_train=min_samples_train,
             seed=seed,
             scorer_out_base=scorer_out_base,
