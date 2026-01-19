@@ -1,3 +1,36 @@
+# -------------------------------------------------
+# Phase D — LOOK_FOR (XAUUSD)
+# Narrativas descriptivas (no señal, no edge)
+# -------------------------------------------------
+phase_d:
+  enabled: true
+  look_fors:
+
+    LOOK_FOR_balance_vwap_proximity:
+      enabled: true
+      base_state: BALANCE
+      require_all: true
+      dist_vwap_atr_max: 0.6
+      state_age_min: 2
+
+    LOOK_FOR_trend_strong_orderly:
+      enabled: true
+      base_state: TREND
+      require_all: true
+      state_age_min: 3
+      dist_vwap_atr_min: 0.5
+
+    LOOK_FOR_transition_failure:
+      enabled: true
+      base_state: TRANSITION
+      require_all: true
+      sessions_in: [LONDON, NY]
+      state_age_max: 5
+      dist_vwap_atr_max: 1.5
+      breakmag_min: 0.25
+      reentry_min: 1.0
+      margin_min: 0.1
+
 event_scorer:
   score_tf: "M5"
   allow_tf: "H1"
@@ -76,17 +109,4 @@ event_scorer:
         max_score_tail_slope: 2.5
         min_calib_samples: 80
 
-phase_d:
-  enabled: true
-  look_fors:
-    LOOK_FOR_transition_failure:
-      enabled: true
-      base_state: transition
-      require_all: true
-      filters:
-        margin_min: 0.10
-        sessions_in: ["LONDON", "NY"]
-        state_age_max: 5
-        dist_vwap_atr_max: 1.5
-        breakmag_min: 0.25
-        reentry_min: 1.0
+
