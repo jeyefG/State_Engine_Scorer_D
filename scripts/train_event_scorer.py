@@ -576,7 +576,14 @@ def _write_vwap_diagnostic_plot(
         reset_mode=reset_mode,
         vwap_window=event_config.vwap_window,
     )
-    df["vwap"] = vwap_result["vwap"]
+    if isinstance(vwap_result, pd.Series):
+        vwap_series = vwap_result
+    else:
+        vwap_series = vwap_result.get("vwap") if isinstance(vwap_result, dict) else None
+    if vwap_series is None:
+        logger.warning("VWAP diagnostic plot skipped: compute_vwap returned no series.")
+        return None
+    df["vwap"] = vwap_series
     if reset_mode == "session":
         session_key = df["session_id"] if "session_id" in df.columns else df["session"]
     else:
