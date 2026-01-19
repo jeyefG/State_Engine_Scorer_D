@@ -10,7 +10,6 @@ import pandas as pd
 
 
 _SESSION_BUCKETS = ("ASIA", "LONDON", "NY", "NY_PM")
-_XAU_SYMBOLS = {"XAUUSD"}
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -48,10 +47,10 @@ def _resolve_vwap_day_anchor(symbol: str | None, anchor: str | None) -> str:
 
 
 def is_context_enabled(symbol: str | None, timeframe: str | None) -> bool:
-    """Return True when XAUUSD H2 context features are enabled."""
-    normalized_symbol = _normalize_symbol(symbol)
-    normalized_tf = _normalize_timeframe(timeframe)
-    return any(normalized_symbol.startswith(sym) for sym in _XAU_SYMBOLS) and normalized_tf == "H2"
+    """Return True when context features are enabled."""
+    _normalize_symbol(symbol)
+    _normalize_timeframe(timeframe)
+    return True
 
 
 def _hour_bucket(hour: int) -> str:
@@ -414,8 +413,7 @@ def build_context_features(
 ) -> pd.DataFrame:
     """Build ctx_* features after state_hat/margin are available."""
     cfg = config or ContextFeatureConfig(vwap_day_anchor=_resolve_vwap_day_anchor(symbol, None))
-    if not is_context_enabled(symbol, timeframe):
-        return pd.DataFrame(index=outputs.index)
+    is_context_enabled(symbol, timeframe)
 
     session_bucket = compute_session_bucket(outputs.index)
     state_age = compute_state_age(outputs["state_hat"], max_age=cfg.max_state_age)
@@ -430,19 +428,22 @@ def build_context_features(
     atr = _resolve_atr_series(ohlcv, window=cfg.atr_window)
     if vwap is None:
         dist_vwap_atr = pd.Series(np.nan, index=ohlcv.index, name="ctx_dist_vwap_atr")
+        vwap_source = "missing"
+        vwap_anchor = "missing"
     else:
         close = pd.to_numeric(ohlcv["close"], errors="coerce")
         denom = np.maximum(atr.to_numpy(), cfg.eps)
         dist = (close - vwap).abs() / denom
         dist_vwap_atr = pd.Series(dist, index=ohlcv.index, name="ctx_dist_vwap_atr")
+        vwap_col = _resolve_vwap_column(ohlcv)
+        provided_valid = False
+        if vwap_col is not None:
+            provided_valid = pd.to_numeric(ohlcv[vwap_col], errors="coerce").notna().any()
+        vwap_source = "provided" if provided_valid else "day_anchor_std"
+        vwap_anchor = anchor
     dist_vwap_atr = dist_vwap_atr.reindex(outputs.index)
-    vwap_col = _resolve_vwap_column(ohlcv)
-    provided_valid = False
-    if vwap_col is not None:
-        provided_valid = pd.to_numeric(ohlcv[vwap_col], errors="coerce").notna().any()
-    vwap_source = "provided" if provided_valid else "day_anchor_std"
     vwap_source = pd.Series(vwap_source, index=outputs.index, name="ctx_vwap_source")
-    vwap_anchor = pd.Series(anchor, index=outputs.index, name="ctx_vwap_anchor")
+    vwap_anchor = pd.Series(vwap_anchor, index=outputs.index, name="ctx_vwap_anchor")
     log_vwap_validation(
         ohlcv,
         vwap,
@@ -454,9 +455,15 @@ def build_context_features(
         cfg.vwap_window,
     )
 
-    return pd.concat(
+    ctx_features = pd.concat(
         [session_bucket, state_age, dist_vwap_atr, vwap_source, vwap_anchor], axis=1
     )
+    non_null_pct = (ctx_features.notna().mean() * 100.0).to_dict()
+    _LOGGER.info(
+        "CTX_FEATURES_NON_NULL_PCT %s",
+        {key: round(value, 2) for key, value in non_null_pct.items()},
+    )
+    return ctx_features
 
 
 __all__ = [
