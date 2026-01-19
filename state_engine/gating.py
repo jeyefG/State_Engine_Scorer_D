@@ -193,7 +193,7 @@ class GatingPolicy:
         allow_transition_failure = guardrails_ok
 
         # Fase D: context filters are semantic filters, not signals.
-        allow_names = [
+        base_allow_names = [
             "ALLOW_trend_pullback",
             "ALLOW_trend_continuation",
             "ALLOW_balance_fade",
@@ -205,6 +205,47 @@ class GatingPolicy:
             "ALLOW_balance_fade": allow_balance_fade,
             "ALLOW_transition_failure": allow_transition_failure,
         }
+
+        ctx_allows = {}
+        if isinstance(config_meta, dict):
+            ctx_allows = config_meta.get("allow_context_filters", {})
+            if not isinstance(ctx_allows, dict):
+                ctx_allows = {}
+
+        extra_allow_names = sorted(
+            [name for name in ctx_allows.keys() if name not in allow_map],
+        )
+        enabled_extras = [
+            name
+            for name in extra_allow_names
+            if isinstance(ctx_allows.get(name), dict) and ctx_allows[name].get("enabled", False)
+        ]
+        if logger is not None:
+            logger.info(
+                "GATING_ALLOWS_BUILT base=%s extras=%s enabled_extras=%s",
+                base_allow_names,
+                extra_allow_names,
+                enabled_extras,
+            )
+
+        for allow_name in extra_allow_names:
+            lower_name = allow_name.lower()
+            if "trend" in lower_name:
+                allow_map[allow_name] = allow_trend_pullback
+            elif "transition" in lower_name:
+                allow_map[allow_name] = guardrails_ok
+            elif "balance" in lower_name:
+                allow_map[allow_name] = allow_balance_fade
+            else:
+                if logger is not None:
+                    logger.warning(
+                        "GATING_ALLOW_UNKNOWN_STATE symbol=%s allow_name=%s base_mask=false",
+                        symbol,
+                        allow_name,
+                    )
+                allow_map[allow_name] = pd.Series(False, index=outputs.index)
+
+        allow_names = base_allow_names + extra_allow_names
         for allow_name in allow_names:
             ctx_meta = None
             if isinstance(config_meta, dict):
@@ -221,20 +262,8 @@ class GatingPolicy:
                 symbol,
             )
             allow_map[allow_name] = filtered_mask
-        allow_trend_pullback = allow_map["ALLOW_trend_pullback"]
-        allow_trend_continuation = allow_map["ALLOW_trend_continuation"]
-        allow_balance_fade = allow_map["ALLOW_balance_fade"]
-        allow_transition_failure = allow_map["ALLOW_transition_failure"]
-
-        return pd.DataFrame(
-            {
-                "ALLOW_trend_pullback": allow_trend_pullback.astype(int),
-                "ALLOW_trend_continuation": allow_trend_continuation.astype(int),
-                "ALLOW_balance_fade": allow_balance_fade.astype(int),
-                "ALLOW_transition_failure": allow_transition_failure.astype(int),
-            },
-            index=outputs.index,
-        )
+        allow_payload = {allow_name: allow_map[allow_name].astype(int) for allow_name in allow_names}
+        return pd.DataFrame(allow_payload, index=outputs.index)
 
     def _apply_allow_context_filter(
         self,
