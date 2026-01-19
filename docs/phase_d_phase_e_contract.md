@@ -9,3 +9,5 @@
 8. Events exist iff ctx[required_allow]==1 for their family.
 9. Phase E validates the contract at startup and logs allow coverage.
 10. Contract validation lives in state_engine/pipeline_phase_d.py and train_event_scorer.py.
+11. Phase E derives active_allows only from Phase D output (ctx_df columns) and never from YAML.
+12. Family_id is computed independently of allow_id; required_allow_by_family is static and non-circular.

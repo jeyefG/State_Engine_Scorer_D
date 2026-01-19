@@ -282,6 +282,13 @@ class GatingPolicy:
                 return outputs[column]
             return None
 
+        def _resolve_col(candidates: Sequence[str]) -> pd.Series | None:
+            for name in candidates:
+                series = _get_col(name)
+                if series is not None:
+                    return series
+            return None
+
         idx = outputs.index
         base_mask = base_mask.reindex(idx).fillna(False).astype(bool)
         if features is not None and not features.index.equals(idx):
@@ -291,17 +298,21 @@ class GatingPolicy:
         enabled = bool(ctx_meta.get("enabled", False)) if ctx_meta else False
         require_all = bool(ctx_meta.get("require_all", True)) if ctx_meta else True
 
-        session_series = _get_col("ctx_session_bucket")
-        state_age_series = _get_col("ctx_state_age")
-        dist_series = _get_col("ctx_dist_vwap_atr")
-        breakmag_series = _get_col("BreakMag")
-        reentry_series = _get_col("ReentryCount")
+        session_series = _resolve_col(["ctx_session_bucket", "session", "session_bucket"])
+        state_age_series = _resolve_col(["ctx_state_age", "state_age"])
+        dist_series = _resolve_col(["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"])
+        breakmag_series = _resolve_col(["BreakMag"])
+        reentry_series = _resolve_col(["ReentryCount"])
 
         masks: list[pd.Series] = []
         mask_map: dict[str, pd.Series] = {}
         applied: set[str] = set()
 
         sessions_in = ctx_meta.get("sessions_in") if ctx_meta else None
+        if enabled and sessions_in is not None and session_series is None:
+            raise ValueError(
+                f"ALLOW {allow_name} requires session column (ctx_session_bucket/session) but none found."
+            )
         if sessions_in is not None and session_series is not None:
             allowed = {str(val) for val in sessions_in}
             mask = session_series.astype(str).isin(allowed)
@@ -311,6 +322,10 @@ class GatingPolicy:
 
         state_age_min = ctx_meta.get("state_age_min") if ctx_meta else None
         state_age_max = ctx_meta.get("state_age_max") if ctx_meta else None
+        if enabled and (state_age_min is not None or state_age_max is not None) and state_age_series is None:
+            raise ValueError(
+                f"ALLOW {allow_name} requires state_age column (ctx_state_age/state_age) but none found."
+            )
         if (state_age_min is not None or state_age_max is not None) and state_age_series is not None:
             series = pd.to_numeric(state_age_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -324,6 +339,10 @@ class GatingPolicy:
 
         dist_min = ctx_meta.get("dist_vwap_atr_min") if ctx_meta else None
         dist_max = ctx_meta.get("dist_vwap_atr_max") if ctx_meta else None
+        if enabled and (dist_min is not None or dist_max is not None) and dist_series is None:
+            raise ValueError(
+                f"ALLOW {allow_name} requires dist_vwap_atr column (ctx_dist_vwap_atr/dist_vwap_atr) but none found."
+            )
         if (dist_min is not None or dist_max is not None) and dist_series is not None:
             series = pd.to_numeric(dist_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -337,6 +356,10 @@ class GatingPolicy:
 
         breakmag_min = ctx_meta.get("breakmag_min") if ctx_meta else None
         breakmag_max = ctx_meta.get("breakmag_max") if ctx_meta else None
+        if enabled and (breakmag_min is not None or breakmag_max is not None) and breakmag_series is None:
+            raise ValueError(
+                f"ALLOW {allow_name} requires BreakMag column but none found."
+            )
         if (breakmag_min is not None or breakmag_max is not None) and breakmag_series is not None:
             series = pd.to_numeric(breakmag_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -350,6 +373,10 @@ class GatingPolicy:
 
         reentry_min = ctx_meta.get("reentry_min") if ctx_meta else None
         reentry_max = ctx_meta.get("reentry_max") if ctx_meta else None
+        if enabled and (reentry_min is not None or reentry_max is not None) and reentry_series is None:
+            raise ValueError(
+                f"ALLOW {allow_name} requires ReentryCount column but none found."
+            )
         if (reentry_min is not None or reentry_max is not None) and reentry_series is not None:
             series = pd.to_numeric(reentry_series, errors="coerce")
             mask = pd.Series(True, index=idx)
@@ -515,227 +542,8 @@ class GatingPolicy:
         return filtered_mask, counts, fail_samples
 
 
-def apply_allow_context_filters(
-    gating_df: pd.DataFrame,
-    symbol_cfg: dict | None,
-    logger,
-    *,
-    phase_e: bool = False,
-) -> pd.DataFrame:
-    """Apply config-driven context filters to ALLOW_* rules."""
-    if not symbol_cfg or not isinstance(symbol_cfg, dict):
-        return gating_df
-    allow_cfg = symbol_cfg.get("allow_context_filters")
-    if not allow_cfg or not isinstance(allow_cfg, dict):
-        return gating_df
-
-    def _resolve_column(df: pd.DataFrame, candidates: Sequence[str]) -> str | None:
-        for name in candidates:
-            if name in df.columns:
-                return name
-        return None
-
-    filtered = gating_df.copy()
-    created_allows: list[str] = []
-    forced_zero_allows: list[str] = []
-    enabled_allows: list[str] = []
-    for allow_rule, rule_cfg in allow_cfg.items():
-        if not isinstance(rule_cfg, dict):
-            logger.warning("allow_context_filters.%s must be a mapping; skipping.", allow_rule)
-            continue
-        if not rule_cfg.get("enabled", False):
-            continue
-        enabled_allows.append(allow_rule)
-        # Transition is handled inside GatingPolicy.apply() (Fase D). Avoid double-apply and misleading logs.
-        if allow_rule == "ALLOW_transition_failure":
-            if allow_rule not in filtered.columns:
-                msg = f"allow_context_filters.{allow_rule} enabled but missing in gating_df."
-                if phase_e:
-                    raise ValueError(msg)
-                logger.warning("%s Filling with zeros.", msg)
-                filtered[allow_rule] = 0
-                created_allows.append(allow_rule)
-                forced_zero_allows.append(allow_rule)
-            logger.info("allow_context_filters.%s handled in gating.py; skipping second pass.", allow_rule)
-            continue
-        
-        if allow_rule not in filtered.columns:
-            msg = f"allow_context_filters.{allow_rule} missing in gating_df"
-            if phase_e:
-                raise ValueError(f"{msg}. Available={sorted(filtered.columns)}")
-            logger.warning("%s; creating column with zeros.", msg)
-            filtered[allow_rule] = 0
-            created_allows.append(allow_rule)
-            forced_zero_allows.append(allow_rule)
-            continue
-
-        allow_series = filtered[allow_rule].astype(bool)
-        before_rate = float(allow_series.mean()) if len(allow_series) else 0.0
-        require_all = rule_cfg.get("require_all", True)
-
-        masks: list[pd.Series] = []
-        applied_conditions: list[str] = []
-
-        missing_required: list[str] = []
-
-        sessions_in = rule_cfg.get("sessions_in")
-        if sessions_in is not None:
-            col_name = _resolve_column(filtered, ["session", "session_bucket"])
-            if col_name is None:
-                missing_required.append("session")
-            else:
-                allowed = {str(val) for val in sessions_in}
-                mask = filtered[col_name].astype(str).isin(allowed)
-                masks.append(mask)
-                applied_conditions.append(f"sessions_in={sorted(allowed)} via {col_name}")
-
-        state_age_min = rule_cfg.get("state_age_min")
-        if state_age_min is not None:
-            col_name = _resolve_column(filtered, ["state_age"])
-            if col_name is None:
-                missing_required.append("state_age")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series >= float(state_age_min)
-                masks.append(mask)
-                applied_conditions.append(f"state_age_min>={state_age_min} via {col_name}")
-
-        state_age_max = rule_cfg.get("state_age_max")
-        if state_age_max is not None:
-            col_name = _resolve_column(filtered, ["state_age"])
-            if col_name is None:
-                missing_required.append("state_age")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series <= float(state_age_max)
-                masks.append(mask)
-                applied_conditions.append(f"state_age_max<={state_age_max} via {col_name}")
-
-        dist_vwap_atr_min = rule_cfg.get("dist_vwap_atr_min")
-        if dist_vwap_atr_min is not None:
-            col_name = _resolve_column(filtered, ["dist_vwap_atr"])
-            if col_name is None:
-                missing_required.append("dist_vwap_atr")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series >= float(dist_vwap_atr_min)
-                masks.append(mask)
-                applied_conditions.append(f"dist_vwap_atr_min>={dist_vwap_atr_min} via {col_name}")
-
-        dist_vwap_atr_max = rule_cfg.get("dist_vwap_atr_max")
-        if dist_vwap_atr_max is not None:
-            col_name = _resolve_column(filtered, ["dist_vwap_atr"])
-            if col_name is None:
-                missing_required.append("dist_vwap_atr")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series <= float(dist_vwap_atr_max)
-                masks.append(mask)
-                applied_conditions.append(f"dist_vwap_atr_max<={dist_vwap_atr_max} via {col_name}")
-
-        breakmag_min = rule_cfg.get("breakmag_min")
-        if breakmag_min is not None:
-            col_name = _resolve_column(filtered, ["BreakMag"])
-            if col_name is None:
-                missing_required.append("BreakMag")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series >= float(breakmag_min)
-                masks.append(mask)
-                applied_conditions.append(f"breakmag_min>={breakmag_min} via {col_name}")
-
-        breakmag_max = rule_cfg.get("breakmag_max")
-        if breakmag_max is not None:
-            col_name = _resolve_column(filtered, ["BreakMag"])
-            if col_name is None:
-                missing_required.append("BreakMag")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series <= float(breakmag_max)
-                masks.append(mask)
-                applied_conditions.append(f"breakmag_max<={breakmag_max} via {col_name}")
-
-        reentry_min = rule_cfg.get("reentry_min")
-        if reentry_min is not None:
-            col_name = _resolve_column(filtered, ["ReentryCount"])
-            if col_name is None:
-                missing_required.append("ReentryCount")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series >= float(reentry_min)
-                masks.append(mask)
-                applied_conditions.append(f"reentry_min>={reentry_min} via {col_name}")
-
-        reentry_max = rule_cfg.get("reentry_max")
-        if reentry_max is not None:
-            col_name = _resolve_column(filtered, ["ReentryCount"])
-            if col_name is None:
-                missing_required.append("ReentryCount")
-            else:
-                series = pd.to_numeric(filtered[col_name], errors="coerce")
-                mask = series <= float(reentry_max)
-                masks.append(mask)
-                applied_conditions.append(f"reentry_max<={reentry_max} via {col_name}")
-
-        if missing_required:
-            missing_required = sorted(set(missing_required))
-            msg = (
-                f"allow_context_filters.{allow_rule} missing required columns={missing_required}"
-            )
-            if phase_e:
-                raise ValueError(f"{msg}. Available={sorted(filtered.columns)}")
-            logger.warning("%s; forcing ALLOW=0.", msg)
-            filtered[allow_rule] = 0
-            forced_zero_allows.append(allow_rule)
-            continue
-
-        if not masks:
-            logger.info("allow_context_filters.%s no effective conditions; skipping.", allow_rule)
-            continue
-
-        if require_all:
-            combined_mask = masks[0]
-            for mask in masks[1:]:
-                combined_mask = combined_mask & mask
-        else:
-            combined_mask = masks[0]
-            for mask in masks[1:]:
-                combined_mask = combined_mask | mask
-
-        filtered[allow_rule] = (allow_series & combined_mask.fillna(False)).astype(int)
-        after_rate = float(filtered[allow_rule].mean()) if len(filtered) else 0.0
-        delta = after_rate - before_rate
-        logger.info(
-            "%s: before=%.2f%% after=%.2f%% delta=%.2f%%",
-            allow_rule,
-            before_rate * 100.0,
-            after_rate * 100.0,
-            delta * 100.0,
-        )
-        logger.info("%s conditions=%s", allow_rule, "; ".join(applied_conditions))
-
-    if enabled_allows:
-        allow_pcts = {}
-        for allow_rule in enabled_allows:
-            if allow_rule not in filtered.columns:
-                continue
-            pct = float(filtered[allow_rule].fillna(0).astype(int).mean() * 100.0)
-            allow_pcts[allow_rule] = pct
-            if pct == 0.0:
-                logger.warning("ALLOW %s has 0%% of 1s after context filters.", allow_rule)
-        logger.info(
-            "ALLOW context columns created=%s forced_zero=%s allow_pct_ones=%s",
-            sorted(set(created_allows)),
-            sorted(set(forced_zero_allows)),
-            allow_pcts,
-        )
-
-    return filtered
-
-
 __all__ = [
     "GatingThresholds",
     "GatingPolicy",
-    "apply_allow_context_filters",
     "build_transition_gating_thresholds",
 ]
