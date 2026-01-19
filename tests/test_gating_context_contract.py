@@ -8,7 +8,11 @@ from state_engine.pipeline_phase_d import validate_allow_context_requirements
 def test_validate_allow_context_requirements_missing_columns_raises() -> None:
     cfg = {
         "allow_context_filters": {
-            "ALLOW_transition_failure": {"enabled": True, "sessions_in": ["NY"]}
+            "ALLOW_transition_failure": {
+                "enabled": True,
+                "base_state": "transition",
+                "sessions_in": ["NY"],
+            }
         }
     }
     available = {"BreakMag", "ReentryCount"}
@@ -21,6 +25,7 @@ def test_validate_allow_context_requirements_ok() -> None:
         "allow_context_filters": {
             "ALLOW_transition_failure": {
                 "enabled": True,
+                "base_state": "transition",
                 "sessions_in": ["NY"],
                 "state_age_max": 2,
                 "dist_vwap_atr_max": 1.5,
