@@ -11,7 +11,7 @@ import pandas as pd
 
 from .context_features import build_context_features
 from .features import FeatureEngineer
-from .gating import GatingPolicy
+from .gating import GatingPolicy, LOOK_FOR_COLUMN_CANDIDATES, resolve_look_for_column_map
 from .model import StateEngineModel
 
 
@@ -89,6 +89,8 @@ def validate_look_for_context_requirements(
     if not isinstance(look_for_cfg, dict):
         raise ValueError("phase_d.look_fors must be a mapping when phase_d.enabled=true.")
 
+    resolved_column_map = resolve_look_for_column_map(available_columns)
+
     def _has_any(candidates: list[str]) -> bool:
         return any(col in available_columns for col in candidates)
 
@@ -114,34 +116,34 @@ def validate_look_for_context_requirements(
             raise ValueError(f"phase_d.look_fors.{look_for_rule}.filters must be a mapping.")
         required: list[str] = []
         if filters_cfg.get("sessions_in") is not None and not _has_any(
-            ["ctx_session_bucket"]
+            list(LOOK_FOR_COLUMN_CANDIDATES["session"])
         ):
             required.append("ctx_session_bucket")
         if (
             filters_cfg.get("state_age_min") is not None
             or filters_cfg.get("state_age_max") is not None
-        ) and not _has_any(["ctx_state_age"]):
-            required.append("ctx_state_age")
+        ) and resolved_column_map.get("state_age") is None:
+            required.append(LOOK_FOR_COLUMN_CANDIDATES["state_age"][0])
         if (
             filters_cfg.get("dist_vwap_atr_min") is not None
             or filters_cfg.get("dist_vwap_atr_max") is not None
-        ) and not _has_any(["ctx_dist_vwap_atr"]):
-            required.append("ctx_dist_vwap_atr")
+        ) and resolved_column_map.get("dist_vwap_atr") is None:
+            required.append(LOOK_FOR_COLUMN_CANDIDATES["dist_vwap_atr"][0])
         if (
             filters_cfg.get("breakmag_min") is not None
             or filters_cfg.get("breakmag_max") is not None
-        ) and "BreakMag" not in available_columns:
-            required.append("BreakMag")
+        ) and resolved_column_map.get("breakmag") is None:
+            required.append(LOOK_FOR_COLUMN_CANDIDATES["breakmag"][0])
         if (
             filters_cfg.get("reentry_min") is not None
             or filters_cfg.get("reentry_max") is not None
-        ) and "ReentryCount" not in available_columns:
-            required.append("ReentryCount")
+        ) and resolved_column_map.get("reentry") is None:
+            required.append(LOOK_FOR_COLUMN_CANDIDATES["reentry"][0])
         if (
             filters_cfg.get("margin_min") is not None
             or filters_cfg.get("margin_max") is not None
-        ) and "margin" not in available_columns:
-            required.append("margin")
+        ) and resolved_column_map.get("margin") is None:
+            required.append(LOOK_FOR_COLUMN_CANDIDATES["margin"][0])
 
         if required:
             missing_by_rule[look_for_rule] = sorted(set(required))
@@ -153,7 +155,8 @@ def validate_look_for_context_requirements(
         )
         raise ValueError(
             "LOOK_FOR filters enabled but missing columns. "
-            f"{missing_details}. Available={sorted(available_columns)}"
+            f"{missing_details}. Available={sorted(available_columns)} "
+            f"resolved_column_map={resolved_column_map}"
         )
     if missing_base_state:
         missing_details = "; ".join(

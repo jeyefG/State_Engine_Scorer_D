@@ -112,6 +112,14 @@ def normalize_phase_d_config(config: dict[str, Any]) -> dict[str, Any]:
     phase_d["look_fors"] = normalized
     return config
 
+
+__all__ = [
+    "PHASE_D_FILTER_FIELDS",
+    "deep_merge",
+    "load_config",
+    "normalize_phase_d_config",
+]
+
 def _validate_config(config: dict[str, Any]) -> None:
     if "symbol" in config:
         raise ValueError("Config must not define 'symbol'; provide symbol via CLI.")
