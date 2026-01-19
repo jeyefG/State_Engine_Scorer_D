@@ -65,17 +65,21 @@ event_scorer:
       max_score_tail_slope: 2.5
       min_calib_samples: 200
 
-allow_context_filters:
-  # Example ALLOW filters (optional). Each ALLOW_* block mirrors the gating filters in code.
-  ALLOW_transition_failure:
-    enabled: false
-    base_state: transition
-    require_all: true
-    sessions_in: ["LONDON", "NY"]
-    state_age_max: 5
-    dist_vwap_atr_max: 1.5
-    breakmag_min: 0.25
-    reentry_min: 1.0
+phase_d:
+  enabled: false
+  look_fors:
+    # Example LOOK_FOR filters (optional). Each LOOK_FOR_* block mirrors the gating filters in code.
+    LOOK_FOR_transition_failure:
+      enabled: false
+      base_state: transition
+      require_all: true
+      filters:
+        margin_min: 0.10
+        sessions_in: ["LONDON", "NY"]
+        state_age_max: 5
+        dist_vwap_atr_max: 1.5
+        breakmag_min: 0.25
+        reentry_min: 1.0
 
 diagnostic_tables:
   n_min: 30

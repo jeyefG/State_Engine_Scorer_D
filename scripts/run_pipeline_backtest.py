@@ -18,10 +18,7 @@ import pandas as pd
 from state_engine.backtest import BacktestConfig, Signal, run_backtest
 from state_engine.events import EventFamily, detect_events
 from state_engine.features import FeatureConfig, FeatureEngineer
-from state_engine.gating import (
-    GatingPolicy,
-    build_transition_gating_thresholds,
-)
+from state_engine.gating import GatingPolicy
 from state_engine.labels import StateLabels
 from state_engine.model import StateEngineModel
 from state_engine.mt5_connector import MT5Connector
@@ -29,7 +26,7 @@ from state_engine.scoring import EventScorerBundle, FeatureBuilder
 from state_engine.sweep import run_param_sweep
 from state_engine.config_loader import load_config
 from state_engine.context_features import build_context_features
-from state_engine.pipeline_phase_d import validate_allow_context_requirements
+from state_engine.pipeline_phase_d import validate_look_for_context_requirements
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,14 +110,14 @@ def build_h1_context(
         timeframe="H1",
     )
     features_for_gating = full_features.join(ctx_features, how="left").reindex(outputs.index)
-    validate_allow_context_requirements(
+    validate_look_for_context_requirements(
         symbol_cfg,
         set(features_for_gating.columns) | set(outputs.columns),
         logger=logger,
     )
-    allows = gating.apply(outputs, features=features_for_gating, config_meta=symbol_cfg, logger=logger)
+    look_fors = gating.apply(outputs, features=features_for_gating, config_meta=symbol_cfg, logger=logger)
     ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
-    ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], ctx_features, allows], axis=1)
+    ctx = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], ctx_features, look_fors], axis=1)
     return ctx.shift(1)
 
 
@@ -133,10 +130,10 @@ def merge_h1_m5(ctx_h1: pd.DataFrame, ohlcv_m5: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def allow_constant_within_hour(df_m5_ctx: pd.DataFrame, allow_cols: list[str]) -> bool:
-    if not allow_cols:
+def allow_constant_within_hour(df_m5_ctx: pd.DataFrame, look_for_cols: list[str]) -> bool:
+    if not look_for_cols:
         return True
-    grouped = df_m5_ctx[allow_cols].groupby(df_m5_ctx.index.floor("h"))
+    grouped = df_m5_ctx[look_for_cols].groupby(df_m5_ctx.index.floor("h"))
     diffs = grouped.nunique().max()
     return bool((diffs <= 1).all())
 
@@ -244,12 +241,7 @@ def main() -> None:
 
     feature_engineer = FeatureEngineer(FeatureConfig())
     symbol_cfg = load_symbol_config(args.symbol, logger)
-    gating_thresholds, _ = build_transition_gating_thresholds(
-        args.symbol,
-        symbol_cfg,
-        logger=logger,
-    )
-    gating = GatingPolicy(gating_thresholds)
+    gating = GatingPolicy()
     ctx_h1 = build_h1_context(
         ohlcv_h1,
         state_model,
@@ -265,9 +257,9 @@ def main() -> None:
     allowed_states = {StateLabels.BALANCE, StateLabels.TREND}
     df_m5_ctx = df_m5_ctx[df_m5_ctx["state_hat_H1"].isin(allowed_states)]
 
-    allow_cols = [col for col in df_m5_ctx.columns if col.startswith("ALLOW_")]
-    if not allow_constant_within_hour(df_m5_ctx, allow_cols):
-        logger.warning("ALLOW_* changed within an hour. Check H1->M5 bridge.")
+    look_for_cols = [col for col in df_m5_ctx.columns if col.startswith("LOOK_FOR_")]
+    if not allow_constant_within_hour(df_m5_ctx, look_for_cols):
+        logger.warning("LOOK_FOR_* changed within an hour. Check H1->M5 bridge.")
 
     events = detect_events(df_m5_ctx)
     allowed_families = {EventFamily.BALANCE_FADE.value, EventFamily.TREND_PULLBACK.value}
@@ -333,12 +325,12 @@ def main() -> None:
             f"margin p50={margin_series.quantile(0.5):.3f} p90={margin_series.quantile(0.9):.3f}",
         ],
     )
-    allow_stats = {col: float(df_m5_ctx[col].mean()) for col in allow_cols}
+    look_for_stats = {col: float(df_m5_ctx[col].mean()) for col in look_for_cols}
     print_section(
-        "GATING",
+        "LOOK_FOR",
         [
-            f"ALLOW rates={allow_stats}",
-            f"tail={df_m5_ctx[allow_cols].tail(5).to_dict(orient='records')}",
+            f"LOOK_FOR rates={look_for_stats}",
+            f"tail={df_m5_ctx[look_for_cols].tail(5).to_dict(orient='records')}",
         ],
     )
     events_by_family = events["family_id"].value_counts().to_dict()

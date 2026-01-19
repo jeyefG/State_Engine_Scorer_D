@@ -74,10 +74,10 @@ class EventFamily(str, Enum):
 
 def required_allow_by_family() -> dict[str, str]:
     return {
-        EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
-        EventFamily.TRANSITION_FAILURE.value: "ALLOW_transition_failure",
-        EventFamily.TREND_PULLBACK.value: "ALLOW_trend_pullback",
-        EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
+        EventFamily.BALANCE_FADE.value: "LOOK_FOR_balance_fade",
+        EventFamily.TRANSITION_FAILURE.value: "LOOK_FOR_transition_failure",
+        EventFamily.TREND_PULLBACK.value: "LOOK_FOR_trend_pullback",
+        EventFamily.TREND_CONTINUATION.value: "LOOK_FOR_trend_continuation",
     }
 
 
@@ -309,7 +309,7 @@ class EventExtractor:
         context_cols = [
             col
             for col in df.columns
-            if col.startswith("ALLOW_")
+            if col.startswith("LOOK_FOR_")
             or col.startswith("state_hat_")
             or col.startswith("margin_")
             or col.startswith("ctx_")
@@ -356,7 +356,7 @@ class EventExtractor:
                 empty.attrs.update(vwap_metadata)
             return empty
 
-        allow_cols = [col for col in events_df.columns if col.startswith("ALLOW_")]
+        allow_cols = [col for col in events_df.columns if col.startswith("LOOK_FOR_")]
         events_df["family_id"] = _infer_family_id(events_df, allow_cols)
 
         events_df.index.name = "ts"

@@ -3,7 +3,7 @@
 from .backtest import BacktestConfig, Signal, Trade, run_backtest
 from .events import EventDetectionConfig, EventFamily, detect_events, label_events
 from .features import FeatureConfig, FeatureEngineer
-from .gating import GatingPolicy, GatingThresholds
+from .gating import GatingPolicy, PhaseDConfig
 from .labels import StateLabeler, StateLabels
 from .model import StateEngineModel, StateEngineModelConfig
 from .mt5_connector import MT5Connector
@@ -22,7 +22,7 @@ __all__ = [
     "FeatureConfig",
     "FeatureEngineer",
     "GatingPolicy",
-    "GatingThresholds",
+    "PhaseDConfig",
     "StateLabeler",
     "StateLabels",
     "StateEngineModel",

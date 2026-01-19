@@ -129,7 +129,7 @@ def test_vwap_daily_reset() -> None:
 
 def test_family_id_from_allow() -> None:
     df_m5 = _make_m5_df()
-    df_m5["ALLOW_balance_fade"] = 1
+    df_m5["LOOK_FOR_balance_fade"] = 1
     df_m5["state_hat_H1"] = 0
     df_m5["margin_H1"] = 0.2
     config = EventDetectionConfig(near_vwap_mode="continuous")

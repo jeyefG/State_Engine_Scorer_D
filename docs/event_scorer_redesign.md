@@ -16,11 +16,11 @@
 - `main()` descarga OHLCV en `score_tf` y `context_tf`, y aplica cutoff por timeframe (floor).【F:scripts/train_event_scorer.py†L3771-L3812】
 
 **3) Construcción de contexto D→E (State + ALLOW + ctx_features)**
-- `build_context()` calcula features, corre `state_model.predict_outputs`, aplica gating y luego intenta inyectar columnas de contexto para `allow_context_filters` (session/state_age/dist_vwap_atr).【F:scripts/train_event_scorer.py†L263-L319】
-- `apply_allow_context_filters()` se invoca dentro de `build_context()` con el frame y config del símbolo.【F:scripts/train_event_scorer.py†L305-L313】
+- `build_context()` calcula features, corre `state_model.predict_outputs`, aplica gating y luego intenta inyectar columnas de contexto para `phase_d.look_fors` (session/state_age/dist_vwap_atr).【F:scripts/train_event_scorer.py†L263-L319】
+- `apply_phase_d.look_fors()` se invoca dentro de `build_context()` con el frame y config del símbolo.【F:scripts/train_event_scorer.py†L305-L313】
 
 **4) Merge context TF → score TF**
-- `merge_allow_score()` hace `merge_asof` de contexto a score, renombra `state_hat/margin` con sufijo de TF y rellena ALLOW_* a 0.【F:scripts/train_event_scorer.py†L322-L344】
+- `merge_allow_score()` hace `merge_asof` de contexto a score, renombra `state_hat/margin` con sufijo de TF y rellena LOOK_FOR_* a 0.【F:scripts/train_event_scorer.py†L322-L344】
 
 **5) Detección de eventos y diagnóstico VWAP**
 - `detect_events()` se ejecuta después del merge (M5) con validaciones de VWAP y estadísticas asociadas.【F:scripts/train_event_scorer.py†L3885-L3899】
@@ -41,7 +41,7 @@
 ### A2) Dónde se rompe el objetivo “Fase E refina post-D” (root causes)
 
 1) **ALLOWs pueden quedar “vacíos” o globales por falta de columnas de contexto**
-   - `apply_allow_context_filters()` solo aplica filtros si existen columnas requeridas (session/state_age/dist_vwap_atr/etc.), y si faltan solo emite warnings y *no falla*; esto facilita un comportamiento silencioso con ALLOWs sin refinamiento contextual real (ALLOWs “globales”).【F:state_engine/gating.py†L489-L599】
+   - `apply_phase_d.look_fors()` solo aplica filtros si existen columnas requeridas (session/state_age/dist_vwap_atr/etc.), y si faltan solo emite warnings y *no falla*; esto facilita un comportamiento silencioso con ALLOWs sin refinamiento contextual real (ALLOWs “globales”).【F:state_engine/gating.py†L489-L599】
    - `build_context()` intenta agregar algunas columnas, pero depende de `full_features` y no valida que el conjunto sea completo para los filtros declarados.【F:scripts/train_event_scorer.py†L263-L319】
 
 2) **El funnel “post-D” no es explícito; E opera con population mix**
@@ -50,8 +50,8 @@
 3) **Baselines no son equivalentes (pre-meta vs post-meta)**
    - `dataset_main` (post-meta) y `dataset_no_meta` se crean, y se calculan reportes comparando ambos en diferentes puntos; esto puede comparar métricas usando poblaciones distintas (baseline en no-meta vs scorer en meta).【F:scripts/train_event_scorer.py†L2692-L2729】
 
-4) **ALLOW_none domina por construcción**
-   - Cuando no hay ALLOWs activos, `allow_id` se vuelve `ALLOW_none`, lo que concentra eventos y empuja un scoring global (especialmente si los ALLOWs faltan o están desactivados).【F:scripts/train_event_scorer.py†L2375-L2385】
+4) **LOOK_FOR_none domina por construcción**
+   - Cuando no hay ALLOWs activos, `allow_id` se vuelve `LOOK_FOR_none`, lo que concentra eventos y empuja un scoring global (especialmente si los ALLOWs faltan o están desactivados).【F:scripts/train_event_scorer.py†L2375-L2385】
 
 5) **E_GENERIC_VWAP puede dominar familias sin control contextual**
    - Existe una familia genérica (`E_GENERIC_VWAP`), potencialmente dominante si no se aplica scope por family/allow/state antes del ranking (no hay un filtro por familia en el pipeline).【F:state_engine/events.py†L65-L72】【F:scripts/train_event_scorer.py†L2375-L2395】
@@ -91,8 +91,8 @@
    - `outputs = state_model.predict_outputs(features)`.
    - `allows = gating.apply(outputs, features=full_features)`.
    - **Enriquecer ctx_features + alias** (session/state_age/dist_vwap_atr/etc.).
-   - `apply_allow_context_filters()` **solo si columnas existen**.
-   - Retorna `ctx_df` con `state_hat`, `margin`, `ctx_*`, `ALLOW_*` alineado y `shift(1)`.
+   - `apply_phase_d.look_fors()` **solo si columnas existen**.
+   - Retorna `ctx_df` con `state_hat`, `margin`, `ctx_*`, `LOOK_FOR_*` alineado y `shift(1)`.
 
 3) **EventDatasetBuilder**
    - `merge_asof` score TF con contexto TF → `df_score_ctx`.
@@ -111,7 +111,7 @@
 
 > **Ningún filtro contextual puede ejecutarse si no existe su columna.**
 
-- En `research` o cuando `phase_e=true`: **si `allow_context_filters.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` / abort explícito**.
+- En `research` o cuando `phase_e=true`: **si `phase_d.look_fors.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` / abort explícito**.
 - En `baseline/production`: **warning + auto-disable con telemetría**.
 
 ---
@@ -119,15 +119,15 @@
 ## Parte C — Plan incremental (3 PRs)
 
 ### PR-1 (desbloqueo mínimo)
-**Objetivo**: “plumbing correcto” del ContextBuilder y allow_context_filters sin refactor masivo.
+**Objetivo**: “plumbing correcto” del ContextBuilder y phase_d.look_fors sin refactor masivo.
 
 Checklist:
 - [ ] **Las columnas `session`, `state_age`, `dist_vwap_atr` deben provenir de la misma fuente de verdad que usa `train_state_engine.py`** (reusar builder/módulo compartido o factorizar uno común; idealmente importando el builder desde `state_engine/context_features.py` o módulo equivalente). **No se permite calcular estas columnas “a mano” en el scorer**.
 - [ ] Inyectar `ctx_features` correctos en `allow_context_frame` (session/state_age/dist_vwap_atr) y **alias explícitos** (p. ej. `ctx_dist_vwap_atr_abs → dist_vwap_atr`, `ctx_session_bucket → session`).
 - [ ] Aplicar la política de validación estricta:
-  - `research` o `--phase-e`: si `allow_context_filters.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` (abort explícito).
+  - `research` o `--phase-e`: si `phase_d.look_fors.<X>.enabled=true` y faltan columnas requeridas → `raise ValueError` (abort explícito).
   - `baseline/production`: warning + auto-disable con telemetría.
-- [ ] Logs pre/post `apply_allow_context_filters()` con conteo de ALLOW_*, `allow_active_pct` y top 3 `allow_id`.
+- [ ] Logs pre/post `apply_phase_d.look_fors()` con conteo de LOOK_FOR_*, `allow_active_pct` y top 3 `allow_id`.
 
 **Snippet sugerido (logging de EffectiveConfig)**
 ```python
@@ -175,7 +175,7 @@ logger.debug("EFFECTIVE_CONFIG=%s", effective_config)
 
 ### D5) ¿Qué logs mínimos garantizan que “D llega vivo a E”?
 - **EffectiveConfig summary en INFO** + dump completo en DEBUG.
-- **Context columns disponibles** y conteos ALLOW pre/post `apply_allow_context_filters()`.
+- **Context columns disponibles** y conteos ALLOW pre/post `apply_phase_d.look_fors()`.
 - **Distribución de ALLOWs** (`allow_active_pct`, top allow_id).【F:scripts/train_event_scorer.py†L305-L313】【F:scripts/train_event_scorer.py†L2438-L2445】
 - **Supply funnel** con conteos por etapa (merge/dropna/events/meta).【F:scripts/train_event_scorer.py†L2504-L2514】
 
@@ -199,11 +199,11 @@ python scripts/train_event_scorer.py \
 **PASS**
 - No aparecen warnings de columnas faltantes.
 - Logs muestran: `has_session=True`, `has_state_age=True`, `has_dist_vwap_atr=True`.
-- `ALLOW_* pre_filter != post_filter` para al menos un allow.
+- `LOOK_FOR_* pre_filter != post_filter` para al menos un allow.
 - `allow_active_pct > 0`.
 
 **FAIL**
-- Sigue dominando `ALLOW_none`.
+- Sigue dominando `LOOK_FOR_none`.
 - `post_filter == pre_filter` siempre.
 - En research/phase-e se emiten warnings silenciosos en vez de abort explícito.
 

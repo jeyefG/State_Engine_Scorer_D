@@ -14,7 +14,7 @@ def test_ev_extended_allow_columns_and_buckets() -> None:
     )
     outputs = pd.DataFrame({"quality_label": ["Q1", "Q2", "Q3", "Q4"]}, index=index)
     gating = pd.DataFrame(
-        {"ALLOW_ALPHA": [True, True, True, True], "BLOCK": [True, False, True, False]},
+        {"LOOK_FOR_ALPHA": [True, True, True, True], "BLOCK": [True, False, True, False]},
         index=index,
     )
     ctx_features = pd.DataFrame(
@@ -36,7 +36,7 @@ def test_ev_extended_allow_columns_and_buckets() -> None:
         warnings_state=warnings_state,
     )
 
-    assert set(ev_extended["allow_rule"]) == {"ALLOW_ALPHA"}
+    assert set(ev_extended["allow_rule"]) == {"LOOK_FOR_ALPHA"}
     assert set(ev_extended["ctx_state_age_bucket"]) == {"0-2", "3-5", "6-10", "11+"}
     assert set(ev_extended["ctx_dist_vwap_atr_bucket"]) == {"<=0.5", "0.5-1", "1-2", ">2"}
 

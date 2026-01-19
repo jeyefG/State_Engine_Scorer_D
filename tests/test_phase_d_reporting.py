@@ -1,7 +1,7 @@
 import pandas as pd
 
 from scripts.train_state_engine import (
-    _build_allow_coverage_table,
+    _build_look_for_coverage_table,
     _build_confidence_summary,
     _build_context_features_audit,
 )
@@ -17,8 +17,8 @@ def test_phase_d_outputs_do_not_include_outcome_columns() -> None:
     )
     gating = pd.DataFrame(
         {
-            "ALLOW_balance_fade": [1, 0, 0],
-            "ALLOW_trend_pullback": [0, 1, 0],
+            "LOOK_FOR_balance_fade": [1, 0, 0],
+            "LOOK_FOR_trend_pullback": [0, 1, 0],
         }
     )
     ctx_features = pd.DataFrame(
@@ -29,7 +29,7 @@ def test_phase_d_outputs_do_not_include_outcome_columns() -> None:
         }
     )
 
-    allow_coverage = _build_allow_coverage_table(gating, outputs)
+    allow_coverage = _build_look_for_coverage_table(gating, outputs)
     context_audit = _build_context_features_audit(ctx_features)
     confidence_summary = _build_confidence_summary(outputs)
 
@@ -48,14 +48,14 @@ def test_allow_coverage_table_has_counts_only() -> None:
     )
     gating = pd.DataFrame(
         {
-            "ALLOW_balance_fade": [1, 1, 0],
-            "ALLOW_trend_pullback": [0, 0, 1],
+            "LOOK_FOR_balance_fade": [1, 1, 0],
+            "LOOK_FOR_trend_pullback": [0, 0, 1],
         }
     )
 
-    coverage = _build_allow_coverage_table(gating, outputs)
+    coverage = _build_look_for_coverage_table(gating, outputs)
     assert set(coverage.columns) == {
-        "allow_rule",
+        "look_for_rule",
         "n",
         "pct_total",
         "state_counts",

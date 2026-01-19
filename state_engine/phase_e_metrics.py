@@ -167,10 +167,10 @@ def _build_ev_extended_table(
     else:
         base["ctx_dist_vwap_atr_bucket"] = "NA"
 
-    allow_cols = [col for col in gating.columns if col.startswith("ALLOW_")]
+    allow_cols = [col for col in gating.columns if col.startswith("LOOK_FOR_")]
     if not allow_cols:
         if not warnings_state.get("missing_allow_cols", False):
-            logger.warning("No ALLOW_* columns found; skipping EV extended allow conditioning.")
+            logger.warning("No LOOK_FOR_* columns found; skipping EV extended allow conditioning.")
             warnings_state["missing_allow_cols"] = True
         coverage = {
             "total_rows_used": int(len(base)),
@@ -918,7 +918,7 @@ def run_phase_e_reporting(
         if not ev_extended_exploded.empty:
             allow_cov_df = ev_extended_exploded["allow_rule"].value_counts().reset_index()
             allow_cov_df.columns = ["allow_rule", "count"]
-            emit_table("COVERAGE_ALLOW", allow_cov_df, None)
+            emit_table("COVERAGE_LOOK_FOR", allow_cov_df, None)
 
         if "ctx_session_bucket" in ctx_features.columns:
             session_cov_df = ctx_features.loc[ev_frame.index, "ctx_session_bucket"].value_counts().reset_index()
