@@ -1287,6 +1287,26 @@ def main() -> None:
     )
     allow_cols = list(gating.columns)
     allow_any = gating.any(axis=1)
+    allow_context_frame = pd.DataFrame(index=outputs.index).join(gating[allow_cols], how="left")
+
+    def _attach_ctx_column(name: str, candidates: list[str]) -> None:
+        series = None
+        for candidate in candidates:
+            if candidate in ctx_features.columns:
+                series = ctx_features[candidate]
+                break
+            if candidate in outputs.columns:
+                series = outputs[candidate]
+                break
+            if candidate in full_features.columns:
+                series = full_features[candidate]
+                break
+        if series is not None:
+            allow_context_frame[name] = series.reindex(outputs.index)
+
+    _attach_ctx_column("session_bucket", ["ctx_session_bucket", "session_bucket", "session"])
+    _attach_ctx_column("state_age", ["ctx_state_age", "state_age"])
+    _attach_ctx_column("dist_vwap_atr", ["ctx_dist_vwap_atr", "dist_vwap_atr", "ctx_dist_vwap_atr_abs"])
 
     # EV estructural (diagnóstico): ret_struct basado en rango direccional futuro
     ev_k_bars = 2
