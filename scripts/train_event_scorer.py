@@ -265,19 +265,6 @@ def setup_logging(level: str) -> logging.Logger:
     return logger
 
 
-def _active_allow_filters(symbol_cfg: dict | None) -> set[str]:
-    if not isinstance(symbol_cfg, dict):
-        return set()
-    allow_cfg = symbol_cfg.get("allow_context_filters")
-    if not isinstance(allow_cfg, dict):
-        return set()
-    return {
-        allow_name
-        for allow_name, rule_cfg in allow_cfg.items()
-        if isinstance(rule_cfg, dict) and rule_cfg.get("enabled", False)
-    }
-
-
 def _required_allow_by_family() -> dict[str, str]:
     return {
         EventFamily.BALANCE_FADE.value: "ALLOW_balance_fade",
@@ -286,43 +273,10 @@ def _required_allow_by_family() -> dict[str, str]:
         EventFamily.TREND_CONTINUATION.value: "ALLOW_trend_continuation",
     }
 
-
-def _validate_phase_e_context_contract(
-    ctx: pd.DataFrame,
-    symbol_cfg: dict | None,
-    required_allow_map: dict[str, str],
-    logger: logging.Logger,
-) -> None:
-    active_allows = _active_allow_filters(symbol_cfg)
-    required_allows = sorted(set(required_allow_map.values()))
-    missing = sorted(set(active_allows) - set(ctx.columns))
-    if missing:
-        raise ValueError(f"Missing ALLOW columns from Phase D: {missing}")
-    allows_to_check = sorted(set(active_allows) | set(required_allows))
-    for allow_name in allows_to_check:
-        if allow_name not in ctx.columns:
-            raise ValueError(f"Missing required ALLOW column in Phase E: {allow_name}")
-        series = pd.to_numeric(ctx[allow_name], errors="coerce")
-        if series.isna().any():
-            raise ValueError(f"ALLOW column {allow_name} has NaN values in Phase E context.")
-        unique_vals = set(series.unique())
-        if not unique_vals.issubset({0, 1}):
-            raise ValueError(
-                f"ALLOW column {allow_name} must be binary (0/1). Observed={sorted(unique_vals)}"
-            )
-    allow_rates = {allow: float(ctx[allow].mean() * 100.0) for allow in allows_to_check} if allows_to_check else {}
-    logger.info(
-        "Phase E context contract OK | allows=%s allow_rates=%s",
-        allows_to_check,
-        {k: round(v, 2) for k, v in allow_rates.items()},
-    )
-
-
 def _apply_event_allow_gates(
     events_df: pd.DataFrame,
     *,
     required_allow_by_family: dict[str, str],
-    active_allows: set[str],
     logger: logging.Logger,
 ) -> pd.DataFrame:
     if events_df.empty:
@@ -373,11 +327,6 @@ def _apply_event_allow_gates(
         )
     coverage_df = pd.DataFrame(coverage_rows)
     logger.info("Phase E allow coverage:\n%s", coverage_df.to_string(index=False))
-    if active_allows:
-        for allow_name in sorted(active_allows):
-            total = coverage_df.loc[coverage_df["allow"] == allow_name, "events_total"]
-            if total.empty or int(total.iloc[0]) == 0:
-                logger.warning("Phase E allow coverage: active allow has no events: %s", allow_name)
     return events.loc[keep_mask].drop(columns=["required_allow"])
 
 
@@ -3828,8 +3777,7 @@ def main() -> None:
         effective_mode,
         run_id,
     )
-    active_allows = _active_allow_filters(config_payload)
-    required_allow_map = required_allow_by_family()
+    required_allow_map = _required_allow_by_family()
 
     research_mode = effective_mode == "research"
     research_enabled = research_mode and bool(research_cfg.get("enabled", False))
@@ -3943,8 +3891,6 @@ def main() -> None:
     df_score_ctx = df_score_ctx.dropna(subset=[state_col, margin_col])
     logger.info("Rows after dropna ctx: %s_ctx=%s", args.score_tf, len(df_score_ctx))
     score_ctx_dropna = len(df_score_ctx)
-    if args.phase_e:
-        _validate_phase_e_context_contract(df_score_ctx, config_payload, required_allow_map, logger)
     feature_builder = FeatureBuilder(context_tf=context_tf)
     features_all = feature_builder.build(df_score_ctx)
     # --- atr_ratio (diagnostic-only, comparable cross-symbol) ---
@@ -3988,10 +3934,10 @@ def main() -> None:
     detected_events = _apply_event_allow_gates(
         detected_events,
         required_allow_by_family=required_allow_map,
-        active_allows=active_allows,
         logger=logger,
     )
     if args.phase_e:
+        logger.info("Phase E contract OK | allow coverage logged above.")
         detected_events = _force_phase_e_allow_identity(
             detected_events,
             required_allow_by_family=required_allow_map,

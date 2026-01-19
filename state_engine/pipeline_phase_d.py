@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
 import pandas as pd
 
@@ -20,6 +21,32 @@ class ContextBundle:
     ohlcv_score: pd.DataFrame
     df_score_ctx: pd.DataFrame
     meta: dict[str, Any]
+
+
+def audit_phase_d_contamination(*, logger: logging.Logger) -> None:
+    patterns: dict[str, str] = {
+        "train_event_scorer": "Phase D must not depend on Phase E training scripts.",
+        "event_scorer": "Phase D must not contain Phase E scorer logic.",
+        "phase_e": "Phase D must not branch on Phase E flags.",
+        "Phase E": "Phase D must not embed Phase E concerns.",
+        "scorer": "Phase D must not embed Event Scorer logic.",
+    }
+    targets: dict[str, Path] = {
+        "gating.py": Path(__file__).resolve().with_name("gating.py"),
+        "context_features.py": Path(__file__).resolve().with_name("context_features.py"),
+    }
+    findings: list[str] = []
+    for name, path in targets.items():
+        if not path.exists():
+            continue
+        content = path.read_text(encoding="utf-8")
+        for pattern, reason in patterns.items():
+            if pattern in content:
+                findings.append(f"{name}:{pattern} -> {reason}")
+    if findings:
+        logger.error("AUDIT_FAIL Phase D contamination detected: %s", "; ".join(findings))
+    else:
+        logger.info("AUDIT_OK Phase D gating/context_features clean.")
 
 
 def _active_allow_filters(symbol_cfg: dict | None) -> list[str]:
@@ -43,6 +70,7 @@ def validate_allow_context_requirements(
     *,
     logger: logging.Logger,
 ) -> None:
+    audit_phase_d_contamination(logger=logger)
     if not isinstance(symbol_cfg, dict):
         return
     allow_cfg = symbol_cfg.get("allow_context_filters")
@@ -99,7 +127,7 @@ def validate_allow_context_requirements(
     logger.info("Phase D allow requirements OK | allows=%s", sorted(allow_cfg.keys()))
 
 
-def _validate_allow_columns(
+def validate_allow_columns(
     ctx_df: pd.DataFrame,
     active_allows: list[str],
     *,
@@ -160,6 +188,27 @@ def _merge_context_score(
     return merged
 
 
+def _log_allow_session_coverage(
+    ctx_df: pd.DataFrame,
+    allow_names: Iterable[str],
+    *,
+    logger: logging.Logger,
+) -> None:
+    allow_names = [name for name in allow_names if name in ctx_df.columns]
+    if not allow_names:
+        return
+    if "ctx_session_bucket" not in ctx_df.columns:
+        return
+    coverage = (
+        ctx_df.groupby("ctx_session_bucket")[allow_names]
+        .mean()
+        .mul(100.0)
+        .round(2)
+        .reset_index()
+    )
+    logger.info("ALLOW session coverage:\n%s", coverage.to_string(index=False))
+
+
 def build_context_bundle(
     *,
     symbol: str,
@@ -198,15 +247,22 @@ def build_context_bundle(
         symbol=symbol,
         config_meta=symbol_cfg,
     )
-    ctx_cols = [col for col in outputs.columns if col.startswith("ctx_")]
-    ctx_df = pd.concat([outputs[["state_hat", "margin", *ctx_cols]], ctx_features, allows], axis=1)
-    ctx_df = ctx_df.shift(1)
+    ctx_features = ctx_features.loc[:, ~ctx_features.columns.duplicated()]
+    ctx_df = pd.concat([outputs[["state_hat", "margin"]], ctx_features, allows], axis=1)
+    ctx_df = ctx_df.loc[:, ~ctx_df.columns.duplicated()].shift(1)
     allow_cols = [col for col in ctx_df.columns if col.startswith("ALLOW_")]
     if allow_cols:
         ctx_df[allow_cols] = ctx_df[allow_cols].fillna(0).astype(int)
 
     active_allows = _active_allow_filters(symbol_cfg)
-    allow_rates = _validate_allow_columns(ctx_df, active_allows, logger=logger)
+    allow_rates = validate_allow_columns(ctx_df, active_allows, logger=logger)
+    logger.info(
+        "Phase D allow summary | required_allows=%s produced_allows=%s",
+        active_allows,
+        sorted(allow_cols),
+    )
+    _log_allow_session_coverage(ctx_df, active_allows, logger=logger)
+    logger.info("Phase D ctx_df tail:\n%s", ctx_df.tail(3).to_string())
     if phase_e:
         logger.info("Phase D context bundle ready for Phase E consumer.")
 
@@ -229,5 +285,7 @@ def build_context_bundle(
 __all__ = [
     "ContextBundle",
     "build_context_bundle",
+    "validate_allow_columns",
     "validate_allow_context_requirements",
+    "audit_phase_d_contamination",
 ]
