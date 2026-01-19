@@ -888,9 +888,8 @@ def main() -> None:
     composition_quality_df = pd.DataFrame()
     if "quality_label" in outputs.columns:
         quality_counts = outputs["quality_label"].fillna("NA").astype(str).value_counts()
-        composition_quality_df = (
-            quality_counts.reset_index()
-            .rename(columns={"index": "quality_label", "quality_label": "count"})
+        composition_quality_df = quality_counts.rename_axis("quality_label").reset_index(
+            name="count"
         )
         composition_quality_df["pct"] = (
             composition_quality_df["count"] / max(len(outputs), 1) * 100.0
