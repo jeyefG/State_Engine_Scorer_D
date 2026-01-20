@@ -1,46 +1,43 @@
 # -------------------------------------------------
-# Phase D — LOOK_FOR (XAUUSD)
-# Narrativas descriptivas (no señal, no edge)
+# Phase D LOOK_FOR (USDMXN)
+# TF/Window: H1 / 12 bars
+# Purpose: detect real substructure (no redefinition of state)
 # -------------------------------------------------
+
 phase_d:
   enabled: true
   look_fors:
 
-    # 1) BALANCE: cerca de VWAP, balance "observable"
-    LOOK_FOR_balance_vwap_proximity:
-      enabled: true
-      base_state: BALANCE
-      require_all: true
-      dist_vwap_atr_max: 0.6
-      state_age_min: 2
-
-    # 2) TREND: tendencia "ordenada" (madura + lejos de VWAP)
-    LOOK_FOR_trend_strong_orderly:
-      enabled: true
-      base_state: TREND
-      require_all: true
-      state_age_min: 3
-      dist_vwap_atr_min: 0.5
-
-    # 3) TRANSITION: chop/ruido cerca de VWAP (narrativa típica)
-    LOOK_FOR_transition_chop_near_vwap:
+    LOOK_FOR_transition_early_escape:
       enabled: true
       base_state: TRANSITION
       require_all: true
-      dist_vwap_atr_max: 0.6
-      reentry_min: 1.0
-      state_age_max: 8
+      state_age_max: 4
+      breakmag_min: 0.35
 
-    # 4) TRANSITION: impulso/expansión (evento raro, ok que tenga baja cobertura)
-    #LOOK_FOR_transition_impulse:
-      #enabled: true
-      #base_state: TRANSITION
-      #require_all: true
-      #sessions_in: [LONDON, NY]
-      #breakmag_min: 0.25
-      #dist_vwap_atr_max: 1.5
-      #state_age_max: 5
+    LOOK_FOR_transition_directional_grind:
+      enabled: true
+      base_state: TRANSITION
+      require_all: true
+      trend_strength_min: 0.35
+      trend_strength_max: 0.6
+      breakmag_max: 0.35
 
+    LOOK_FOR_trend_shock_continuation:
+      enabled: true
+      base_state: TREND
+      require_all: true
+      state_age_min: 2
+      trend_strength_min: 0.7
+
+    LOOK_FOR_balance_leaking:
+      enabled: true
+      base_state: BALANCE
+      require_all: true
+      dist_vwap_atr_min: 0.5
+      reentry_min: 1
+
+      
 #----------------------------------------------------------------
 #                   Fase E/Scorer
 #----------------------------------------------------------------    

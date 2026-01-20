@@ -1,45 +1,42 @@
 # -------------------------------------------------
-# Phase D — LOOK_FOR (XAUUSD)
-# Narrativas descriptivas (no señal, no edge)
+# Phase D — LOOK_FOR (EURUSD)
+# Narrativas propias EURUSD (descriptivas; no señal)
+# Nota: se colapsa TRANSITION a 1 narrativa (evita redundancia Jaccard alto)
 # -------------------------------------------------
 phase_d:
   enabled: true
   look_fors:
 
-    # 1) BALANCE: cerca de VWAP, balance "observable"
-    LOOK_FOR_balance_vwap_proximity:
+    # BALANCE típico EURUSD: equilibrio breve / rotación (no “compresión larga”)
+    LOOK_FOR_balance_short_lived:
       enabled: true
       base_state: BALANCE
       require_all: true
-      dist_vwap_atr_max: 0.6
-      state_age_min: 2
+      sessions_in: [LONDON, NY]
+      state_age_max: 4
+      dist_vwap_atr_max: 0.8
 
-    # 2) TREND: tendencia "ordenada" (madura + lejos de VWAP)
-    LOOK_FOR_trend_strong_orderly:
-      enabled: true
-      base_state: TREND
-      require_all: true
-      state_age_min: 3
-      dist_vwap_atr_min: 0.5
-
-    # 3) TRANSITION: chop/ruido cerca de VWAP (narrativa típica)
-    LOOK_FOR_transition_chop_near_vwap:
+    # TRANSITION dominante EURUSD: rotación/fallo sin impulso
+    LOOK_FOR_transition_rotation_no_impulse:
       enabled: true
       base_state: TRANSITION
       require_all: true
-      dist_vwap_atr_max: 0.6
-      reentry_min: 1.0
+      sessions_in: [LONDON, NY]
       state_age_max: 8
+      dist_vwap_atr_max: 1.2
+      breakmag_max: 0.35
+      reentry_min: 1.0
 
-    # 4) TRANSITION: impulso/expansión (evento raro, ok que tenga baja cobertura)
-    #LOOK_FOR_transition_impulse:
-      #enabled: true
-      #base_state: TRANSITION
-      #require_all: true
-      #sessions_in: [LONDON, NY]
-      #breakmag_min: 0.25
-      #dist_vwap_atr_max: 1.5
-      #state_age_max: 5
+    # TREND EURUSD: tendencia más “ordenada” y relativamente cerca de VWAP
+    LOOK_FOR_trend_persistent_near_vwap:
+      enabled: true
+      base_state: TREND
+      require_all: true
+      sessions_in: [LONDON, NY]
+      state_age_min: 4
+      state_age_max: 10
+      dist_vwap_atr_max: 1.0
+
 
 #----------------------------------------------------------------
 #                   Fase E/Scorer

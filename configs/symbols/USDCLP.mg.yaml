@@ -1,46 +1,24 @@
 # -------------------------------------------------
-# Phase D — LOOK_FOR (XAUUSD)
-# Narrativas descriptivas (no señal, no edge)
+# Phase D LOOK_FOR (USDCLP) - Final exploratory pool (out of the box)
+# Purpose: express USDCLP complexity via orthogonal, non-classic narratives
+# Narrative hacking: 0 percent (no tuning after run)
+# Evaluate only: coverage, split stability, Jaccard
+# ASCII-only (avoid encoding issues)
 # -------------------------------------------------
+
 phase_d:
   enabled: true
   look_fors:
 
-    # 1) BALANCE: cerca de VWAP, balance "observable"
-    LOOK_FOR_balance_vwap_proximity:
+    LOOK_FOR_balance_biased:
       enabled: true
       base_state: BALANCE
       require_all: true
-      dist_vwap_atr_max: 0.6
-      state_age_min: 2
+      dist_vwap_atr_min: 0.4
+      dist_vwap_atr_max: 0.9
 
-    # 2) TREND: tendencia "ordenada" (madura + lejos de VWAP)
-    LOOK_FOR_trend_strong_orderly:
-      enabled: true
-      base_state: TREND
-      require_all: true
-      state_age_min: 3
-      dist_vwap_atr_min: 0.5
 
-    # 3) TRANSITION: chop/ruido cerca de VWAP (narrativa típica)
-    LOOK_FOR_transition_chop_near_vwap:
-      enabled: true
-      base_state: TRANSITION
-      require_all: true
-      dist_vwap_atr_max: 0.6
-      reentry_min: 1.0
-      state_age_max: 8
-
-    # 4) TRANSITION: impulso/expansión (evento raro, ok que tenga baja cobertura)
-    #LOOK_FOR_transition_impulse:
-      #enabled: true
-      #base_state: TRANSITION
-      #require_all: true
-      #sessions_in: [LONDON, NY]
-      #breakmag_min: 0.25
-      #dist_vwap_atr_max: 1.5
-      #state_age_max: 5
-
+      
 #----------------------------------------------------------------
 #                   Fase E/Scorer
 #----------------------------------------------------------------    

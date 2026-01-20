@@ -1,46 +1,51 @@
 # -------------------------------------------------
-# Phase D — LOOK_FOR (XAUUSD)
-# Narrativas descriptivas (no señal, no edge)
+# Phase D LOOK_FOR (US500) v2
+# Descriptive narratives (no signal, no edge)
+# Goal: clear archetypes + split stability + low collision (low Jaccard)
+# Changes vs v1:
+# - Remove LOOK_FOR_transition_failed_breakout (N too low)
+# - Collapse TRANSITION to one narrative "resolution"
+# - Add a second BALANCE "inventory_reset" to capture directional balance
+# - Keep TREND "orderly_pullback" (already solid)
 # -------------------------------------------------
+
 phase_d:
   enabled: true
   look_fors:
 
-    # 1) BALANCE: cerca de VWAP, balance "observable"
-    LOOK_FOR_balance_vwap_proximity:
+    LOOK_FOR_balance_compression:
       enabled: true
       base_state: BALANCE
       require_all: true
-      dist_vwap_atr_max: 0.6
       state_age_min: 2
+      state_age_max: 8
+      dist_vwap_atr_max: 0.4
+      reentry_min: 1
 
-    # 2) TREND: tendencia "ordenada" (madura + lejos de VWAP)
-    LOOK_FOR_trend_strong_orderly:
+    LOOK_FOR_balance_inventory_reset:
+      enabled: true
+      base_state: BALANCE
+      require_all: true
+      state_age_min: 6
+      dist_vwap_atr_min: 0.4
+      dist_vwap_atr_max: 0.9
+
+    LOOK_FOR_transition_resolution:
+      enabled: true
+      base_state: TRANSITION
+      require_all: true
+      state_age_max: 6
+      breakmag_min: 0.3
+
+    LOOK_FOR_trend_orderly_pullback:
       enabled: true
       base_state: TREND
       require_all: true
       state_age_min: 3
-      dist_vwap_atr_min: 0.5
+      dist_vwap_atr_max: 1.0
 
-    # 3) TRANSITION: chop/ruido cerca de VWAP (narrativa típica)
-    LOOK_FOR_transition_chop_near_vwap:
-      enabled: true
-      base_state: TRANSITION
-      require_all: true
-      dist_vwap_atr_max: 0.6
-      reentry_min: 1.0
-      state_age_max: 8
 
-    # 4) TRANSITION: impulso/expansión (evento raro, ok que tenga baja cobertura)
-    #LOOK_FOR_transition_impulse:
-      #enabled: true
-      #base_state: TRANSITION
-      #require_all: true
-      #sessions_in: [LONDON, NY]
-      #breakmag_min: 0.25
-      #dist_vwap_atr_max: 1.5
-      #state_age_max: 5
-
+      
 #----------------------------------------------------------------
 #                   Fase E/Scorer
 #----------------------------------------------------------------    
